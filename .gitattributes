@@ -1,0 +1,7 @@
+# Keep line endings sane across platforms: the bash launcher must stay
+# LF everywhere (a CR breaks its shebang on Linux), PowerShell prefers CRLF.
+muse-gateway text eol=lf
+muse-shim text eol=lf
+.env.example text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf

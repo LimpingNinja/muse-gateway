@@ -1,0 +1,73 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+# Virtualenvs / local installs
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# Packaging / editable leftovers
+*.egg
+
+# Environment and secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+auth.json
+.credentials.json
+*credentials*.json
+!.github/**
+secrets/
+*.secret
+
+# Auth / tool state that may contain tokens
+.codex/
+.claude/
+.muse/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test / temp artifacts
+tmp/
+temp/
+*.log
+*.log.*
+.hypothesis/
+
+# Local notes / private work (never check in)
+*.local.md
+NOTES.private.md
+CARRYOVER.md
+.private/

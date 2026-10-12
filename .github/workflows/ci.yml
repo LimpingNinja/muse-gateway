@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run unit tests (stdlib only)
+        run: python -m unittest -v
+
+  public-surface:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check launcher syntax
+        run: bash -n muse-gateway
+      - name: Check launch help renders
+        run: python -m muse_shim launch -h
+      - name: Reject committed secrets and private endpoints
+        run: |
+          set -euo pipefail
+          git ls-files -z > "$RUNNER_TEMP/gateway-tracked-files"
+          while IFS= read -r -d '' path; do
+            case "/$path" in
+              */.env.example) ;;
+              */.env|*/.env.*|*/CARRYOVER.md|*/auth.json|*/.credentials.json|*/secrets/*|*/.private/*|*.log|*.log.*|*.pem|*.key)
+                echo "error: forbidden private file is tracked" >&2
+                exit 1 ;;
+            esac
+            # Never echo matching lines: CI logs must not disclose the secret.
+            if grep -E 'sk-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|192\.168\.[0-9]+\.[0-9]+|10\.[0-9]+\.[0-9]+\.[0-9]+' -- "$path" > /dev/null; then
+              echo "error: possible secret or private endpoint in a tracked file" >&2
+              exit 1
+            else
+              status=$?
+              if [ "$status" -ne 1 ]; then
+                echo "error: public-surface scan could not read a tracked file" >&2
+                exit "$status"
+              fi
+            fi
+          done < "$RUNNER_TEMP/gateway-tracked-files"

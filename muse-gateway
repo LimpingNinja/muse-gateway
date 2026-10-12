@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# One-shot launcher: starts the muse-gateway, then Muse on top of it.
+#
+# Thin wrapper around `python muse_shim.py launch` (same as the installed
+# `muse-gateway launch` command). All arguments forward unchanged: launcher
+# options (--port, --check-only, --local-*) come first, then Muse subcommands
+# (resume, exec), flags (--model, --yolo), and --help, which passes through
+# to `muse`. Your working directory is preserved for the Muse process.
+#
+# Meta models ride your `muse login` subscription (OAuth) via header
+# forwarding, so no Meta API key is configured. Codex uses your existing
+# `codex login`. No virtualenv needed: the gateway is stdlib-only, zero
+# dependencies. Local-backend config comes from flags, environment
+# (MUSE_SHIM_LOCAL_UPSTREAM, MUSE_SHIM_LOCAL_API_KEY, MUSE_SHIM_LOCAL_MODELS),
+# or a `.env` file next to this script; flags win over env, env wins over
+# the file. Run with -h for launcher help.
+#
+#   ./muse-gateway                                   # interactive Muse on :8787
+#   ./muse-gateway resume <session-id>               # resume a session
+#   ./muse-gateway exec "..." --model local/<alias>  # one-shot agent run
+#   ./muse-gateway --check-only                      # validate, no Muse launch
+#   ./muse-gateway --port 9000 -- --yolo             # custom port + muse args
+#
+# For Meta API-key billing, use the manual server setup in README.md instead
+# of this subscription-authentication launcher.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  echo "error: python3/python not found on PATH" >&2
+  exit 1
+fi
+
+exec "$PYTHON" "$SCRIPT_DIR/muse_shim.py" launch --env-file "$SCRIPT_DIR/.env" "$@"
