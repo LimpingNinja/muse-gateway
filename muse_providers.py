@@ -1,4 +1,4 @@
-"""Native provider transports used by :mod:`muse_shim`.
+"""Native provider transports used by :mod:`muse_gateway`.
 
 The module deliberately uses only the Python standard library.  Muse speaks
 the OpenAI Responses wire format; Codex already accepts that format while
@@ -378,6 +378,7 @@ def _candidate_codex_paths(config: Any) -> list[tuple[Path, bool]]:
 def _candidate_claude_paths(config: Any) -> list[tuple[Path, bool]]:
     explicit = str(
         getattr(config, "claude_credentials", "")
+        or os.environ.get("MUSE_GATEWAY_CLAUDE_CREDENTIALS", "")
         or os.environ.get("MUSE_SHIM_CLAUDE_CREDENTIALS", "")
         or os.environ.get("CLAUDE_CODE_CREDENTIALS_PATH", "")
     ).strip()
@@ -443,6 +444,7 @@ def _env_first(names: Iterable[str]) -> tuple[str, str] | tuple[None, None]:
 def discover_codex_credentials(config: Any) -> CredentialState | None:
     env_name, access = _env_first(
         (
+            "MUSE_GATEWAY_CODEX_ACCESS_TOKEN",
             "MUSE_SHIM_CODEX_ACCESS_TOKEN",
             "CODEX_ACCESS_TOKEN",
             "OPENAI_CODEX_ACCESS_TOKEN",
@@ -453,7 +455,11 @@ def discover_codex_credentials(config: Any) -> CredentialState | None:
         env_name = "command line" if access else None
     if access:
         _, refresh = _env_first(
-            ("MUSE_SHIM_CODEX_REFRESH_TOKEN", "CODEX_REFRESH_TOKEN")
+            (
+                "MUSE_GATEWAY_CODEX_REFRESH_TOKEN",
+                "MUSE_SHIM_CODEX_REFRESH_TOKEN",
+                "CODEX_REFRESH_TOKEN",
+            )
         )
         return CredentialState(
             provider="codex",
@@ -530,6 +536,7 @@ def _read_claude_keychain() -> CredentialState | None:
 def discover_claude_credentials(config: Any) -> CredentialState | None:
     env_name, token = _env_first(
         (
+            "MUSE_GATEWAY_CLAUDE_ACCESS_TOKEN",
             "MUSE_SHIM_CLAUDE_ACCESS_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_TOKEN",
@@ -540,7 +547,11 @@ def discover_claude_credentials(config: Any) -> CredentialState | None:
         env_name = "command line" if token else None
     if token:
         refresh_name, refresh = _env_first(
-            ("MUSE_SHIM_CLAUDE_REFRESH_TOKEN", "CLAUDE_CODE_REFRESH_TOKEN")
+            (
+                "MUSE_GATEWAY_CLAUDE_REFRESH_TOKEN",
+                "MUSE_SHIM_CLAUDE_REFRESH_TOKEN",
+                "CLAUDE_CODE_REFRESH_TOKEN",
+            )
         )
         if not _is_oauth_token(token):
             return CredentialState(
@@ -793,7 +804,7 @@ def refresh_claude_oauth(
 def _credential_refresh_lock(path: Path) -> Iterator[None]:
     """Serialize file-backed refreshes when POSIX locking is available.
 
-    The lock is advisory and only coordinates processes that use this shim's
+    The lock is advisory and only coordinates processes that use this gateway's
     lock file. Provider CLIs that ignore it remain outside that coordination.
     """
     if fcntl is None:
@@ -1008,6 +1019,7 @@ def resolve_codex_credentials(
         allow_override = bool(getattr(config, "allow_oauth_host_override", False))
         token_url = str(
             getattr(config, "codex_token_url", "")
+            or os.environ.get("MUSE_GATEWAY_CODEX_TOKEN_URL", "")
             or os.environ.get("MUSE_SHIM_CODEX_TOKEN_URL", "")
             or DEFAULT_CODEX_TOKEN_URL
         )
@@ -1081,6 +1093,7 @@ def resolve_claude_credentials(
         allow_override = bool(getattr(config, "allow_oauth_host_override", False))
         urls = str(
             getattr(config, "claude_token_url", "")
+            or os.environ.get("MUSE_GATEWAY_CLAUDE_TOKEN_URL", "")
             or os.environ.get("MUSE_SHIM_CLAUDE_TOKEN_URL", "")
         ).strip()
         token_urls = (urls,) if urls else CLAUDE_TOKEN_URLS
@@ -1572,12 +1585,12 @@ def responses_to_anthropic(
 ) -> tuple[dict[str, Any], ToolNameMap]:
     if "previous_response_id" in body:
         raise ProviderError(
-            "Claude mode does not support previous_response_id because the shim has no durable response-state store.",
+            "Claude mode does not support previous_response_id because the gateway has no durable response-state store.",
             code="claude_previous_response_unsupported",
         )
     model = str(model_override or body.get("model") or "").strip()
     if not model:
-        raise ProviderError("request is missing model; set MUSE_SHIM_MODEL or send model.", code="model_missing")
+        raise ProviderError("request is missing model; set MUSE_GATEWAY_MODEL or send model.", code="model_missing")
     anthropic_tools, tool_names = convert_tools_to_anthropic(body.get("tools"), oauth=oauth)
     system_parts: list[dict[str, Any]] = []
     instructions = body.get("instructions", body.get("system"))

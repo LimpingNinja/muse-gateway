@@ -11,7 +11,7 @@ installation is not required. From the repository root:
 
 ```bash
 python -m unittest -v
-python -m muse_shim --help
+python -m muse_gateway --help
 ```
 
 Use `python3` if that is your Python executable. For an optional editable install,
@@ -26,19 +26,19 @@ Never make ordinary tests depend on personal credentials or paid inference.
 
 ## Areas of the codebase
 
-- `muse_shim.py`: model routing/catalogs, request transforms, HTTP server,
+- `muse_gateway.py`: model routing/catalogs, request transforms, HTTP server,
   diagnostics, the unified `launch` command, and the inherited low-level
   `run` launcher.
 - `muse_providers.py`: provider authentication and protocol adapters.
 - `muse-gateway` and `muse-gateway.ps1`: thin wrappers forwarding to
-  `python muse_shim.py launch`.
+  `python muse_gateway.py launch`.
 - `test_muse_shim.py` and `test_native_providers.py`: provider regression tests.
 - `test_launchers.py`: launcher contract tests (wrapper and direct `launch`
   startup, argument splitting, env-file loading).
 
-Module names, `MUSE_SHIM_*` settings, and legacy protocol identifiers are
-compatibility interfaces. Avoid cosmetic renames that break existing setups.
-Use **muse-gateway** in new user-facing documentation and messages.
+The `muse_shim` module alias, the `muse-shim` command alias, `MUSE_SHIM_*`
+settings, and legacy protocol identifiers are compatibility interfaces.
+Avoid cosmetic renames that break existing setups. Use **muse-gateway** in new user-facing documentation and messages.
 
 ## Change guidelines
 

@@ -50,26 +50,27 @@ Copy `.env.example` to `.env` beside the launchers (or `./.env` for the
 installed command), then edit it:
 
 ```dotenv
-MUSE_SHIM_LOCAL_UPSTREAM=http://127.0.0.1:4000/v1
-MUSE_SHIM_LOCAL_API_KEY=replace-with-your-upstream-key
+MUSE_GATEWAY_LOCAL_UPSTREAM=http://127.0.0.1:4000/v1
+MUSE_GATEWAY_LOCAL_API_KEY=replace-with-your-upstream-key
 # Optional: restrict the menu to these upstream model IDs.
-# MUSE_SHIM_LOCAL_MODELS=my-coder,my-reasoner
+# MUSE_GATEWAY_LOCAL_MODELS=my-coder,my-reasoner
 ```
 
-The `MUSE_SHIM_*` prefix is retained for configuration compatibility with the
-upstream project. Do not commit `.env` or credentials.
+Settings use the `MUSE_GATEWAY_*` prefix. The older `MUSE_SHIM_*` spellings
+from the upstream project still work as fallbacks; when both are set,
+`MUSE_GATEWAY_*` wins. Do not commit `.env` or credentials.
 
 The launcher reads configuration in this order: command-line flags, nonempty
 process environment variables, then `.env`. It does not create a config file.
 It warns and continues without requiring a local key; setting the key enables
-local-backend preflight. Clear unused `MUSE_SHIM_LOCAL_*` variables if you want no
+local-backend preflight. Clear unused `MUSE_GATEWAY_LOCAL_*` variables if you want no
 local entries, since the Python server still honors explicit upstream/model
 configuration independently of that launcher preflight. The wrappers pass
 `--env-file <checkout>/.env`; the installed command falls back to `./.env`
 — pass `--env-file` to be explicit.
 
 With an upstream configured, the gateway discovers IDs from `GET /models`.
-`MUSE_SHIM_LOCAL_MODELS` restricts that list when set. Discovery reads common
+`MUSE_GATEWAY_LOCAL_MODELS` restricts that list when set. Discovery reads common
 limit keys (`max_input_tokens`, `context_window`, `max_output_tokens`,
 `max_completion_tokens`, and similar aliases) and image-input evidence
 (`capabilities`, `modalities`, `supports_vision`, and similar fields) when the
@@ -119,7 +120,7 @@ It does **not** test inference or launch an interactive Muse session.
   subscription login, whose authorization header is forwarded per request.
 - **`local/<id>`:** forwards to your configured Responses endpoint. Namespace
   tools are flattened, and qualified historical tool-call names are rewritten
-  to match. Uses `MUSE_SHIM_LOCAL_API_KEY`, then `MUSE_SHIM_API_KEY`, then the
+  to match. Uses `MUSE_GATEWAY_LOCAL_API_KEY`, then `MUSE_GATEWAY_API_KEY`, then the
   incoming authorization header.
 - **`codex/<id>`:** uses Codex OAuth from its credential file or environment,
   including refresh support, and the native Codex Responses backend. It does
@@ -134,20 +135,20 @@ It does **not** test inference or launch an interactive Muse session.
 Only send requests to upstreams you trust. Without a route-specific key, bearer
 forwarding can send Muse's credentials to that upstream; the gateway logs a
 one-time warning when forwarding to a non-default upstream (a custom Meta URL,
-or a non-loopback local URL). A custom `MUSE_SHIM_META_UPSTREAM` also receives
+or a non-loopback local URL). A custom `MUSE_GATEWAY_META_UPSTREAM` also receives
 native Meta payloads and credentials; putting LiteLLM there does not guarantee
 it supports Meta's wire format.
 
 ## Advanced server use
 
 Two interfaces share one launcher implementation (`launch_main` in
-`muse_shim.py`):
+`muse_gateway.py`):
 
 - `muse-gateway.ps1` / `bash ./muse-gateway`: wrappers that forward to
-  `python muse_shim.py launch --env-file <checkout>/.env`.
+  `python muse_gateway.py launch --env-file <checkout>/.env`.
 - Installed `muse-gateway launch`: the same flow without the wrappers.
 
-`python -m muse_shim` without `launch` is the low-level server CLI; it does not
+`python -m muse_gateway` without `launch` is the low-level server CLI; it does not
 load `.env`. Server options may also go before the `launch` token
 (`muse-gateway --verbose launch ...`) for host, timeout, and logging settings;
 `launch` always serves the unified auto catalog.
@@ -156,7 +157,7 @@ For an explicit two-terminal setup, start the server with configuration already
 exported in its environment:
 
 ```bash
-python -m muse_shim auto
+python -m muse_gateway auto
 ```
 
 Then run Muse in the project you want to work on, with `META_API_KEY` unset for
@@ -166,41 +167,41 @@ subscription authentication:
 muse --provider meta --base-url http://127.0.0.1:8787
 ```
 
-For Meta API-key billing instead, configure `MUSE_SHIM_META_API_KEY` on the server
+For Meta API-key billing instead, configure `MUSE_GATEWAY_META_API_KEY` on the server
 and the appropriate `META_API_KEY` for Muse; use this manual setup rather than
 the subscription launcher.
 
-The inherited `python -m muse_shim run` command sets a placeholder Muse key.
+The inherited `python -m muse_gateway run` command sets a placeholder Muse key.
 It is suitable for routes that supply their own credentials, but **not** for
 forwarding Muse subscription authentication. Use `launch` for that.
 
 ### Server configuration
 
-Run `python -m muse_shim --help` for all flags. Common environment settings:
+Run `python -m muse_gateway --help` for all flags. Common environment settings:
 
-- `MUSE_SHIM_PROVIDER`: `auto` (default), `meta`, `local`, `codex`, `claude`,
+- `MUSE_GATEWAY_PROVIDER`: `auto` (default), `meta`, `local`, `codex`, `claude`,
   `generic`, or `http` (alias of `generic`).
-- `MUSE_SHIM_HOST`, `MUSE_SHIM_PORT`: default `127.0.0.1:8787`.
-- `MUSE_SHIM_META_UPSTREAM`, `MUSE_SHIM_META_API_KEY`, `MUSE_SHIM_META_MODELS`:
+- `MUSE_GATEWAY_HOST`, `MUSE_GATEWAY_PORT`: default `127.0.0.1:8787`.
+- `MUSE_GATEWAY_META_UPSTREAM`, `MUSE_GATEWAY_META_API_KEY`, `MUSE_GATEWAY_META_MODELS`:
   Meta route settings. With a static API key, the catalog is discovered live
   from `{upstream}/models`; otherwise (including subscription forwarding) the
-  bundled list is used. An explicit `MUSE_SHIM_META_MODELS` curates names while
+  bundled list is used. An explicit `MUSE_GATEWAY_META_MODELS` curates names while
   discovery enriches their limits.
-- `MUSE_SHIM_LOCAL_UPSTREAM`, `MUSE_SHIM_LOCAL_API_KEY`, `MUSE_SHIM_LOCAL_MODELS`:
+- `MUSE_GATEWAY_LOCAL_UPSTREAM`, `MUSE_GATEWAY_LOCAL_API_KEY`, `MUSE_GATEWAY_LOCAL_MODELS`:
   local route settings.
-- `MUSE_SHIM_UPSTREAM`, `MUSE_SHIM_API_KEY`: generic route settings; the generic
+- `MUSE_GATEWAY_UPSTREAM`, `MUSE_GATEWAY_API_KEY`: generic route settings; the generic
   upstream defaults to `https://openrouter.ai/api/v1`.
-- `MUSE_SHIM_CODEX_MODELS`, `MUSE_SHIM_CLAUDE_MODELS`: fallback/curated model IDs.
-- `MUSE_SHIM_NO_MODEL_DISCOVERY=1`: skip catalog requests and use configured IDs.
-- `MUSE_SHIM_PORTABLE=1`: remove reasoning and cache fields on non-Meta routes.
-- `MUSE_SHIM_MAX_OUTPUT_TOKENS`: cap requested output tokens.
-- `MUSE_SHIM_CLAUDE_TRANSPORT=cli|http`: select the Claude transport.
-- `MUSE_SHIM_CLAUDE_CLI`: Claude executable; defaults to `claude`.
-- `MUSE_SHIM_CODEX_AUTH`, `CODEX_HOME`: override Codex credential discovery.
-- `MUSE_SHIM_TIMEOUT`: upstream timeout in seconds.
-- `MUSE_SHIM_LOG_FILE`: diagnostic log path; defaults to `muse-gateway.log` in
+- `MUSE_GATEWAY_CODEX_MODELS`, `MUSE_GATEWAY_CLAUDE_MODELS`: fallback/curated model IDs.
+- `MUSE_GATEWAY_NO_MODEL_DISCOVERY=1`: skip catalog requests and use configured IDs.
+- `MUSE_GATEWAY_PORTABLE=1`: remove reasoning and cache fields on non-Meta routes.
+- `MUSE_GATEWAY_MAX_OUTPUT_TOKENS`: cap requested output tokens.
+- `MUSE_GATEWAY_CLAUDE_TRANSPORT=cli|http`: select the Claude transport.
+- `MUSE_GATEWAY_CLAUDE_CLI`: Claude executable; defaults to `claude`.
+- `MUSE_GATEWAY_CODEX_AUTH`, `CODEX_HOME`: override Codex credential discovery.
+- `MUSE_GATEWAY_TIMEOUT`: upstream timeout in seconds.
+- `MUSE_GATEWAY_LOG_FILE`: diagnostic log path; defaults to `muse-gateway.log` in
   the working directory. Also available as `--log-file` or PowerShell `-LogFile`.
-- `MUSE_SHIM_VERBOSE=1`: include HTTP access events in the diagnostic file.
+- `MUSE_GATEWAY_VERBOSE=1`: include HTTP access events in the diagnostic file.
 
 `--model` on the Python server pins a model only in provider-specific mode.
 In auto mode, select a model in Muse instead. The server's `--upstream` option
@@ -230,9 +231,9 @@ never follow a cross-origin redirect; such a redirect fails the request
 instead of forwarding authorization elsewhere.
 
 ```bash
-python -m muse_shim doctor --doctor-provider local
-python -m muse_shim doctor --doctor-provider codex
-python -m muse_shim doctor --doctor-provider claude
+python -m muse_gateway doctor --doctor-provider local
+python -m muse_gateway doctor --doctor-provider codex
+python -m muse_gateway doctor --doctor-provider claude
 ```
 
 These commands read the current environment, not `.env`. Doctor checks
@@ -309,6 +310,8 @@ Contributions and local test instructions: [CONTRIBUTING.md](CONTRIBUTING.md).
 Participation guidelines: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 License: [MIT](LICENSE), retaining the original muse-shim copyright notice.
 
-Python module names, the legacy CLI alias, environment variables, and selected
-protocol identifiers retain `muse_shim` / `muse-shim` for compatibility. The
+The legacy module alias (`muse_shim`, so `python -m muse_shim` still runs),
+the `muse-shim` console command and launcher wrapper, every `MUSE_SHIM_*`
+environment variable, older `muse-shim` health-service identifiers, and the
+`shim_error` wire error type keep working for compatibility. The
 project and user-facing product name are **muse-gateway**.

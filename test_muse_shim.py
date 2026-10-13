@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from muse_shim import (
+from muse_gateway import (
     Config,
     MuseShimHandler,
     MuseShimServer,
@@ -140,10 +140,10 @@ class TransformTests(unittest.TestCase):
         auto = config(provider="auto", upstream=None)
         with (
             patch(
-                "muse_shim.discover_codex_credentials",
+                "muse_gateway.discover_codex_credentials",
                 return_value=SimpleNamespace(access_token="test-token"),
             ),
-            patch("muse_shim.urllib.request.urlopen", return_value=Response()),
+            patch("muse_gateway.urllib.request.urlopen", return_value=Response()),
         ):
             catalog = provider_model_catalog(auto, "codex")
         self.assertEqual([item["model_id"] for item in catalog], ["codex/gpt-account-model"])
@@ -153,10 +153,10 @@ class TransformTests(unittest.TestCase):
         auto = config(provider="auto", upstream=None, model_discovery=True)
         with (
             patch(
-                "muse_shim.discover_claude_credentials",
+                "muse_gateway.discover_claude_credentials",
                 side_effect=AssertionError("CLI catalog must not inspect HTTP credentials"),
             ),
-            patch("muse_shim.shutil.which", return_value="/bin/claude"),
+            patch("muse_gateway.shutil.which", return_value="/bin/claude"),
         ):
             catalog = provider_model_catalog(auto, "claude")
         self.assertEqual(
@@ -215,8 +215,8 @@ class ProxyTests(unittest.TestCase):
             return forward
 
         with (
-            patch("muse_shim.MuseShimHandler.forward_codex", new=record("codex")),
-            patch("muse_shim.MuseShimHandler.forward_claude_cli", new=record("claude")),
+            patch("muse_gateway.MuseShimHandler.forward_codex", new=record("codex")),
+            patch("muse_gateway.MuseShimHandler.forward_claude_cli", new=record("claude")),
         ):
             shim_thread.start()
             try:
@@ -250,7 +250,7 @@ class ProxyTests(unittest.TestCase):
         # Menu-shape test: simulate installed providers so availability gating
         # does not hide the asserted rows.
         availability = patch(
-            "muse_shim._provider_is_available", return_value=True
+            "muse_gateway._provider_is_available", return_value=True
         )
         availability.start()
         try:
@@ -534,7 +534,7 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
                 ]}
             )
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(self._meta_config(), "meta")
         self.assertEqual(seen["url"], "https://api.meta.ai/v1/models")
         self.assertEqual(seen["auth"], "Bearer test-meta-key")
@@ -551,7 +551,7 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
             raise AssertionError("subscription setups must not probe Meta")
 
         cfg = config(provider="auto", upstream=None)
-        with patch("muse_shim.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             catalog = provider_model_catalog(cfg, "meta")
         self.assertEqual(
             [entry["model_id"] for entry in catalog],
@@ -562,7 +562,7 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
         def fail_urlopen(request, timeout=None):
             raise urllib.error.URLError("down")
 
-        with patch("muse_shim.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             catalog = provider_model_catalog(self._meta_config(), "meta")
         self.assertEqual(
             [entry["model_id"] for entry in catalog],
@@ -581,7 +581,7 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
             )
 
         cfg = self._meta_config(meta_models="muse-spark-1.3")
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(cfg, "meta")
         self.assertEqual(
             [(entry["model_id"], entry["context_limit"]) for entry in catalog],
@@ -624,7 +624,7 @@ class GatewayForwardTests(unittest.TestCase):
             seen["body"] = json.loads(request.data.decode("utf-8"))
             return FakeUpstream()
 
-        with patch("muse_shim.urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", side_effect=fake_urlopen):
             getattr(MuseShimHandler, method_name)(handler, body)
         return seen
 
@@ -735,7 +735,7 @@ class GatewayProxyTests(unittest.TestCase):
         # Menu-shape test: simulate installed providers so availability gating
         # does not hide the asserted rows.
         availability = patch(
-            "muse_shim._provider_is_available", return_value=True
+            "muse_gateway._provider_is_available", return_value=True
         )
         availability.start()
         try:
@@ -779,8 +779,8 @@ class GatewayProxyTests(unittest.TestCase):
             return forward
 
         with (
-            patch("muse_shim.MuseShimHandler.forward_meta", new=record("meta")),
-            patch("muse_shim.MuseShimHandler.forward_local", new=record("local")),
+            patch("muse_gateway.MuseShimHandler.forward_meta", new=record("meta")),
+            patch("muse_gateway.MuseShimHandler.forward_local", new=record("local")),
         ):
             shim_thread.start()
             try:
@@ -943,7 +943,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
                 {"data": [{"id": "alpha"}, {"id": "beta"}, {"id": "  "}, {}]}
             )
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(self._local_config(), "local")
         self.assertEqual(seen["url"], "http://127.0.0.1:9/v1/models")
         # (split literal: the tooling redacts "Bearer <word>" in file writes)
@@ -965,7 +965,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
             )
 
         cfg = self._local_config(local_models="x,y")
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(cfg, "local")
         limits = {
             entry["model_id"]: (entry["context_limit"], entry["output_limit"])
@@ -980,7 +980,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
             raise urllib.error.URLError("down")
 
         cfg = self._local_config(local_models="x")
-        with patch("muse_shim.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             catalog = provider_model_catalog(cfg, "local")
         self.assertEqual(
             [(entry["model_id"], entry["context_limit"])
@@ -993,21 +993,21 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
             raise AssertionError("discovery must not run when unconfigured")
 
         cfg = config(provider="auto")
-        with patch("muse_shim.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             self.assertEqual(provider_model_catalog(cfg, "local"), [])
 
     def test_discovery_failure_degrades_to_empty(self):
         def fail_urlopen(request, timeout=None):
             raise urllib.error.URLError("down")
 
-        with patch("muse_shim.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             self.assertEqual(
                 provider_model_catalog(self._local_config(), "local"), []
             )
 
     def test_malformed_payload_degrades_to_empty(self):
         with patch(
-            "muse_shim.urllib.request.urlopen",
+            "muse_gateway.urllib.request.urlopen",
             new=lambda request, timeout=None: _ModelsResponse({"nope": True}),
         ):
             self.assertEqual(
@@ -1019,7 +1019,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
             raise AssertionError("discovery must honor the flag")
 
         cfg = self._local_config(model_discovery=False)
-        with patch("muse_shim.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             self.assertEqual(provider_model_catalog(cfg, "local"), [])
 
     def test_discovery_carries_upstream_limits(self):
@@ -1036,7 +1036,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
                 }
             )
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(self._local_config(), "local")
         limits = {
             entry["model_id"]: (entry["context_limit"], entry["output_limit"])
@@ -1055,7 +1055,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
         def fake_urlopen(request, timeout=None):
             return _ModelsResponse({"data": [{"id": "beta"}]})
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             cfg = self._local_config()
             self.assertEqual(cfg.resolve_model("beta"), ("local", "beta"))
             with self.assertRaises(ProviderError):
@@ -1071,7 +1071,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
                 ]}
             )
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(self._local_config(), "local")
         self.assertEqual(catalog[0]["context_limit"], 500000)
         self.assertEqual(catalog[0]["output_limit"], 8000)
@@ -1091,7 +1091,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
                 return _ModelsResponse({"models": [{"name": "qwen:32b"}]})
             return _ModelsResponse({"data": []})
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(self._local_config(), "local")
         self.assertEqual(
             seen,
@@ -1108,7 +1108,7 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
                 {"data": [{"id": "plain"}, {"id": "seer", "supports_vision": True}]}
             )
 
-        with patch("muse_shim.urllib.request.urlopen", new=fake_urlopen):
+        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(self._local_config(), "local")
         wire = muse_catalog_response(catalog)["data"]
         modalities = {

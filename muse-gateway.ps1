@@ -3,12 +3,14 @@
   One-shot launcher: starts the muse-gateway, then Muse on top of it.
 
 .DESCRIPTION
-  Thin wrapper around `python muse_shim.py launch` (same as the installed
+  Thin wrapper around `python muse_gateway.py launch` (same as the installed
   `muse-gateway launch` command). Named parameters cover the launcher options;
   all remaining arguments pass straight through to `muse`, so this script
   behaves like the bare `muse` command line: subcommands (resume, exec),
   flags (--model, --yolo), and --help all work. Your working directory is
-  preserved for the Muse process.
+  preserved for the Muse process. If the port already serves a compatible
+  gateway (e.g. from another terminal), Muse attaches to it instead of
+  starting a new one.
 
   Meta models ride your `muse login` subscription (OAuth) via header
   forwarding, so no Meta API key is configured. Codex uses your existing
@@ -16,8 +18,9 @@
   zero dependencies.
 
   Local-backend config comes from flags (-LocalUpstream, -LocalApiKey,
-  -LocalModels), environment (MUSE_SHIM_LOCAL_UPSTREAM, MUSE_SHIM_LOCAL_API_KEY,
-  MUSE_SHIM_LOCAL_MODELS), or a `.env` file next to this script (copy
+  -LocalModels), environment (MUSE_GATEWAY_LOCAL_UPSTREAM,
+  MUSE_GATEWAY_LOCAL_API_KEY, MUSE_GATEWAY_LOCAL_MODELS; the MUSE_SHIM_*
+  spellings still work), or a `.env` file next to this script (copy
   `.env.example` to start; override with -EnvFile); flags win over env, env
   wins over the file. Without a key the launcher warns and continues.
   -LogFile and -MuseBin map to --log-file and --muse-bin; -Port is only
@@ -65,7 +68,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ShimScript = Join-Path $PSScriptRoot "muse_shim.py"
+$GatewayScript = Join-Path $PSScriptRoot "muse_gateway.py"
 if (-not $EnvFile) { $EnvFile = Join-Path $PSScriptRoot ".env" }
 
 $Python = Get-Command python -ErrorAction SilentlyContinue
@@ -85,8 +88,8 @@ if ($LocalApiKey) { $launchArgs += "--local-api-key", $LocalApiKey }
 if ($LocalModels) { $launchArgs += "--local-models", $LocalModels }
 if ($MuseBin) { $launchArgs += "--muse-bin", $MuseBin }
 if ($PythonCommand.Count -gt 1) {
-    & $PythonCommand[0] $PythonCommand[1] $ShimScript @launchArgs @MuseArgs
+    & $PythonCommand[0] $PythonCommand[1] $GatewayScript @launchArgs @MuseArgs
 } else {
-    & $PythonCommand[0] $ShimScript @launchArgs @MuseArgs
+    & $PythonCommand[0] $GatewayScript @launchArgs @MuseArgs
 }
 exit $LASTEXITCODE

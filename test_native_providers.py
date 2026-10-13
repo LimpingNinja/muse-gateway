@@ -39,7 +39,7 @@ from muse_providers import (
 )
 from contextlib import redirect_stderr
 
-from muse_shim import (
+from muse_gateway import (
     Config,
     MuseShimHandler,
     ShimError,
@@ -167,17 +167,22 @@ class NoCredentialEnvTest(unittest.TestCase):
         self._credential_env = patch.dict(
             os.environ,
             {
+                "MUSE_GATEWAY_CODEX_ACCESS_TOKEN": "",
                 "MUSE_SHIM_CODEX_ACCESS_TOKEN": "",
                 "CODEX_ACCESS_TOKEN": "",
                 "OPENAI_CODEX_ACCESS_TOKEN": "",
+                "MUSE_GATEWAY_CODEX_REFRESH_TOKEN": "",
                 "MUSE_SHIM_CODEX_REFRESH_TOKEN": "",
                 "CODEX_REFRESH_TOKEN": "",
                 "CLAUDE_CODE_OAUTH_TOKEN": "",
                 "ANTHROPIC_TOKEN": "",
+                "MUSE_GATEWAY_CLAUDE_ACCESS_TOKEN": "",
                 "MUSE_SHIM_CLAUDE_ACCESS_TOKEN": "",
                 "CLAUDE_CODE_REFRESH_TOKEN": "",
+                "MUSE_GATEWAY_CLAUDE_REFRESH_TOKEN": "",
                 "MUSE_SHIM_CLAUDE_REFRESH_TOKEN": "",
                 "ANTHROPIC_API_KEY": "",
+                "MUSE_GATEWAY_CLAUDE_CREDENTIALS": "",
                 "MUSE_SHIM_CLAUDE_CREDENTIALS": "",
                 "CLAUDE_CODE_CREDENTIALS_PATH": "",
                 "CLAUDE_CONFIG_DIR": "",
@@ -396,10 +401,10 @@ class NativeRetryTests(NoCredentialEnvTest):
         config = Config(_args(provider="codex"))
         handler = DummyForwardHandler(config)
         with patch(
-            "muse_shim.resolve_codex_credentials",
+            "muse_gateway.resolve_codex_credentials",
             side_effect=[first, second],
         ), patch(
-            "muse_shim.urllib.request.urlopen",
+            "muse_gateway.urllib.request.urlopen",
             side_effect=[_unauthorized_response(), success],
         ) as urlopen:
             MuseShimHandler.forward_codex(
@@ -419,10 +424,10 @@ class NativeRetryTests(NoCredentialEnvTest):
         config = Config(_args(provider="codex"))
         handler = DummyForwardHandler(config)
         with patch(
-            "muse_shim.resolve_codex_credentials",
+            "muse_gateway.resolve_codex_credentials",
             side_effect=[first, AuthError("refresh failed")],
         ), patch(
-            "muse_shim.urllib.request.urlopen",
+            "muse_gateway.urllib.request.urlopen",
             side_effect=[_unauthorized_response()],
         ):
             with self.assertRaisesRegex(AuthError, "codex login"):
@@ -447,10 +452,10 @@ class NativeRetryTests(NoCredentialEnvTest):
         config = Config(_args(provider="claude"))
         handler = DummyForwardHandler(config)
         with patch(
-            "muse_shim.resolve_claude_credentials",
+            "muse_gateway.resolve_claude_credentials",
             side_effect=[first, second],
         ), patch(
-            "muse_shim.urllib.request.urlopen",
+            "muse_gateway.urllib.request.urlopen",
             side_effect=[_unauthorized_response(), success],
         ) as urlopen:
             MuseShimHandler.forward_claude(
@@ -710,7 +715,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         )
         config = Config(_args(provider="auto"))
         with patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=False):
-            with patch("muse_shim.subprocess.run", return_value=completed) as launched:
+            with patch("muse_gateway.subprocess.run", return_value=completed) as launched:
                 payload, tool_names = run_claude_cli(body, config)
         command = launched.call_args.args[0]
         self.assertEqual(command[:2], ["claude", "-p"])
@@ -737,7 +742,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             args=[], returncode=1, stdout=json.dumps(cli_result), stderr=""
         )
         config = Config(_args(provider="auto"))
-        with patch("muse_shim.subprocess.run", return_value=completed):
+        with patch("muse_gateway.subprocess.run", return_value=completed):
             with self.assertRaises(ProviderError) as raised:
                 run_claude_cli(
                     {"model": "claude-haiku-4-5-20251001", "input": "hello"},
@@ -748,7 +753,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
 
     def test_run_mode_launches_muse_with_local_wiring_and_passthrough_args(self):
         config = Config(_args(provider="auto", port=0))
-        with patch("muse_shim.subprocess.Popen") as launched:
+        with patch("muse_gateway.subprocess.Popen") as launched:
             launched.return_value.wait.return_value = 7
             launched.return_value.poll.return_value = 7
             result = run_muse(config, ["--resume", "session-id"], output=io.StringIO())
@@ -760,11 +765,11 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(command[3], "--base-url")
         self.assertTrue(command[4].startswith("http://127.0.0.1:"))
         self.assertEqual(command[5:], ["--resume", "session-id"])
-        self.assertEqual(environment["META_API_KEY"], "local-shim-placeholder")
+        self.assertEqual(environment["META_API_KEY"], "local-gateway-placeholder")
 
     def test_run_mode_stops_muse_when_launcher_is_interrupted(self):
         config = Config(_args(provider="auto", port=0))
-        with patch("muse_shim.subprocess.Popen") as launched:
+        with patch("muse_gateway.subprocess.Popen") as launched:
             process = launched.return_value
             process.wait.side_effect = [KeyboardInterrupt(), None]
             process.poll.return_value = None
@@ -781,29 +786,29 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 "claude_transport": "cli",
             }
         )
-        with patch("muse_shim.urllib.request.urlopen", return_value=FakeResponse(auto)):
+        with patch("muse_gateway.urllib.request.urlopen", return_value=FakeResponse(auto)):
             self.assertTrue(_existing_shim_is_compatible("http://127.0.0.1:8787", "auto"))
             self.assertFalse(_existing_shim_is_compatible("http://127.0.0.1:8787", "codex"))
         with patch(
-            "muse_shim.urllib.request.urlopen",
+            "muse_gateway.urllib.request.urlopen",
             return_value=FakeResponse('{"ok":true}'),
         ):
             self.assertFalse(_existing_shim_is_compatible("http://127.0.0.1:8787", "auto"))
         with patch(
-            "muse_shim.urllib.request.urlopen",
+            "muse_gateway.urllib.request.urlopen",
             return_value=FakeResponse("[]"),
         ):
             self.assertFalse(_existing_shim_is_compatible("http://127.0.0.1:8787", "auto"))
 
     def test_main_run_intercepts_muse_args_before_shim_argparse(self):
-        with patch("muse_shim.run_muse", return_value=9) as launch:
+        with patch("muse_gateway.run_muse", return_value=9) as launch:
             result = main(["run", "--model", "codex/gpt-test"])
         self.assertEqual(result, 9)
         self.assertEqual(launch.call_args.args[1], ["--model", "codex/gpt-test"])
         self.assertEqual(launch.call_args.args[0].provider, "auto")
 
     def test_main_accepts_shim_options_before_run(self):
-        with patch("muse_shim.run_muse", return_value=0) as launch:
+        with patch("muse_gateway.run_muse", return_value=0) as launch:
             result = main(["--port", "9876", "run", "--resume"])
         self.assertEqual(result, 0)
         self.assertEqual(launch.call_args.args[0].port, 9876)
@@ -930,7 +935,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 kwargs = ({"side_effect": response} if isinstance(response, Exception)
                           else {"return_value": response})
                 with patch.dict(os.environ, {}, clear=True), patch(
-                    "muse_shim.urllib.request.urlopen", **kwargs
+                    "muse_gateway.urllib.request.urlopen", **kwargs
                 ), patch("sys.stdout", output):
                     result = main([
                         "doctor", "--doctor-provider", "local",
@@ -951,7 +956,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 ))
                 output = io.StringIO()
                 response = FakeResponse('{"data":[{"id":"local-test"}]}')
-                with patch("muse_shim.urllib.request.urlopen", return_value=response):
+                with patch("muse_gateway.urllib.request.urlopen", return_value=response):
                     self.assertEqual(run_doctor(config, output=output), 0)
                 self.assertIn("local: ready", output.getvalue())
 
@@ -961,7 +966,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             local_api_key="test-key",
         ))
         output = io.StringIO()
-        with patch("muse_shim._credential_status", return_value=(True, "configured")) as status:
+        with patch("muse_gateway._credential_status", return_value=(True, "configured")) as status:
             self.assertEqual(run_doctor(config, output=output), 0)
         self.assertIn("local", [call.args[1] for call in status.call_args_list])
 
@@ -988,7 +993,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
     def test_error_redaction_is_byte_safe(self):
         import http.client
         import threading
-        from muse_shim import MuseShimServer
+        from muse_gateway import MuseShimServer
 
         self.assertEqual(_redact_bytes(b"token=secret-value", ["secret-value"]), b"token=[REDACTED]")
         self.assertEqual(_redact_bytes(b"secret-value", ["Bearer secret-value"]), b"[REDACTED]")
@@ -1009,7 +1014,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 "http://127.0.0.1/responses", 400, "bad request", {}, io.BytesIO(upstream_body)
             )
             try:
-                with patch("muse_shim.urllib.request.urlopen", side_effect=failure), redirect_stderr(stderr):
+                with patch("muse_gateway.urllib.request.urlopen", side_effect=failure), redirect_stderr(stderr):
                     connection.request("POST", "/responses", json.dumps({
                         "model": "audit-model", "input": "private-prompt",
                         "reasoning": {"effort": "minimal"},
@@ -1022,7 +1027,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 stream_bytes = b'event: error\ndata: {"type":"error","error":{"message":"Unsupported effort","param":"reasoning.effort","code":"unsupported_value"}}\n\n'
                 stream = FakeResponse(stream_bytes, headers={"Content-Type": "text/event-stream"})
                 stream.readline = io.BytesIO(stream_bytes).readline
-                with patch("muse_shim.urllib.request.urlopen", return_value=stream), redirect_stderr(stderr):
+                with patch("muse_gateway.urllib.request.urlopen", return_value=stream), redirect_stderr(stderr):
                     connection.request("POST", "/responses", json.dumps({
                         "model": "audit-model", "input": "private-prompt", "stream": True,
                     }), {"Authorization": "Bearer incoming-secret", "Content-Type": "application/json"})
@@ -1046,7 +1051,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertEqual(stderr.getvalue(), "")
 
     def test_cli_inference_is_explicitly_limited_to_claude_print_mode(self):
-        source = Path("muse_shim.py").read_text(encoding="utf-8") + Path("muse_providers.py").read_text(encoding="utf-8")
+        source = Path("muse_gateway.py").read_text(encoding="utf-8") + Path("muse_providers.py").read_text(encoding="utf-8")
         self.assertNotIn("codex " + "exec", source)
         self.assertNotIn("shell=True", source)
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env sh
+# Backward-compatible alias for the muse-gateway launcher.
+# Prefer ./muse-gateway; this wrapper keeps the old name working.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$script_dir/muse_shim.py" "$@"
+exec python3 "$script_dir/muse_gateway.py" "$@"

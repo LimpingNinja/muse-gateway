@@ -30,7 +30,7 @@ jobs:
       - name: Check launcher syntax
         run: bash -n muse-gateway
       - name: Check launch help renders
-        run: python -m muse_shim launch -h
+        run: python -m muse_gateway launch -h
       - name: Reject committed secrets and private endpoints
         run: |
           set -euo pipefail

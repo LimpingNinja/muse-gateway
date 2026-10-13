@@ -1,11 +1,13 @@
 """Tests for the unified subscription launcher.
 
 The platform wrapper (PowerShell on Windows, Bash elsewhere) forwards to
-`python muse_shim.py launch`, so both entries are exercised against the same
+`python muse_gateway.py launch`, so both entries are exercised against the same
 clean-room startup contract. Pure parsing units are tested in-process; the
 startup path runs as a subprocess so server shutdown is always observed.
 """
 
+import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,9 +15,21 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 
-from muse_shim import ProviderError, _split_launch_args, load_env_file
+from muse_gateway import (
+    Config,
+    MuseShimServer,
+    ProviderError,
+    _split_launch_args,
+    launch_main,
+    load_env_file,
+    main,
+    parse_args,
+)
 
 
 def _free_port():
@@ -28,14 +42,15 @@ def _clean_environment(explicit_models=False):
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("MUSE_SHIM_") and key != "META_API_KEY"
+        if not key.startswith(("MUSE_GATEWAY_", "MUSE_SHIM_"))
+        and key != "META_API_KEY"
     }
     environment.update({
-        "MUSE_SHIM_NO_MODEL_DISCOVERY": "1",
-        "MUSE_SHIM_CODEX_ACCESS_TOKEN": "launcher-test-token",
+        "MUSE_GATEWAY_NO_MODEL_DISCOVERY": "1",
+        "MUSE_GATEWAY_CODEX_ACCESS_TOKEN": "launcher-test-token",
     })
     if explicit_models:
-        environment["MUSE_SHIM_LOCAL_MODELS"] = "launcher-test"
+        environment["MUSE_GATEWAY_LOCAL_MODELS"] = "launcher-test"
     return environment
 
 
@@ -43,7 +58,7 @@ def _stage_checkout(directory):
     root = Path(__file__).resolve().parent
     work = Path(directory)
     launcher = "muse-gateway.ps1" if os.name == "nt" else "muse-gateway"
-    for name in (launcher, "muse_shim.py", "muse_providers.py"):
+    for name in (launcher, "muse_gateway.py", "muse_providers.py"):
         shutil.copyfile(root / name, work / name)
     return work, launcher
 
@@ -95,12 +110,100 @@ class LauncherTests(unittest.TestCase):
             environment = _clean_environment(explicit_models=True)
             port = _free_port()
             command = [
-                sys.executable, str(work / "muse_shim.py"), "launch",
+                sys.executable, str(work / "muse_gateway.py"), "launch",
                 "--env-file", str(work / ".env"),
                 "--check-only", "--port", str(port),
             ]
             output = _run_check_only(command, work, environment, port)
             self.assertIn("local/launcher-test", output)
+
+
+class ModelsAndReuseTests(unittest.TestCase):
+    """In-process coverage for --models and second-terminal reuse.
+
+    Neither path spawns Muse (--models exits before serving; reuse is
+    exercised with --check-only), so no subprocess is needed. Discovery
+    stays off and credentials stay fake: both tests are fully offline.
+    """
+
+    def _offline_environment(self):
+        environment = _clean_environment()
+        # Claude CLI may or may not exist on the test machine; keyless HTTP
+        # transport is unavailable everywhere, keeping the listing exact.
+        environment["MUSE_GATEWAY_CLAUDE_TRANSPORT"] = "http"
+        return environment
+
+    def test_models_lists_catalog_ids_without_starting_server(self):
+        saved = os.environ.copy()
+        environment = self._offline_environment()
+        os.environ.clear()
+        os.environ.update(environment)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                missing = str(Path(directory) / ".env")
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = main(["--models", "--env-file", missing])
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out.getvalue().split(),
+            [
+                "codex/gpt-5.6-sol",
+                "codex/gpt-5.6-terra",
+                "codex/gpt-5.5",
+                "codex/gpt-5.4",
+                "meta/muse-spark-1.3",
+                "meta/muse-spark-1.2",
+            ],
+        )
+
+    def test_launch_attaches_to_compatible_gateway(self):
+        saved = os.environ.copy()
+        environment = self._offline_environment()
+        os.environ.clear()
+        os.environ.update(environment)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                port = _free_port()
+                server_config = Config(parse_args([
+                    "auto", "--port", str(port),
+                    "--log-file", str(work / "server.log"),
+                ]))
+                server = MuseShimServer(
+                    (server_config.host, port), server_config
+                )
+                thread = threading.Thread(
+                    target=server.serve_forever, daemon=True
+                )
+                thread.start()
+                try:
+                    out, err = io.StringIO(), io.StringIO()
+                    with redirect_stdout(out), redirect_stderr(err):
+                        code = launch_main([], [
+                            "--port", str(port), "--check-only",
+                            "--env-file", str(work / ".env"),
+                            "--log-file", str(work / "launch.log"),
+                        ])
+                    output = out.getvalue()
+                    self.assertEqual(code, 0)
+                    self.assertIn("reusing existing gateway", output)
+                    self.assertIn("catalog (", output)
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/health", timeout=5
+                    ) as response:
+                        health = json.loads(response.read().decode("utf-8"))
+                    self.assertTrue(health.get("ok"))
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
 
 class LaunchArgTests(unittest.TestCase):
