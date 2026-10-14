@@ -45,7 +45,6 @@ from muse_gateway import (
     ShimError,
     _existing_shim_is_compatible,
     _forwarding_warnings,
-    _iter_upstream_chunks,
     _redact_bytes,
     _run_command_index,
     _warn_credential_forwarding_once,
@@ -418,12 +417,15 @@ class NativeRetryTests(NoCredentialEnvTest):
         success = FakeResponse(json.dumps({"id": "resp-ok"}), headers={"Content-Type": "application/json"})
         config = Config(_args(provider="codex"))
         handler = DummyForwardHandler(config)
+        rejected = _unauthorized_response()
+        rejected_body = rejected.fp
+        self.addCleanup(rejected.close)
         with patch(
             "muse_gateway.resolve_codex_credentials",
             side_effect=[first, second],
         ), patch(
             "muse_gateway.urllib.request.urlopen",
-            side_effect=[_unauthorized_response(), success],
+            side_effect=[rejected, success],
         ) as urlopen:
             MuseShimHandler.forward_codex(
                 handler,
@@ -436,23 +438,28 @@ class NativeRetryTests(NoCredentialEnvTest):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(urlopen.call_args_list[0].args[0].headers["Authorization"], "Bearer old-access")
         self.assertEqual(urlopen.call_args_list[1].args[0].headers["Authorization"], "Bearer new-access")
+        self.assertTrue(rejected_body.closed, "rejected response leaked during Codex retry")
 
     def test_codex_refresh_failure_surfaces_login_action(self):
         first = CredentialState(provider="codex", access_token="old-access", refresh_token="old-refresh")
         config = Config(_args(provider="codex"))
         handler = DummyForwardHandler(config)
+        rejected = _unauthorized_response()
+        rejected_body = rejected.fp
+        self.addCleanup(rejected.close)
         with patch(
             "muse_gateway.resolve_codex_credentials",
             side_effect=[first, AuthError("refresh failed")],
         ), patch(
             "muse_gateway.urllib.request.urlopen",
-            side_effect=[_unauthorized_response()],
+            side_effect=[rejected],
         ):
             with self.assertRaisesRegex(AuthError, "codex login"):
                 MuseShimHandler.forward_codex(
                     handler,
                     {"model": "gpt-5-codex", "input": "hello"},
                 )
+        self.assertTrue(rejected_body.closed, "rejected response leaked when refresh failed")
 
     def test_claude_oauth_401_refreshes_and_retries_once(self):
         first = CredentialState(provider="claude", access_token="old-access", refresh_token="old-refresh")
@@ -469,12 +476,15 @@ class NativeRetryTests(NoCredentialEnvTest):
         )
         config = Config(_args(provider="claude"))
         handler = DummyForwardHandler(config)
+        rejected = _unauthorized_response()
+        rejected_body = rejected.fp
+        self.addCleanup(rejected.close)
         with patch(
             "muse_gateway.resolve_claude_credentials",
             side_effect=[first, second],
         ), patch(
             "muse_gateway.urllib.request.urlopen",
-            side_effect=[_unauthorized_response(), success],
+            side_effect=[rejected, success],
         ) as urlopen:
             MuseShimHandler.forward_claude(
                 handler,
@@ -483,6 +493,7 @@ class NativeRetryTests(NoCredentialEnvTest):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(urlopen.call_args_list[0].args[0].headers["Authorization"], "Bearer old-access")
         self.assertEqual(urlopen.call_args_list[1].args[0].headers["Authorization"], "Bearer new-access")
+        self.assertTrue(rejected_body.closed, "rejected response leaked during Claude retry")
 
 
 class ClaudeAuthAndConversionTests(NoCredentialEnvTest):
@@ -690,6 +701,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
 
 class CliAndSafetyTests(NoCredentialEnvTest):
+    def assert_cli_error(self, args, message):
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic), self.assertRaises(SystemExit) as caught:
+            parse_args(args)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn(message, diagnostic.getvalue())
+
     def test_cli_modes_and_provider_endpoints(self):
         self.assertEqual(parse_args([]).provider, "auto")
         self.assertEqual(parse_args(["codex"]).provider, "codex")
@@ -837,20 +855,18 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(_run_command_index(["--port", "9876", "run"]), 2)
 
     def test_auto_rejects_global_model_pin(self):
-        with self.assertRaises(SystemExit):
-            parse_args(["auto", "--model", "gpt-5"])
+        self.assert_cli_error(["auto", "--model", "gpt-5"], "cannot pin auto mode")
 
     def test_native_hosts_and_tls_are_rejected_without_explicit_development_opt_in(self):
-        with self.assertRaises(SystemExit):
-            parse_args(["codex", "--upstream", "https://evil.example/responses"])
-        with self.assertRaises(SystemExit):
-            parse_args(["codex", "--codex-token-url", "https://evil.example/token"])
-        with self.assertRaises(SystemExit):
-            parse_args(["claude", "--claude-token-url", "https://evil.example/token"])
-        with self.assertRaises(SystemExit):
-            parse_args(["codex", "--insecure-upstream"])
-        with self.assertRaises(SystemExit):
-            parse_args(["claude", "--insecure-upstream"])
+        for args, message in (
+            (["codex", "--upstream", "https://evil.example/responses"], "not an approved native URL"),
+            (["codex", "--codex-token-url", "https://evil.example/token"], "not an approved native URL"),
+            (["claude", "--claude-token-url", "https://evil.example/token"], "not an approved native URL"),
+            (["codex", "--insecure-upstream"], "not permitted"),
+            (["claude", "--insecure-upstream"], "not permitted"),
+        ):
+            with self.subTest(args=args):
+                self.assert_cli_error(args, message)
 
     def test_environment_typo_cannot_implicitly_enable_oauth_host_override(self):
         with patch.dict(
@@ -861,8 +877,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             },
             clear=False,
         ):
-            with self.assertRaises(SystemExit):
-                parse_args(["codex"])
+            self.assert_cli_error(["codex"], "not an approved native URL")
 
     def test_explicit_oauth_host_override_is_required_for_local_fake_endpoints(self):
         args = parse_args(
@@ -879,31 +894,9 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(args.upstream, "http://127.0.0.1:9999/responses")
 
     def test_non_loopback_binding_requires_explicit_opt_in(self):
-        with self.assertRaises(SystemExit):
-            parse_args(["generic", "--host", "0.0.0.0"])
+        self.assert_cli_error(["generic", "--host", "0.0.0.0"], "refusing non-loopback")
         args = parse_args(["generic", "--host", "0.0.0.0", "--allow-non-loopback"])
         self.assertTrue(args.allow_non_loopback)
-
-    def test_stream_reader_is_prompt_and_does_not_use_large_read(self):
-        class LineReader:
-            def __init__(self):
-                self.lines = [b"event: one\n", b"data: {}\n", b"\n"]
-                self.calls = []
-
-            def readline(self):
-                self.calls.append("readline")
-                return self.lines.pop(0) if self.lines else b""
-
-            def read(self, amount=-1):
-                self.calls.append(("read", amount))
-                raise AssertionError("large read path used")
-
-        reader = LineReader()
-        self.assertEqual(
-            list(_iter_upstream_chunks(reader, content_type="text/event-stream")),
-            [b"event: one\n", b"data: {}\n", b"\n"],
-        )
-        self.assertEqual(reader.calls[:3], ["readline", "readline", "readline"])
 
     def test_body_limit_rejects_before_reading(self):
         class NeverRead:

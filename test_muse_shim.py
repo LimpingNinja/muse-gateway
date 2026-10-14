@@ -1,7 +1,6 @@
 import argparse
 import io
 import json
-import socket
 import threading
 import unittest
 import urllib.error
@@ -21,21 +20,6 @@ from muse_gateway import (
     muse_catalog_response,
     provider_model_catalog,
     transform_request,
-)
-
-
-def loopback_sockets_available():
-    try:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.close()
-        return True
-    except OSError:
-        return False
-
-
-NETWORK_TEST = unittest.skipUnless(
-    loopback_sockets_available(),
-    "loopback sockets are unavailable in this restricted test environment",
 )
 
 
@@ -116,7 +100,7 @@ class TransformTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "cannot infer a provider"):
             auto.resolve_model("mystery-model")
 
-    def test_live_codex_catalog_replaces_default_fallbacks(self):
+    def test_mocked_codex_discovery_replaces_bundled_fallbacks(self):
         class Response:
             def __enter__(self):
                 return self
@@ -176,6 +160,9 @@ class TransformTests(unittest.TestCase):
 
 
 class FakeUpstreamHandler(BaseHTTPRequestHandler):
+    # An opaque sentinel for a byte-passthrough test, NOT a valid Responses
+    # fixture or evidence of client acceptance.
+    wire = b": opaque passthrough sentinel\n\ndata: opaque payload\n\n"
     request_body = None
     authorization = None
 
@@ -187,7 +174,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         type(self).request_body = json.loads(
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
         )
-        payload = b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        payload = self.wire
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
@@ -195,9 +182,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-@NETWORK_TEST
 class ProxyTests(unittest.TestCase):
-    def test_auto_dispatches_each_selected_model_to_its_native_transport(self):
+    def test_http_dispatch_selects_provider_branch(self):
         shim_config = config(
             provider="auto",
             upstream=None,
@@ -236,7 +222,7 @@ class ProxyTests(unittest.TestCase):
             [("codex", "gpt-selected"), ("claude", "claude-selected")],
         )
 
-    def test_auto_catalog_is_visible_to_muse(self):
+    def test_muse_catalog_endpoint_shape(self):
         shim_config = config(
             provider="auto",
             upstream=None,
@@ -300,7 +286,7 @@ class ProxyTests(unittest.TestCase):
             shim.shutdown()
             shim.server_close()
 
-    def test_forwards_transformed_stream(self):
+    def test_transforms_request_and_preserves_opaque_upstream_bytes(self):
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         upstream_thread.start()
@@ -331,9 +317,9 @@ class ProxyTests(unittest.TestCase):
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(request, timeout=5) as response:
-                payload = response.read().decode()
+                payload = response.read()
 
-            self.assertIn("response.completed", payload)
+            self.assertEqual(payload, FakeUpstreamHandler.wire)
             self.assertEqual(FakeUpstreamHandler.authorization, "Bearer test-key")
             self.assertEqual(FakeUpstreamHandler.request_body["model"], "openai/gpt-5")
             self.assertEqual(FakeUpstreamHandler.request_body["tools"][0]["name"], "read_file")
@@ -358,7 +344,8 @@ class ProxyTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as raised:
                 urllib.request.urlopen(request, timeout=5)
             self.assertEqual(raised.exception.code, 400)
-            error = json.loads(raised.exception.read())
+            with raised.exception as response:
+                error = json.load(response)
             self.assertIn("no upstream API key", error["error"]["message"])
         finally:
             shim.shutdown()
@@ -528,7 +515,7 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
         values.update(overrides)
         return config(**values)
 
-    def test_live_discovery_replaces_bundled_fallbacks(self):
+    def test_mocked_meta_discovery_replaces_bundled_fallbacks(self):
         seen = {}
 
         def fake_urlopen(request, timeout=None):
@@ -722,7 +709,6 @@ class GatewayForwardTests(unittest.TestCase):
         self.assertEqual(seen["auth"], f"Bearer {'generic-key'}")
 
 
-@NETWORK_TEST
 class GatewayProxyTests(unittest.TestCase):
     """End-to-end route checks. Need loopback binds (see ProxyTests)."""
 

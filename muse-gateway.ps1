@@ -14,8 +14,8 @@
 
   Meta models ride your `muse login` subscription (OAuth) via header
   forwarding, so no Meta API key is configured. Codex uses your existing
-  `codex login`. No virtualenv needed: the gateway is stdlib-only,
-  zero dependencies.
+  `codex login`. Install once with `python -m pip install .` from the checkout;
+  protobuf is installed with the package. A virtual environment is optional.
 
   Local-backend config comes from flags (-LocalUpstream, -LocalApiKey,
   -LocalModels), environment (MUSE_GATEWAY_LOCAL_UPSTREAM,
@@ -35,20 +35,18 @@
   Resume a previous session through the gateway.
 
 .EXAMPLE
-  .\muse-gateway.ps1 exec "summarize the repo root" --model local/<alias>
-  One-shot agent run through the gateway on a local model.
-
-.EXAMPLE
   .\muse-gateway.ps1 -CheckOnly
-  Preflight + gateway + catalog check, then exits (no Muse launch).
+  Preflight + gateway + catalog check, then exits (no Muse or inference).
 
 .EXAMPLE
-  .\muse-gateway.ps1 -Port 9000 -- --yolo
-  Custom port; extra args after -- go straight to `muse`.
+  .\muse-gateway.ps1 -Port 9000
+  Starts the gateway and Muse on a different port.
 
 .NOTES
   For Meta API-key billing, use the manual server setup in README.md instead
   of this subscription-authentication launcher.
+  Headless `exec` arguments pass to Muse, whose model-profile/compaction rules
+  still apply. Invoke this script by absolute path to work in another project.
   When launching via `powershell -File`, omit the `--` separator and pass
   Muse arguments directly (bare subcommands and flags all work); `-File`
   cannot forward a literal `--` token.

@@ -3,7 +3,7 @@
 
 Modes:
 
-* ``auto`` advertises Meta, Codex, Claude, and configured local models to Muse
+* ``auto`` advertises Meta, Codex, Claude, Devin, and configured local models to Muse
   and routes requests according to the selection in Muse's ``/model`` menu.
 * ``generic`` / ``http`` (the historical mode) forwards Responses requests
   to any Responses-compatible endpoint.
@@ -18,6 +18,8 @@ Modes:
 * ``local`` (gateway fork) forwards to a user-configured Responses endpoint
   (LiteLLM, Ollama via an adapter, ...) with the usual flattened tools.
   ``auto`` advertises ``local/`` aliases only when explicitly configured.
+* ``devin`` uses the Connect/protobuf API with a session token, Devin CLI login,
+  or OMP credential store; the CLI is not used for inference.
 
 The implementation needs a single runtime dependency (protobuf, for the
 Devin provider's generated bindings). Codex uses its ordinary
@@ -2444,6 +2446,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     return
             except urllib.error.HTTPError as error:
                 if error.code in {401, 403} and not auth_refreshed:
+                    error.close()
                     try:
                         state = resolve_codex_credentials(self.config, force_refresh=True)
                     except ProviderError as refresh_error:
@@ -2455,6 +2458,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     auth_refreshed = True
                     continue
                 if error.code in {401, 403}:
+                    error.close()
                     raise AuthError(
                         "Codex upstream rejected the OAuth credentials. Run `codex login` and try again.",
                         code="codex_upstream_unauthorized",
@@ -2594,6 +2598,9 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     self.wfile.write(encoded)
                     return
             except urllib.error.HTTPError as error:
+                # This adapter projects only the status, never the body.
+                # Dispose it before retry/refresh or retaining an exception.
+                error.close()
                 if error.code in {401, 403} and attempt == 0 and state.auth_mode != "api_key":
                     try:
                         state = resolve_claude_credentials(self.config, force_refresh=True)
@@ -2720,7 +2727,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "muse-gateway: loopback Muse proxy with a unified Meta, Codex, "
-            "Claude, and local model catalog (forked from muse-shim)"
+            "Claude, Devin, and local model catalog (forked from muse-shim)"
         ),
         epilog=(
             "For Muse subscription auth use `muse-gateway launch [MUSE_ARGS...]` "
@@ -2764,7 +2771,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--meta-upstream",
         default=env_value("MUSE_GATEWAY_META_UPSTREAM"),
-        help="Meta Responses base URL (default: https://api.meta.ai/v1; point at LiteLLM to route Meta via your gateway)",
+        help="Meta Responses base URL (default: https://api.meta.ai/v1; custom hosts receive native Meta payloads and authorization)",
     )
     parser.add_argument(
         "--meta-api-key",
@@ -2796,7 +2803,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=env_value(
             "MUSE_GATEWAY_DEVIN_API_KEY", env_value("DEVIN_API_KEY")
         ),
-        help="Devin session token (prefer env vars; else the OMP credential store)",
+        help="Devin session token (prefer env vars; else Devin CLI login, then OMP credential store)",
     )
     parser.add_argument(
         "--devin-auth-db",
@@ -3273,7 +3280,7 @@ ends option parsing and everything from there goes to `muse`.
   --local-api-key KEY        local upstream API key
   --local-models A,B         restrict local/ entries to these upstream IDs
   --devin-upstream URL       Devin Connect RPC base URL
-  --devin-api-key KEY        Devin session token (else OMP credential store)
+  --devin-api-key KEY        Devin session token (else CLI login, then OMP)
   --devin-auth-db PATH       OMP agent.db path for Devin credentials
   --devin-credential-id ID   Devin credential row when several are active
   --devin-models A,B         restrict devin/ entries to these IDs

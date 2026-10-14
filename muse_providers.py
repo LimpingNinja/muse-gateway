@@ -2213,15 +2213,25 @@ def convert_anthropic_stream(
     tool_names: ToolNameMap,
 ) -> Iterator[bytes]:
     state = StreamState(model=model, tool_names=tool_names)
+    sequence = 0
+
+    def encode_event(event_name, payload):
+        nonlocal sequence
+        # Muse's Responses decoder requires numbering on every event,
+        # including synthetic lifecycle/failure events on truncated streams.
+        numbered = {**payload, "sequence_number": sequence}
+        sequence += 1
+        return response_sse_line(event_name, numbered)
+
     for event_name, payload in _iter_sse_text(stream):
         for output_event, output_payload in convert_anthropic_event(event_name, payload, state):
-            yield response_sse_line(output_event, output_payload)
+            yield encode_event(output_event, output_payload)
     if not state.finished:
         if not state.started:
             for output_event, output_payload in convert_anthropic_event(
                 "message_start", {"type": "message_start", "message": {}}, state
             ):
-                yield response_sse_line(output_event, output_payload)
+                yield encode_event(output_event, output_payload)
         state.stop_reason = "error"
         state.error_message = state.error_message or (
             "Claude stream ended before message_stop."
@@ -2229,7 +2239,7 @@ def convert_anthropic_stream(
         state.error_type = state.error_type or "truncated_stream"
         status = "failed"
         event_name = "response.failed"
-        yield response_sse_line(event_name, _event_payload(event_name, {"response": state.response(status=status)}))
+        yield encode_event(event_name, _event_payload(event_name, {"response": state.response(status=status)}))
         state.finished = True
 
 

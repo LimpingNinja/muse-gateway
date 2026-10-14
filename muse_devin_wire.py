@@ -448,7 +448,12 @@ def _post(url, body, headers, timeout):
     try:
         response = urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as error:
-        payload = error.read() if hasattr(error, "read") else b""
+        try:
+            payload = error.read()
+        finally:
+            # The chained exception can outlive this request; do not leave
+            # its HTTP response/socket open until garbage collection.
+            error.close()
         if capture is not None:
             label = capture.label("devin.http_error")
             capture.json(label + ".headers", {"status": error.code, "headers": dict(error.headers or {})})

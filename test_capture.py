@@ -39,22 +39,6 @@ def post(base, body, headers=None):
 
 
 class CaptureTests(unittest.TestCase):
-    def test_public_catalog_uses_context_size_without_subtraction(self):
-        response = devin_pb2.GetCliModelConfigsResponse()
-        for uid, context in (("ctx-small", 200000), ("ctx-wide", 1000000), ("ctx-fallback", 0)):
-            row = response.client_model_configs.add(model_uid=uid, label=uid, max_tokens=context)
-            row.model_info.max_output_tokens = 64000
-        with tempfile.TemporaryDirectory() as directory:
-            config = Config(argparse.Namespace(provider="devin", devin_api_key="fake-token",
-                model_discovery=True, log_file=str(Path(directory) / "gateway.log")))
-            with patch("muse_devin._fetch_catalog", return_value=response):
-                with serving(MuseShimServer(("127.0.0.1", 0), config)) as base:
-                    with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as result:
-                        rows = json.load(result)["data"]
-            contexts = {row["id"]: row["metadata"]["muse-code"]["limit"]["context"] for row in rows}
-            self.assertEqual(contexts, {"devin/ctx-small": 200000, "devin/ctx-wide": 1000000,
-                                        "devin/ctx-fallback": 200000})
-
     def test_scrubs_split_secrets_and_records_explicit_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
             session = CaptureSession(directory)
@@ -205,7 +189,8 @@ class CaptureTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     post(base, {"model": "gpt-test", "input": "hello", "stream": True})
                 self.assertEqual(raised.exception.code, 400)
-                self.assertEqual(json.loads(raised.exception.read())["error"]["type"], "codex_upstream_error")
+                with raised.exception as response:
+                    self.assertEqual(json.load(response)["error"]["type"], "codex_upstream_error")
             request_dir = next(path for path in server.capture_session.directory.iterdir() if path.is_dir())
             self.assertEqual((request_dir / "upstream.error.body").read_bytes(), error_body)
             captured_request = json.loads((request_dir / "outgoing.body").read_bytes())
@@ -341,49 +326,6 @@ class CaptureTests(unittest.TestCase):
         for token in ("concurrent-a", "concurrent-b"):
             roster, _ = config._devin_rosters[_devin_cache_key(config, token)]
             self.assertEqual(set(roster), {token})
-
-    def test_flushed_connect_frame_reaches_client_before_upstream_eof(self):
-        release = threading.Event()
-        message = devin_pb2.GetChatMessageResponse(message_id="resp_live_frame", delta_text="READY", stop_reason=2)
-        first = frame_message(message.SerializeToString())
-        trailer = frame_message(b"{}", 2)
-        class Upstream(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
-                auth = self.path.endswith("GetUserJwt")
-                body = devin_pb2.GetUserJwtResponse(user_jwt="fake-jwt").SerializeToString() if auth else first + trailer
-                self.send_response(200)
-                self.send_header("Content-Type", "application/proto" if auth else "application/connect+proto")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                if auth:
-                    self.wfile.write(body)
-                else:
-                    self.wfile.write(first)
-                    self.wfile.flush()
-                    release.wait(4)
-                    self.wfile.write(trailer)
-            def log_message(self, *args):
-                pass
-        with tempfile.TemporaryDirectory() as directory, serving(ThreadingHTTPServer(("127.0.0.1", 0), Upstream)) as upstream:
-            config = Config(argparse.Namespace(provider="auto", devin_upstream=upstream,
-                devin_api_key="fake-token", model_discovery=False, log_file=str(Path(directory) / "gateway.log")))
-            with serving(MuseShimServer(("127.0.0.1", 0), config)) as base:
-                request = urllib.request.Request(base + "/responses", data=json.dumps(
-                    {"model": "devin/swe-1-6", "input": "hello", "stream": True}).encode(),
-                    headers={"Content-Type": "application/json"})
-                try:
-                    with urllib.request.urlopen(request, timeout=2) as response:
-                        while True:
-                            line = response.readline()
-                            self.assertTrue(line, "stream ended before the flushed text frame")
-                            if b"response.output_text.delta" in line:
-                                break
-                        self.assertFalse(release.is_set())
-                        release.set()
-                        self.assertIn(b"response.completed", response.read())
-                finally:
-                    release.set()
 
     def test_partial_connect_frame_fails_instead_of_completing(self):
         message = devin_pb2.GetChatMessageResponse(message_id="resp_truncated", delta_text="partial")

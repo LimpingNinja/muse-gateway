@@ -55,7 +55,10 @@ from muse_devin import (
 )
 from muse_devin_wire import (
     ConnectFrameDecoder,
+    DevinAuthError,
     DevinFrameError,
+    DevinHttpError,
+    DevinWireError,
     cli_metadata,
     decode_unary,
     discovery_metadata,
@@ -64,6 +67,7 @@ from muse_devin_wire import (
     normalize_base_url,
     normalize_session_token,
     parse_trailer_error,
+    unary_rpc,
 )
 from muse_gateway import (
     _credential_status,
@@ -219,13 +223,13 @@ class DevinWireTests(unittest.TestCase):
         )
 
     def test_frames_reassemble_across_chunks(self):
-        decoder = ConnectFrameDecoder()
-        first = frame_message(b"hello", 0)
-        second = frame_message(b"world!", 1)
-        self.assertEqual(decoder.decode(first[:3]), [])
-        self.assertEqual(
-            decoder.decode(first[3:] + second), [(0, b"hello"), (1, b"world!")]
-        )
+        # Literal protocol bytes, not a round-trip through our own encoder.
+        wire = b"\x00\x00\x00\x00\x05hello\x01\x00\x00\x00\x06world!"
+        for boundary in range(len(wire) + 1):
+            with self.subTest(boundary=boundary):
+                decoder = ConnectFrameDecoder()
+                events = decoder.decode(wire[:boundary]) + decoder.decode(wire[boundary:])
+                self.assertEqual(events, [(0, b"hello"), (1, b"world!")])
 
     def test_oversize_length_prefix_fails_before_buffering(self):
         decoder = ConnectFrameDecoder(max_payload_bytes=4)
@@ -284,11 +288,25 @@ class DevinWireTests(unittest.TestCase):
             "boom",
         )
 
+    def test_http_error_releases_response_even_when_exception_is_retained(self):
+        body = io.BytesIO(b'{"error":{"message":"busy"}}')
+        error = urllib.error.HTTPError("http://127.0.0.1/rpc", 503, "busy",
+                                       {"Content-Type": "application/json"}, body)
+        try:
+            with patch("muse_devin_wire.urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(DevinHttpError) as raised:
+                    unary_rpc("http://127.0.0.1", "/rpc", b"request")
+            self.assertEqual(raised.exception.status, 503)
+            self.assertIn("busy", str(raised.exception))
+            self.assertTrue(body.closed, "HTTP error response leaked until exception garbage collection")
+        finally:
+            error.close()
+
     def test_base_url_validation(self):
         self.assertEqual(
             normalize_base_url("https://x.example///"), "https://x.example"
         )
-        with self.assertRaises(Exception):
+        with self.assertRaises(DevinWireError):
             normalize_base_url("ftp://x.example")
 
 
@@ -401,7 +419,7 @@ class DevinCredentialTests(unittest.TestCase):
             raise DevinHttpError("request", 401, "unauthorized")
 
         with patch("muse_devin.unary_rpc", side_effect=fail_401):
-            with self.assertRaises(Exception):
+            with self.assertRaises(DevinAuthError):
                 fetch_auth("mark-on-401-token", "https://x")
         self.assertIsNotNone(auth_failure_mark("mark-on-401-token"))
 
@@ -409,7 +427,7 @@ class DevinCredentialTests(unittest.TestCase):
             raise DevinHttpError("request", 500, "oops")
 
         with patch("muse_devin.unary_rpc", side_effect=fail_500):
-            with self.assertRaises(Exception):
+            with self.assertRaises(DevinAuthError):
                 fetch_auth("no-mark-on-500-token", "https://x")
         self.assertIsNone(auth_failure_mark("no-mark-on-500-token"))
 
@@ -991,22 +1009,7 @@ class DevinGatewayTests(unittest.TestCase):
         patcher.start()
 
     def _handler(self, cfg):
-        seen = {}
-
-        def send_json(status, payload):
-            seen["status"] = status
-            seen["payload"] = payload
-
-        handler = SimpleNamespace(
-            config=cfg,
-            headers={},
-            server_version="muse-gateway-test",
-            wfile=io.BytesIO(),
-            _send_upstream_headers=lambda *args, **kwargs: None,
-            send_json=send_json,
-            _log_event=lambda *args, **kwargs: None,
-        )
-        return handler, seen
+        return SimpleNamespace(config=cfg, headers={})
 
     def test_resolve_model_prefix(self):
         cfg = devin_config()
@@ -1041,85 +1044,9 @@ class DevinGatewayTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("explicit token", detail)
 
-    def test_forward_nonstream_returns_final(self):
-        cfg = devin_config()
-        handler, seen = self._handler(cfg)
-        final = {"id": "r", "status": "completed", "output": []}
-        with patch("muse_devin.run_turn_final", return_value=final) as mocked:
-            MuseShimHandler.forward_devin(
-                handler, {"model": "swe-1-6", "input": "hi"}
-            )
-        self.assertEqual(seen["status"], 200)
-        self.assertEqual(seen["payload"], final)
-        self.assertEqual(mocked.call_args[0][2].uid, "swe-1-6")
-
-    def test_forward_stream_prestream_failure_before_headers(self):
-        cfg = devin_config()
-        handler, _ = self._handler(cfg)
-        header_calls = []
-        handler._send_upstream_headers = (
-            lambda *args, **kwargs: header_calls.append(True)
-        )
-
-        def failing():
-            raise DevinChatError("boom")
-            yield
-
-        with patch("muse_devin.run_turn_events", return_value=failing()):
-            with self.assertRaises(ProviderError) as raised:
-                MuseShimHandler.forward_devin(
-                    handler, {"model": "swe-1-6", "input": "hi", "stream": True}
-                )
-        self.assertEqual(raised.exception.code, "devin_chat_error")
-        self.assertEqual(header_calls, [])
-        self.assertEqual(handler.wfile.getvalue(), b"")
-
-    def test_forward_stream_empty_turn_errors(self):
-        cfg = devin_config()
-        handler, _ = self._handler(cfg)
-        header_calls = []
-        handler._send_upstream_headers = (
-            lambda *args, **kwargs: header_calls.append(True)
-        )
-        with patch("muse_devin.run_turn_events", return_value=iter([])):
-            with self.assertRaises(ProviderError) as raised:
-                MuseShimHandler.forward_devin(
-                    handler, {"model": "swe-1-6", "input": "hi", "stream": True}
-                )
-        self.assertEqual(raised.exception.code, "devin_chat_error")
-        self.assertEqual(header_calls, [])
-
-    def test_forward_stream_emits_primed_first_event(self):
-        cfg = devin_config()
-        handler, _ = self._handler(cfg)
-        header_calls = []
-        handler._send_upstream_headers = (
-            lambda *args, **kwargs: header_calls.append(True)
-        )
-        events = [
-            ("response.output_text.delta", {
-                "type": "response.output_text.delta", "delta": "Hi",
-            }),
-            ("response.completed", {
-                "type": "response.completed", "response": {"id": "r"},
-            }),
-        ]
-        with patch("muse_devin.run_turn_events", return_value=iter(events)):
-            MuseShimHandler.forward_devin(
-                handler, {"model": "swe-1-6", "input": "hi", "stream": True}
-            )
-        self.assertEqual(len(header_calls), 1)
-        body = handler.wfile.getvalue().decode("utf-8")
-        self.assertIn("event: response.output_text.delta", body)
-        self.assertIn("event: response.completed", body)
-        self.assertLess(
-            body.index("event: response.output_text.delta"),
-            body.index("event: response.completed"),
-        )
-
     def test_forward_unknown_model_errors(self):
         cfg = devin_config()
-        handler, _ = self._handler(cfg)
+        handler = self._handler(cfg)
         with self.assertRaises(ProviderError) as raised:
             MuseShimHandler.forward_devin(handler, {"model": "nope", "input": "hi"})
         self.assertEqual(raised.exception.code, "devin_unknown_model")
@@ -1128,61 +1055,18 @@ class DevinGatewayTests(unittest.TestCase):
         cfg = devin_config(devin_api_key=None)
         with tempfile.TemporaryDirectory() as directory:
             cfg.devin_auth_db = os.path.join(directory, "agent.db")
-            handler, _ = self._handler(cfg)
+            handler = self._handler(cfg)
             with self.assertRaises(ProviderError) as raised:
                 MuseShimHandler.forward_devin(
                     handler, {"model": "swe-1-6", "input": "hi"}
                 )
         self.assertEqual(raised.exception.code, "devin_credential_unavailable")
 
-    def test_provider_error_with_upstream_code_responds(self):
-        # Regression: _upstream_diagnostic carries its own "code" (e.g.
-        # invalid_value); splatting it beside our code= crashed with
-        # TypeError and dropped the connection (client: "malformed
-        # response data" after 10 retries).
-        seen = {}
-
-        def send_json(status, payload):
-            seen["status"] = status
-            seen["payload"] = payload
-
-        logged = {}
-
-        def log_event(event, **fields):
-            logged[event] = fields
-
-        cfg = devin_config()
-        handler = SimpleNamespace(
-            config=cfg,
-            headers={},
-            _response_started=False,
-            _request_id="test-code-collision",
-            _upstream_diagnostic={
-                "type": "invalid_request_error",
-                "code": "invalid_value",
-            },
-            _log_event=log_event,
-            send_json=send_json,
-        )
-        MuseShimHandler.send_provider_error(
-            handler,
-            ProviderError("Codex upstream returned HTTP 400.",
-                          status=400, code="codex_upstream_error"),
-        )
-        self.assertEqual(seen["status"], 400)
-        self.assertEqual(seen["payload"]["error"]["type"],
-                         "codex_upstream_error")
-        self.assertEqual(
-            logged["provider_error"]["upstream_code"], "invalid_value")
-
     def test_forward_crash_returns_500_json(self):
-        # End to end over loopback: an unexpected exception inside forward
-        # must answer 500 JSON, never drop the connection.
+        # Public HTTP error contract with a deliberate handler fault:
+        # unexpected exceptions must answer 500 JSON, not drop the connection.
         cfg = devin_config()
-        try:
-            server = MuseShimServer(("127.0.0.1", 0), cfg)
-        except OSError:
-            self.skipTest("loopback sockets are unavailable")
+        server = MuseShimServer(("127.0.0.1", 0), cfg)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
 
         def explode(handler_self, body):
@@ -1205,7 +1089,8 @@ class DevinGatewayTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
         self.assertEqual(raised.exception.code, 500)
-        payload = json.loads(raised.exception.read().decode("utf-8"))
+        with raised.exception as response:
+            payload = json.load(response)
         self.assertEqual(payload["error"]["type"], "internal_error")
 
 

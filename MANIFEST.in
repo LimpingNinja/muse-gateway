@@ -1,2 +1,4 @@
 include devin.proto
 include THIRD_PARTY_NOTICES
+include CONTRIBUTING.md
+recursive-include tests *.py

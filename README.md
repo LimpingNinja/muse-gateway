@@ -1,375 +1,471 @@
 # muse-gateway
 
-Use Muse Spark, OpenAI Codex, Claude, Devin, and local models from Muse
-Code's `/model` menu. muse-gateway is an unofficial loopback proxy: Muse keeps
-the coding-agent harness and executes tools; the gateway routes model requests
-to your providers.
+Bring the models you already use into Muse Code. muse-gateway puts Muse Spark,
+Codex, Claude, Devin, Kiro via Kiro Gateway, and local LLMs in the same workflow,
+with model selection through Muse's `/model` menu.
 
-Forked from [luckeyfaraday/muse-shim](https://github.com/luckeyfaraday/muse-shim),
-with native Meta forwarding, local endpoint discovery, and Windows/Bash launchers.
-The upstream MIT license and attribution are retained. This project is not
-affiliated with Meta, OpenAI, Anthropic, or Devin.
+You keep Muse's conversation, workspace, permissions, and tools. The gateway
+runs alongside it on your machine, routes requests to the provider you choose,
+and translates between APIs where needed. Muse still reads files, runs commands,
+and executes tool calls; the provider supplies the model responses.
+
+Use your existing provider logins or configure your own endpoint. There is no
+gateway account to create, and your provider's access rules, usage limits, and
+billing still apply.
+
+This is an unofficial community project, forked from
+[luckeyfaraday/muse-shim](https://github.com/luckeyfaraday/muse-shim). It is not
+affiliated with Meta, OpenAI, Anthropic, Cognition, or AWS.
+
+[Quick start](#quick-start) · [Providers](#provider-support) ·
+[Configuration](#configuration-and-launch-options) · [Troubleshooting](#troubleshooting)
 
 ## Requirements
 
-- Python 3.10 or newer; one runtime dependency (`protobuf`, installed with the package).
-- Muse Code installed as `muse` and authenticated with `muse login`.
-- Optional: a local or LiteLLM endpoint supporting **OpenAI Responses** with
-  streaming and function tools. A Chat Completions-only endpoint needs an adapter.
-- Optional: an existing `codex login` or an installed, authenticated Claude Code
-  CLI for those providers.
-- Optional: for Devin, a Devin CLI login (`devin auth login`), a session
-  token, or an existing OMP login (`~/.omp/agent/agent.db`).
+- **Python 3.10 or newer**, with pip. Install and run the gateway with the same
+  Python environment. The package installs its one runtime dependency,
+  `protobuf>=7.35.1`, for you; you do not need a protobuf compiler.
+- **Muse Code**, available as `muse` in your terminal and signed in with
+  `muse login` for the usual subscription-based launch.
+- **Access to the providers you want to use.** You do not need to install every
+  provider CLI. See [provider support](#provider-support) for each one's setup.
 
-## Private failure captures
-
-For a controlled diagnosis, start the server on a separate port with
-`--capture-dir PATH` (or `MUSE_GATEWAY_CAPTURE_DIR`). For example:
-
-```powershell
-python muse_gateway.py auto --port 8791 --capture-dir "$env:TEMP\muse-gateway-captures"
-```
-
-Connect Muse to that exact port. `/health` includes the capture session,
-process ID, source directory, and source fingerprint, so an older running
-gateway cannot be mistaken for the instrumented checkout.
-
-Capture is off by default. When enabled it creates a private session directory
-with one subdirectory per gateway request ID. It records incoming/transformed
-requests, outgoing request bytes, upstream headers and complete error bodies,
-downstream HTTP/SSE bytes, and a monotonic read/frame/write timeline. Devin
-requests and unary responses are saved as scrubbed protobuf and readable JSON;
-complete chat frames retain their original bytes unless secret removal is
-necessary. Opaque frames that cannot be decoded safely are explicitly marked
-omitted. Credentials in headers and protobuf metadata/JWT fields are removed
-before writing. Original-byte hashes refer to bytes before scrubbing.
-
-These files **contain conversation content**, even though credentials are
-scrubbed. They are separate from ordinary rotating logs, use owner-only directory
-permissions (including a protected Windows ACL), and are not uploaded. Each
-request has a 64 MiB capture budget; `manifest.json` reports truncation, capture
-errors, first/terminal SSE events, and observed byte counts. A capture without
-errors or truncation is transport evidence, not proof that Muse accepted it;
-correlate it with the corresponding Muse session's completion or decoder error.
+The Python entry point is shared across Windows, macOS, and Linux/WSL.
+PowerShell and Bash wrappers are also included. A virtual environment is
+optional; if you use one, activate it before both installation and launch.
 
 ## Quick start
 
-Download or clone this repository and open a terminal in its directory.
-Install it once using the Python interpreter that will run the gateway;
-this installs the required protobuf dependency automatically:
+### 1. Install the gateway
+
+With Git:
 
 ```bash
+git clone https://github.com/LimpingNinja/muse-gateway.git
+cd muse-gateway
 python -m pip install .
 ```
 
-There is one launcher interface, available three ways: the source wrappers
-(`.\muse-gateway.ps1` on Windows, `bash ./muse-gateway` on Linux/macOS/WSL)
-forward to the cross-platform `launch` subcommand, which is also the installed
-`muse-gateway launch`. All three behave identically: they preserve Muse's
-subscription authentication (no Meta API key needed), start the gateway, run
-Muse, and stop their gateway process when Muse exits.
+If you downloaded a ZIP instead, extract it, open a terminal in the extracted
+directory, and run `python -m pip install .`. After pulling or downloading an
+update, run the install command again to update the installed copy.
 
-```powershell
-.\muse-gateway.ps1
-```
+Use `python3` instead of `python` if that is your interpreter's name. On
+Windows, `py -3` is another option.
 
-```bash
-bash ./muse-gateway
-```
+### 2. Open Muse through the gateway
+
+Sign in to Muse if you have not already:
 
 ```bash
-muse-gateway launch   # installed console command, same behavior
+muse login
 ```
 
-Inside Muse, open `/model` and select a `Meta`, `Codex`, `Claude`, `Devin`, or `Local`
-entry. A catalog entry does not prove account access: Codex and Claude fallback
-entries may appear before you authenticate with those providers.
+Open a terminal in **the project you want to work on**, then run:
 
-### Add a local endpoint
+```bash
+python -m muse_gateway launch
+```
 
-Copy `.env.example` to `.env` beside the launchers (or `./.env` for the
-installed command), then edit it:
+The installed `muse-gateway launch` command does the same thing. The module
+form above also works when your Python scripts directory is not on `PATH`.
+
+The launcher starts a gateway at `http://127.0.0.1:8787`, opens Muse, and stops
+the gateway it started when Muse exits. If a compatible gateway is already
+running there, it reuses it and leaves it running afterward. An unrelated or
+incompatible listener is an error; use `--port 9000` rather than stopping a
+process you do not recognise.
+
+### 3. Choose a model
+
+Open `/model` in Muse and choose a provider/model entry. Start with a short
+prompt, then try a file read or another tool call.
+
+Meta is listed for subscription forwarding. Codex and Devin entries need local
+credentials; Claude needs its CLI or HTTP credentials. Local entries appear
+when you configure a local endpoint or model list. These checks make the menu
+useful, but an entry is not a guarantee of account access or a successful turn.
+
+Warnings about an unconfigured provider do not mean you must install it. In
+particular, the launcher warns when no local API key is set and skips that
+route's preflight; you can still use your other providers.
+
+## Provider support
+
+### Muse Spark
+
+The normal launcher uses your existing `muse login` session. No Meta API key is
+needed: Muse sends its authorization header to the gateway, which forwards it
+to `https://api.meta.ai/v1` for `meta/<model-id>` requests.
+
+Meta's namespace tools, reasoning, and cache fields are preserved. The routing
+prefix is removed, and an explicitly configured output-token cap still applies.
+The launcher deliberately clears static Meta API-key settings so that this path
+uses subscription authentication.
+
+The catalog can use a static key or the bearer on a Muse catalog request to
+discover Meta models. Subscription discovery reuses that bearer only with the
+default Meta upstream. If discovery is unavailable, the bundled list remains.
+For API-key billing instead, use the [manual setup](#manual-server-setup).
+`MUSE_GATEWAY_META_UPSTREAM` overrides the endpoint, but any replacement must
+accept Meta's native payloads and be trusted with its authorization.
+
+### Claude
+
+Install [Claude Code](https://code.claude.com/docs/en/overview), sign in through
+its normal login flow, and make sure `claude` is available in the same terminal
+as the gateway. Then launch the gateway and select a `claude/<model-id>` entry.
+You can set `MUSE_GATEWAY_CLAUDE_CLI` if the executable has a different path.
+
+By default the gateway invokes the official `claude -p` command. Claude's own
+tools and session persistence are disabled for these calls; requested tool
+calls come back to Muse to execute. Output arrives after each subprocess
+finishes, not token by token, and this transport advertises text-only input.
+
+For direct Anthropic Messages requests instead, set
+`MUSE_GATEWAY_CLAUDE_TRANSPORT=http`. That mode reads HTTP credentials from
+supported Claude credential storage or the environment, including
+`ANTHROPIC_API_KEY` for API-key billing. Set
+`MUSE_GATEWAY_CLAUDE_CREDENTIALS` to use an explicit credential file. HTTP mode
+does not require the CLI for inference, and supports credential refresh where
+the stored login provides it.
+
+Claude does not support restoring turns with `previous_response_id`; send the
+conversation history inline. Native signed-thinking replay is not supported.
+
+### Codex
+
+Sign in with the Codex CLI:
+
+```bash
+codex login
+```
+
+The gateway reads the existing credentials and lists `codex/<model-id>` entries.
+It uses the native Codex Responses backend directly, with OAuth refresh
+support; it does not start the Codex CLI for inference. `CODEX_HOME` or
+`MUSE_GATEWAY_CODEX_AUTH` can point it at another credential location.
+
+Codex requests are stateless (`store=False`). When complete history is present,
+the gateway drops an unresolvable `previous_response_id` and sends that history
+instead. It also normalises Muse's replay item IDs without changing the IDs
+that pair tool calls with their results, and folds text system messages into
+`instructions`.
+
+If Codex explicitly rejects encrypted reasoning retained from another provider,
+the gateway retries once with its visible summary in place of that opaque
+state. Conversation and tool history stay intact; the recovery is logged as
+`codex_reasoning_demoted`. Known reasoning-effort mismatches are reconciled
+against model-specific discovery, rather than assuming every model accepts
+the same effort names.
+
+### Devin
+
+Sign in with the [Devin CLI](https://cli.devin.ai/):
+
+```bash
+devin auth login
+```
+
+The gateway speaks Devin's Connect/protobuf API directly. The CLI is a source
+of credentials, not the process used for inference. Credential lookup uses:
+
+1. `MUSE_GATEWAY_DEVIN_API_KEY` (or `DEVIN_API_KEY`) for an explicit session token.
+2. Your existing Devin CLI login.
+3. Your OMP login, normally in `~/.omp/agent/agent.db`.
+
+Use `MUSE_GATEWAY_DEVIN_AUTH_DB` for another OMP database and
+`MUSE_GATEWAY_DEVIN_CREDENTIAL_ID` to select a particular stored credential.
+An explicit credential ID targets the store instead of the CLI login.
+There is no refresh grant in this integration; an expired or rejected login
+means signing in again.
+
+Select a `devin/<model-id>` entry. Discovery uses the active credential and
+includes directly servable models, routers, and supported effort lanes. Fusion
+pairings are excluded because their sidekick half cannot run in this gateway.
+Without discovery, the small bundled SWE model list is a fallback, not an
+account-verified roster.
+
+Text streams incrementally. Function calls are released once their names and
+arguments are final, so the streamed and completed arguments agree. Developer
+messages retain their position in history. Native signed-reasoning replay is
+not implemented; incoming signatures are not forwarded as provider-owned state.
+
+### Kiro Gateway
+
+### Local LLMs and other Responses endpoints
+
+Use the `local/` route for a local model server, a LiteLLM proxy, or another
+endpoint you operate. It needs **OpenAI Responses** support: `POST /responses`,
+streaming SSE, and structured function-call events for tools. A server that
+only implements Chat Completions needs an adapter. Discovering an Ollama model
+does not by itself establish Responses or tool compatibility.
+
+Copy [.env.example](.env.example) to a private `.env`, uncomment the local
+settings, and edit them for your endpoint:
 
 ```dotenv
 MUSE_GATEWAY_LOCAL_UPSTREAM=http://127.0.0.1:4000/v1
 MUSE_GATEWAY_LOCAL_API_KEY=replace-with-your-upstream-key
-# Optional: restrict the menu to these upstream model IDs.
+# Optional: restrict the menu to these upstream IDs.
 # MUSE_GATEWAY_LOCAL_MODELS=my-coder,my-reasoner
 ```
 
-Settings use the `MUSE_GATEWAY_*` prefix. The older `MUSE_SHIM_*` spellings
-from the upstream project still work as fallbacks; when both are set,
-`MUSE_GATEWAY_*` wins. Do not commit `.env` or credentials.
+Run from your working project, giving the config file's location explicitly:
 
-The launcher reads configuration in this order: command-line flags, nonempty
-process environment variables, then `.env`. It does not create a config file.
-It warns and continues without requiring a local key; setting the key enables
-local-backend preflight. Clear unused `MUSE_GATEWAY_LOCAL_*` variables if you want no
-local entries, since the Python server still honors explicit upstream/model
-configuration independently of that launcher preflight. The wrappers pass
-`--env-file <checkout>/.env`; the installed command falls back to `./.env`
-— pass `--env-file` to be explicit.
+```bash
+python -m muse_gateway launch --env-file /path/to/muse-gateway/.env
+```
 
-With an upstream configured, the gateway discovers IDs from `GET /models`.
-`MUSE_GATEWAY_LOCAL_MODELS` restricts that list when set. Discovery reads common
-limit keys (`max_input_tokens`, `context_window`, `max_output_tokens`,
-`max_completion_tokens`, and similar aliases) and image-input evidence
-(`capabilities`, `modalities`, `supports_vision`, and similar fields) when the
-endpoint provides them. Missing limits fall back to 128,000 context tokens and
-32,768 output tokens, labeled **limits unverified** in the menu; these are not
-measurements of your model's capabilities. Without image evidence, local entries
-advertise text input only. A bare Ollama server (upstream ending in `/v1`) is
-listed via its native `/api/tags` endpoint as a fallback.
+The gateway discovers IDs from the upstream's `GET /models`. An explicit model
+list curates those names. Discovery reads advertised context/output limits and
+image-input capabilities; missing local limits fall back to 128,000 context
+and 32,768 output tokens, labelled **limits unverified**. Without image
+evidence, entries advertise text input only. For an Ollama URL ending in `/v1`,
+`/api/tags` is a discovery fallback.
 
-### Launcher options
+Local requests flatten namespace tools and rewrite qualified historical call
+names to match. Tools must arrive as structured function calls; XML-like tool
+syntax in ordinary response text is not converted.
+
+A local API key enables launcher preflight. A keyless server can still be
+configured, but preflight is skipped and the gateway may forward Muse's bearer
+when no dedicated route key is set. Use a dedicated upstream key where possible;
+see [security](#security).
+
+For a single Responses endpoint without the combined menu, the separate
+`generic` (also `http`) server mode is available. Its default upstream is
+OpenRouter; it is not another route in auto mode.
+
+## Configuration and launch options
+
+Settings use `MUSE_GATEWAY_*`. The older `MUSE_SHIM_*` names remain fallbacks;
+the newer spelling wins when both are set. Flags override environment values,
+and the launcher loads nonempty `.env` values only where the same environment
+variable is not already set. Use the newer names consistently to avoid mixing
+aliases across configuration sources.
+
+Use `--env-file PATH` after `launch` to choose a file. Otherwise it looks beside
+`muse_gateway.py`, then in the current directory. The source wrappers explicitly
+use `.env` beside the scripts. Installing the package does not copy your source
+checkout's `.env`, and no launcher creates one automatically. Environment
+changes do not reconfigure an already running gateway that a launcher reuses.
+
+Common settings (the provider sections above explain authentication):
+
+| Setting | Purpose |
+| --- | --- |
+| `MUSE_GATEWAY_HOST`, `MUSE_GATEWAY_PORT` | Listener; defaults to `127.0.0.1:8787` |
+| `MUSE_GATEWAY_PROVIDER` | Low-level server mode; `launch` always uses `auto` |
+| `MUSE_GATEWAY_META_MODELS` | Curate Meta model IDs; discovery enriches their limits |
+| `MUSE_GATEWAY_CODEX_MODELS`, `MUSE_GATEWAY_CLAUDE_MODELS` | Set fallback model IDs; discovery can add models |
+| `MUSE_GATEWAY_DEVIN_MODELS` | Restrict Devin discovery to selected IDs |
+| `MUSE_GATEWAY_LOCAL_UPSTREAM`, `MUSE_GATEWAY_LOCAL_API_KEY`, `MUSE_GATEWAY_LOCAL_MODELS` | Local endpoint, key, and model list |
+| `MUSE_GATEWAY_UPSTREAM`, `MUSE_GATEWAY_API_KEY` | Generic endpoint/key; the generic key is also a fallback for local requests |
+| `MUSE_GATEWAY_NO_MODEL_DISCOVERY=1` | Disable discovery and use configured/bundled models |
+| `MUSE_GATEWAY_MAX_OUTPUT_TOKENS` | Cap requested output tokens |
+| `MUSE_GATEWAY_PORTABLE=1` | Remove reasoning/cache fields on non-Meta routes |
+| `MUSE_GATEWAY_TIMEOUT` | Upstream timeout in seconds; default 600 |
+| `MUSE_GATEWAY_LOG_FILE`, `MUSE_GATEWAY_VERBOSE=1` | Log path and extra HTTP access events |
+| `MUSE_GATEWAY_CAPTURE_DIR` | Opt-in private wire captures; contains conversation content |
+
+Use the installed command or the matching Python module form:
+
+```bash
+muse-gateway launch --port 9000
+muse-gateway launch --check-only
+muse-gateway launch resume <session-id>
+muse-gateway launch -h
+```
+
+`--check-only` checks startup and the catalog, then exits without launching Muse
+or testing inference. Launcher options go first; remaining arguments go to Muse.
+`-h` shows launcher help, while `--help` passes through to Muse.
+
+The source wrappers use the same launcher and preserve your working directory:
 
 ```powershell
-.\muse-gateway.ps1 resume <session-id>
-.\muse-gateway.ps1 exec "Summarize this repository" --model local/<model-id>
+# Windows PowerShell, from the checkout:
 .\muse-gateway.ps1 -Port 9000
 .\muse-gateway.ps1 -CheckOnly
+.\muse-gateway.ps1 resume <session-id>
 ```
 
 ```bash
-bash ./muse-gateway resume <session-id>
-bash ./muse-gateway exec "Summarize this repository" --model local/<model-id>
+# macOS / Linux / WSL, from the checkout:
 bash ./muse-gateway --port 9000
 bash ./muse-gateway --check-only
-muse-gateway launch --port 9000 --check-only
-muse-gateway launch -h   # launcher help (--help passes through to Muse)
+bash ./muse-gateway resume <session-id>
 ```
 
-Local settings also accept `-LocalUpstream`, `-LocalApiKey`, and `-LocalModels`
-in PowerShell, or `--local-upstream`, `--local-api-key`, and `--local-models`
-after `launch` (the wrappers translate their named parameters to the same
-flags). Prefer environment/config-file keys over command-line secrets.
-Launcher options come first; other arguments pass to Muse. `-h` shows launcher
-help while `--help` passes through to Muse. When using `powershell -File`,
-omit the `--` separator.
+You can invoke those scripts by absolute path from another project. The
+PowerShell wrapper also accepts `-EnvFile`, `-MuseBin`, `-LogFile`,
+`-LocalUpstream`, `-LocalApiKey`, and `-LocalModels`. Prefer config/environment
+settings to command-line secrets. With `powershell -File`, omit the `--`
+separator and pass Muse arguments directly.
 
-The default address is `http://127.0.0.1:8787`. An occupied port is an error;
-choose a different port rather than stopping an unrelated process.
-`-CheckOnly` / `--check-only` checks startup and prints the catalog, then exits.
-It does **not** test inference or launch an interactive Muse session.
+### Manual server setup
 
-## Routes and authentication
-
-- **`meta/<id>`:** forwards Responses requests to `https://api.meta.ai/v1`.
-  Namespace tools, reasoning, and cache fields remain intact. The routing prefix
-  is removed; an explicitly configured output-token cap still applies.
-  The source launchers clear Meta API-key variables so Muse uses its existing
-  subscription login, whose authorization header is forwarded per request.
-- **`local/<id>`:** forwards to your configured Responses endpoint. Namespace
-  tools are flattened, and qualified historical tool-call names are rewritten
-  to match. Uses `MUSE_GATEWAY_LOCAL_API_KEY`, then `MUSE_GATEWAY_API_KEY`, then the
-  incoming authorization header.
-- **`codex/<id>`:** uses Codex OAuth from its credential file or environment,
-  including refresh support, and the native Codex Responses backend. It does
-  not run the Codex CLI for inference.
-  Muse's composite replay item IDs are normalized without changing tool
-  call/result IDs. If Codex explicitly rejects retained encrypted reasoning,
-  the gateway retries once with that opaque reasoning demoted to its visible
-  summary; visible conversation and tool history are preserved. This recovery
-  is logged as `codex_reasoning_demoted` and does not alter valid requests.
-- **`claude/<id>`:** invokes the official `claude -p` transport by default.
-  Claude's built-in tools and session persistence are disabled; structured tool
-  calls are returned to Muse to execute. Direct Anthropic Messages mode is
-  available with `--claude-transport http` on the Python server.
-- **`devin/<id>`:** speaks Devin's Connect/protobuf protocol directly. Credentials come from
-  `MUSE_GATEWAY_DEVIN_API_KEY` (or `DEVIN_API_KEY`) if set, else your Devin
-  CLI login (`devin auth login`), else your OMP login; there is no refresh
-  grant, so an expired login means logging in again. Fusion pairings are not
-  listed (their sidekick half cannot run gateway-side); directly servable
-  models, routers, and effort lanes are.
-  Responses events carry sequence numbers required by Muse. Text is delivered
-  incrementally; function calls are released after names/arguments are finalized,
-  so repaired arguments match their delta and completion events. Developer
-  messages retain their position in history, and model discovery is scoped to
-  the active credential. Native signed-reasoning replay is not implemented;
-  incoming signatures are not trusted or forwarded as provider-owned state.
-- **`generic` / `http` mode:** forwards to a Responses-compatible endpoint such
-  as OpenRouter. It is a separate server mode, not an additional auto-mode route.
-
-Only send requests to upstreams you trust. Without a route-specific key, bearer
-forwarding can send Muse's credentials to that upstream; the gateway logs a
-one-time warning when forwarding to a non-default upstream (a custom Meta URL,
-or a non-loopback local URL). A custom `MUSE_GATEWAY_META_UPSTREAM` also receives
-native Meta payloads and credentials; putting LiteLLM there does not guarantee
-it supports Meta's wire format.
-
-## Advanced server use
-
-Two interfaces share one launcher implementation (`launch_main` in
-`muse_gateway.py`):
-
-- `muse-gateway.ps1` / `bash ./muse-gateway`: wrappers that forward to
-  `python muse_gateway.py launch --env-file <checkout>/.env`.
-- Installed `muse-gateway launch`: the same flow without the wrappers.
-
-`python -m muse_gateway` without `launch` is the low-level server CLI; it does not
-load `.env`. Server options may also go before the `launch` token
-(`muse-gateway --verbose launch ...`) for host, timeout, and logging settings;
-`launch` always serves the unified auto catalog.
-
-For an explicit two-terminal setup, start the server with configuration already
-exported in its environment:
+For separate server and Muse terminals, first export your configuration in the
+server's environment, then start:
 
 ```bash
 python -m muse_gateway auto
 ```
 
-Then run Muse in the project you want to work on, with `META_API_KEY` unset for
-subscription authentication:
+The low-level server does **not** load `.env`. In your working project, run
+Muse with `META_API_KEY` unset for subscription authentication:
 
 ```bash
 muse --provider meta --base-url http://127.0.0.1:8787
 ```
 
-For Meta API-key billing instead, configure `MUSE_GATEWAY_META_API_KEY` on the server
-and the appropriate `META_API_KEY` for Muse; use this manual setup rather than
-the subscription launcher.
+For Meta API-key billing, set `MUSE_GATEWAY_META_API_KEY` on the server and the
+appropriate `META_API_KEY` for Muse instead of using the subscription launcher.
+
+`python -m muse_gateway --help` lists server flags and modes, including `devin`.
+Server options go **before** the `launch` token when combining the interfaces,
+for example `python -m muse_gateway --timeout 120 launch`. `launch` always
+serves the combined auto catalog; `--model` pins a model only in a
+provider-specific server mode, not auto mode. Use per-route upstream settings
+in auto mode, not the generic `--upstream` setting.
 
 The inherited `python -m muse_gateway run` command sets a placeholder Muse key.
-It is suitable for routes that supply their own credentials, but **not** for
-forwarding Muse subscription authentication. Use `launch` for that.
+It is suitable only for routes supplying their own credentials, not forwarding
+a Muse subscription login. Use `launch` for the usual workflow.
 
-### Server configuration
+## Troubleshooting
 
-Run `python -m muse_gateway --help` for all flags. Common environment settings:
+### Checking a failed turn
 
-- `MUSE_GATEWAY_PROVIDER`: `auto` (default), `meta`, `local`, `codex`, `claude`,
-  `generic`, or `http` (alias of `generic`).
-- `MUSE_GATEWAY_HOST`, `MUSE_GATEWAY_PORT`: default `127.0.0.1:8787`.
-- `MUSE_GATEWAY_META_UPSTREAM`, `MUSE_GATEWAY_META_API_KEY`, `MUSE_GATEWAY_META_MODELS`:
-  Meta route settings. With a static API key, the catalog is discovered live
-  from `{upstream}/models`; otherwise (including subscription forwarding) the
-  bundled list is used. An explicit `MUSE_GATEWAY_META_MODELS` curates names while
-  discovery enriches their limits.
-- `MUSE_GATEWAY_LOCAL_UPSTREAM`, `MUSE_GATEWAY_LOCAL_API_KEY`, `MUSE_GATEWAY_LOCAL_MODELS`:
-  local route settings.
-- `MUSE_GATEWAY_UPSTREAM`, `MUSE_GATEWAY_API_KEY`: generic route settings; the generic
-  upstream defaults to `https://openrouter.ai/api/v1`.
-- `MUSE_GATEWAY_CODEX_MODELS`, `MUSE_GATEWAY_CLAUDE_MODELS`: fallback/curated model IDs.
-- `MUSE_GATEWAY_NO_MODEL_DISCOVERY=1`: skip catalog requests and use configured IDs.
-- `MUSE_GATEWAY_PORTABLE=1`: remove reasoning and cache fields on non-Meta routes.
-- `MUSE_GATEWAY_MAX_OUTPUT_TOKENS`: cap requested output tokens.
-- `MUSE_GATEWAY_CLAUDE_TRANSPORT=cli|http`: select the Claude transport.
-- `MUSE_GATEWAY_CLAUDE_CLI`: Claude executable; defaults to `claude`.
-- `MUSE_GATEWAY_CODEX_AUTH`, `CODEX_HOME`: override Codex credential discovery.
-- `MUSE_GATEWAY_TIMEOUT`: upstream timeout in seconds.
-- `MUSE_GATEWAY_LOG_FILE`: diagnostic log path; defaults to `muse-gateway.log` in
-  the working directory. Also available as `--log-file` or PowerShell `-LogFile`.
-- `MUSE_GATEWAY_VERBOSE=1`: include HTTP access events in the diagnostic file.
+An HTTP 200 does not guarantee a complete, readable model response. Check the
+stream's terminal event and Muse's outcome, including any tool continuation.
+Health and catalog checks confirm the listener and model listing, not inference.
 
-`--model` on the Python server pins a model only in provider-specific mode.
-In auto mode, select a model in Muse instead. The server's `--upstream` option
-selects the endpoint in single-provider modes; use `--meta-upstream` and
-`--local-upstream` for their routes in auto mode.
+- **Missing provider:** check its login or executable, then refresh the catalog.
+  Successful discovery is cached for an hour; failed/empty discovery retries
+  after a minute. Restart to refresh immediately, or fetch the catalog with
+  `Cache-Control: no-cache`.
+- **Local startup fails:** verify the endpoint/key and its model listing, or
+  configure an explicit local model list. Explicit IDs bypass discovery checks,
+  not inference requirements.
+- **Devin authentication fails:** sign in again; the gateway does not refresh
+  that login. A token rejected during this gateway process is quarantined in
+  memory, so restart after replacing a bad token if needed.
+- **Muse reports malformed data or retries:** match the Muse session error to
+  the gateway request ID and capture the failing stream if needed. Use the
+  terminal event and decoder error to distinguish completion from a partial
+  or unreadable stream.
+- **Headless `muse exec` fails before making a request:** Muse can reject
+  unfamiliar model IDs while resolving compaction budgets. Use interactive
+  `/model` selection to check the route; do not assume the gateway received it.
 
-### Diagnostics
+### Logs and doctor
 
-Every server writes a rotating diagnostic file (5 MiB per file, two backups).
-The log directory must exist and be writable. Use separate `--log-file` paths
-when running multiple gateway processes. Startup fails if the log cannot be
-opened; the gateway does not silently claim that logging is enabled.
+The default diagnostic file is `muse-gateway.log` in the gateway's working
+directory. It rotates at 5 MiB with two backups. Its directory must exist and
+be writable; startup fails if logging cannot be opened. Use distinct paths for
+separate gateway processes. If a launcher reuses a server, inspect that
+server's log, not a newly chosen path in the attaching terminal.
 
-Errors and request metadata go to this file rather than interrupting the Muse
-terminal. Records contain a request ID, model, recognized reasoning effort,
-history/tool item counts, HTTP status, and known error categories. They do not
-contain prompts, tool arguments/results, response text, authorization headers,
-raw upstream error bodies, or response IDs. Error responses include the request
-ID for correlation. `request_finished` means forwarding ended, not that the
-model completed the task. Startup and credential-forwarding warnings still
-appear in the terminal. Review even redacted logs before sharing them.
+Records contain request IDs, routes/models, recognised effort, item counts,
+HTTP status, and error categories. Ordinary logs exclude prompts, tool
+arguments/results, response text, authorization headers, and raw error bodies.
+Review even redacted logs before sharing. On PowerShell:
 
-For PowerShell, follow the default log with `Get-Content .\muse-gateway.log -Wait`.
-The log and rotated backups are ignored by Git. Log files are created
-owner-only (0600) where the platform supports it. Credentialed upstreams
-never follow a cross-origin redirect; such a redirect fails the request
-instead of forwarding authorization elsewhere.
-
-```bash
-python -m muse_gateway doctor --doctor-provider local
-python -m muse_gateway doctor --doctor-provider codex
-python -m muse_gateway doctor --doctor-provider claude
+```powershell
+Get-Content .\muse-gateway.log -Wait
 ```
 
-These commands read the current environment, not `.env`. Doctor checks
-configuration/credential availability, not a completed inference request.
-Explicit local model IDs are accepted without probing inference. When local
-discovery is required but returns no usable models, doctor reports not ready
-and exits nonzero. Bare `doctor` checks the default routes and configured local
-route; Meta without a static key is reported not ready even when subscription
-forwarding will work once Muse sends a request.
+Doctor reads the environment, not `.env`, and checks configuration/credential
+availability rather than running an inference request:
+
+```bash
+python -m muse_gateway doctor --doctor-provider codex
+python -m muse_gateway doctor --doctor-provider claude
+python -m muse_gateway doctor --doctor-provider devin
+python -m muse_gateway doctor --doctor-provider local
+```
+
+Bare `doctor` checks the default routes and configured local route. It can
+report Meta as not ready without a static key even when subscription forwarding
+will work once Muse sends its bearer. For local models, keyless setups or
+unusable discovery can also make doctor report not ready; that is a preflight
+result, not an attempted model turn.
 
 HTTP endpoints:
 
-- `GET /health`: server liveness, not upstream readiness; identifies the service
-  as `muse-gateway`. The launcher also recognizes older gateways when reusing a listener.
-- `GET /muse-code/models` (also `/v1/muse-code/models`): Muse model catalog.
-- `POST /responses` (also `/v1/responses`): inference.
+- `GET /health`: listener health, not upstream readiness. Includes process and
+  source identity so you can check which gateway is running.
+- `GET /muse-code/models`: Muse's model catalog.
+- `POST /responses`: inference.
 
-## Compatibility and limitations
+The catalog and inference endpoints also accept a `/v1` prefix.
 
-- Muse Code updates can change the expected protocol. This is community tooling,
-  not a supported extension contract or a guarantee of provider feature parity.
-- Meta entries are discovered live only when a static API key is configured;
-  subscription setups use a bundled model list, which may not include every
-  account-visible Muse model. Bundled Meta output limits are fallback values,
-  not confirmed provider limits, and are labeled accordingly in the menu.
-- The menu only lists providers this system can serve: Codex rows require
-  stored credentials and Claude rows require the CLI (or HTTP credentials),
-  matching what doctor reports. Meta is always listed (subscription forwarding
-  cannot be checked statically) and local stays opt-in.
-- Catalog discovery is cached for one hour. Failed or empty discovery retries
-  after a minute instead, so a fresh login or recovered upstream appears
-  without a restart. Restart the gateway to refresh immediately, or fetch the
-  catalog with `Cache-Control: no-cache` to recall discovery on demand (for
-  example after switching models). Meta subscription
-  setups reuse the catalog request's own bearer for the default Meta upstream,
-  mirroring inference forwarding; any failure keeps the bundled list.
-  Discovered Codex models with missing limits and local/Meta
-  fallbacks are labeled unverified. Native bundled fallback labels are legacy
-  defaults, not live-verified limits. Codex reasoning choices
-  come from model-specific discovery; client-only orchestration levels are not
-  advertised as wire efforts. Meta rows advertise the levels Muse itself
-  documents (`none` through `ultra`, default `high`); Muse's /effort options
-  come from the same per-model variant lists. A menu entry does not verify
-  tool quality or end-to-end inference compatibility.
-- Local tool calls must arrive as structured Responses function-call events.
-  The gateway does not convert XML-like tool syntax embedded in ordinary text.
-- Codex runs stateless (`store=False`), so `previous_response_id` can never
-  resolve upstream. When a turn carries complete input, the gateway drops the
-  unresolvable reference, proceeds with the full turn, and logs
-  `previous_response_id_dropped`. Only a turn with no input at all is
-  rejected, since there is nothing to forward.
-  String input is wrapped in the canonical user-message list form, which the
-  backend requires.
-  Text system messages are folded into `instructions`; nontext system content
-  is rejected rather than dropped. Reasoning efforts are reconciled against
-  model-specific discovery: known mislabels (`minimal`→`low`, `ultra`→`max`)
-  are corrected with a log event, anything else unsupported is rejected with
-  the supported list, and models without discovered effort evidence pass
-  through untouched.
-- Claude CLI output is returned after each subprocess completes, not token by
-  token. This transport advertises text-only input. Claude mode does not support
-  `previous_response_id` state restoration.
-- Responses compatibility alone does not establish reliable multi-turn tool
-  use. Unit tests use local fakes; test live providers with your own accounts.
+### Private failure captures
 
-## Security and project information
+Capture is off by default. For a controlled diagnosis, use a separate port and
+a private destination outside the repository:
 
-Keep the listener on loopback. The gateway has no client authentication or
-multi-tenant isolation. `--allow-non-loopback` requires your own access controls.
-OAuth credentials may be refreshed on disk. Do not upload auth files, `.env`,
-private work notes, or unreviewed logs. See [SECURITY.md](SECURITY.md).
+```powershell
+python -m muse_gateway --capture-dir "$env:TEMP\muse-gateway-captures" launch --port 8791
+```
 
-Contributions and local test instructions: [CONTRIBUTING.md](CONTRIBUTING.md).
-Participation guidelines: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
-License: [MIT](LICENSE), retaining the original muse-shim copyright notice.
+`MUSE_GATEWAY_CAPTURE_DIR` enables the same mode. `/health` identifies the
+capture session as well as the process/source. Each gateway request gets its
+own directory containing request transforms, outgoing bytes, upstream headers
+and error bodies, downstream HTTP/SSE bytes, and a monotonic read/frame/write
+timeline. Devin protobufs are also saved in readable form. Credentials are
+scrubbed before writing; frames that cannot safely be scrubbed are marked
+omitted, and hashes of original bytes are identified as such.
 
-The legacy module alias (`muse_shim`, so `python -m muse_shim` still runs),
-the `muse-shim` console command and launcher wrapper, every `MUSE_SHIM_*`
-environment variable, older `muse-shim` health-service identifiers, and the
-`shim_error` wire error type keep working for compatibility. The
-project and user-facing product name are **muse-gateway**.
+**Captures contain conversation content.** Owner-only permissions are applied,
+including a protected Windows ACL, and the gateway does not upload these files.
+Each request has a 64 MiB budget. Check `manifest.json` for truncation, omitted
+data, capture errors, byte counts, and terminal events. Even a complete capture
+is transport evidence: correlate it with Muse's completion or decoder error.
+See [SECURITY.md](SECURITY.md) before sharing any files.
+
+## Compatibility
+
+Muse's protocol can change between releases. Re-run consumer compatibility
+checks after updating Muse; they are specific to the executable being tested.
+[CONTRIBUTING.md](CONTRIBUTING.md#what-a-green-result-means) explains the checks
+and which account/TUI workflows still need verification.
+
+Advertised model limits are discovery data or fallbacks, not measurements.
+Local/Meta and undiscovered Devin limits are marked unverified; legacy native
+fallback labels are not proof of live-verified limits either. Model quality,
+tool reliability, and features such as signed reasoning remain provider-specific.
+Switching providers does not make their opaque reasoning state interchangeable.
+
+## Security
+
+Keep the listener on loopback. There is no client authentication or multi-tenant
+isolation; `--allow-non-loopback` requires your own access controls.
+
+Only configure upstreams you trust. Local requests use the local key, then the
+generic gateway key, then incoming authorization. Meta uses its static route
+key or incoming authorization. Without a dedicated key, your configured server
+may receive Muse's subscription bearer. A custom Meta URL also receives native
+Meta payloads; an OpenAI-compatible label alone does not establish support.
+
+Native Codex/Claude OAuth destinations are allowlisted, and credentialed
+requests do not follow cross-origin redirects. Do not use
+`--allow-oauth-host-override` casually. Prefer TLS for non-loopback upstreams.
+OAuth refresh may update credential files on disk. Keep `.env`, credentials,
+logs, and captures private; the gateway cannot remove every secret a user or
+model might include in conversation content. See [SECURITY.md](SECURITY.md).
+
+## Contributing and attribution
+
+Development and test instructions: [CONTRIBUTING.md](CONTRIBUTING.md).
+Community guidelines: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+Licensed under [MIT](LICENSE), retaining muse-shim's original copyright and
+attribution. Devin protocol adaptations also retain the upstream notices in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+The `muse_shim` module, `muse-shim` console command and wrapper, `MUSE_SHIM_*`
+settings, older health-service identifiers, and `shim_error` wire type remain
+for compatibility. The project name is **muse-gateway**.

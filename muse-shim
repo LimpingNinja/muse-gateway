@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
-# Backward-compatible alias for the muse-gateway launcher.
-# Prefer ./muse-gateway; this wrapper keeps the old name working.
+# Legacy low-level server entry point; arguments pass to muse_gateway.py.
+# Prefer ./muse-gateway for the subscription launcher, or use this script's
+# `launch` subcommand explicitly. The historical default stays server-only.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
