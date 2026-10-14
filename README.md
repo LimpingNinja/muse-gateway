@@ -1,26 +1,67 @@
 # muse-gateway
 
-Use Muse Spark, OpenAI Codex, Claude, and local models from Muse Code's `/model`
-menu. muse-gateway is an unofficial loopback proxy: Muse keeps the coding-agent
-harness and executes tools; the gateway routes model requests to your providers.
+Use Muse Spark, OpenAI Codex, Claude, Devin, and local models from Muse
+Code's `/model` menu. muse-gateway is an unofficial loopback proxy: Muse keeps
+the coding-agent harness and executes tools; the gateway routes model requests
+to your providers.
 
 Forked from [luckeyfaraday/muse-shim](https://github.com/luckeyfaraday/muse-shim),
 with native Meta forwarding, local endpoint discovery, and Windows/Bash launchers.
 The upstream MIT license and attribution are retained. This project is not
-affiliated with Meta, OpenAI, or Anthropic.
+affiliated with Meta, OpenAI, Anthropic, or Devin.
 
 ## Requirements
 
-- Python 3.10 or newer; no third-party Python runtime dependencies.
+- Python 3.10 or newer; one runtime dependency (`protobuf`, installed with the package).
 - Muse Code installed as `muse` and authenticated with `muse login`.
 - Optional: a local or LiteLLM endpoint supporting **OpenAI Responses** with
   streaming and function tools. A Chat Completions-only endpoint needs an adapter.
 - Optional: an existing `codex login` or an installed, authenticated Claude Code
   CLI for those providers.
+- Optional: for Devin, a Devin CLI login (`devin auth login`), a session
+  token, or an existing OMP login (`~/.omp/agent/agent.db`).
+
+## Private failure captures
+
+For a controlled diagnosis, start the server on a separate port with
+`--capture-dir PATH` (or `MUSE_GATEWAY_CAPTURE_DIR`). For example:
+
+```powershell
+python muse_gateway.py auto --port 8791 --capture-dir "$env:TEMP\muse-gateway-captures"
+```
+
+Connect Muse to that exact port. `/health` includes the capture session,
+process ID, source directory, and source fingerprint, so an older running
+gateway cannot be mistaken for the instrumented checkout.
+
+Capture is off by default. When enabled it creates a private session directory
+with one subdirectory per gateway request ID. It records incoming/transformed
+requests, outgoing request bytes, upstream headers and complete error bodies,
+downstream HTTP/SSE bytes, and a monotonic read/frame/write timeline. Devin
+requests and unary responses are saved as scrubbed protobuf and readable JSON;
+complete chat frames retain their original bytes unless secret removal is
+necessary. Opaque frames that cannot be decoded safely are explicitly marked
+omitted. Credentials in headers and protobuf metadata/JWT fields are removed
+before writing. Original-byte hashes refer to bytes before scrubbing.
+
+These files **contain conversation content**, even though credentials are
+scrubbed. They are separate from ordinary rotating logs, use owner-only directory
+permissions (including a protected Windows ACL), and are not uploaded. Each
+request has a 64 MiB capture budget; `manifest.json` reports truncation, capture
+errors, first/terminal SSE events, and observed byte counts. A capture without
+errors or truncation is transport evidence, not proof that Muse accepted it;
+correlate it with the corresponding Muse session's completion or decoder error.
 
 ## Quick start
 
 Download or clone this repository and open a terminal in its directory.
+Install it once using the Python interpreter that will run the gateway;
+this installs the required protobuf dependency automatically:
+
+```bash
+python -m pip install .
+```
+
 There is one launcher interface, available three ways: the source wrappers
 (`.\muse-gateway.ps1` on Windows, `bash ./muse-gateway` on Linux/macOS/WSL)
 forward to the cross-platform `launch` subcommand, which is also the installed
@@ -40,7 +81,7 @@ bash ./muse-gateway
 muse-gateway launch   # installed console command, same behavior
 ```
 
-Inside Muse, open `/model` and select a `Meta`, `Codex`, `Claude`, or `Local`
+Inside Muse, open `/model` and select a `Meta`, `Codex`, `Claude`, `Devin`, or `Local`
 entry. A catalog entry does not prove account access: Codex and Claude fallback
 entries may appear before you authenticate with those providers.
 
@@ -125,10 +166,27 @@ It does **not** test inference or launch an interactive Muse session.
 - **`codex/<id>`:** uses Codex OAuth from its credential file or environment,
   including refresh support, and the native Codex Responses backend. It does
   not run the Codex CLI for inference.
+  Muse's composite replay item IDs are normalized without changing tool
+  call/result IDs. If Codex explicitly rejects retained encrypted reasoning,
+  the gateway retries once with that opaque reasoning demoted to its visible
+  summary; visible conversation and tool history are preserved. This recovery
+  is logged as `codex_reasoning_demoted` and does not alter valid requests.
 - **`claude/<id>`:** invokes the official `claude -p` transport by default.
   Claude's built-in tools and session persistence are disabled; structured tool
   calls are returned to Muse to execute. Direct Anthropic Messages mode is
   available with `--claude-transport http` on the Python server.
+- **`devin/<id>`:** speaks Devin's Connect/protobuf protocol directly. Credentials come from
+  `MUSE_GATEWAY_DEVIN_API_KEY` (or `DEVIN_API_KEY`) if set, else your Devin
+  CLI login (`devin auth login`), else your OMP login; there is no refresh
+  grant, so an expired login means logging in again. Fusion pairings are not
+  listed (their sidekick half cannot run gateway-side); directly servable
+  models, routers, and effort lanes are.
+  Responses events carry sequence numbers required by Muse. Text is delivered
+  incrementally; function calls are released after names/arguments are finalized,
+  so repaired arguments match their delta and completion events. Developer
+  messages retain their position in history, and model discovery is scoped to
+  the active credential. Native signed-reasoning replay is not implemented;
+  incoming signatures are not trusted or forwarded as provider-owned state.
 - **`generic` / `http` mode:** forwards to a Responses-compatible endpoint such
   as OpenRouter. It is a separate server mode, not an additional auto-mode route.
 

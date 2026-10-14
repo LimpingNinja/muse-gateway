@@ -6,17 +6,17 @@ preserve upstream attribution, and document user-visible behavior.
 
 ## Development and tests
 
-Python 3.10+ is required. Runtime and tests use the standard library only;
-installation is not required. From the repository root:
+Python 3.10+ is required. The runtime has one dependency, protobuf; the tests
+use the standard-library unittest runner. From the repository root:
 
 ```bash
+python -m pip install -e .
 python -m unittest -v
 python -m muse_gateway --help
 ```
 
-Use `python3` if that is your Python executable. For an optional editable install,
-create a project-local environment with `python -m venv .venv`, activate it for
-your shell, and run `python -m pip install -e .` inside that environment.
+Use `python3` if that is your Python executable. You can create a project-local
+environment with `python -m venv .venv` and activate it before installing.
 The installed `muse-gateway launch` command and source wrappers use the same
 subscription launcher; see [README.md](README.md).
 

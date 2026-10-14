@@ -19,7 +19,8 @@ Modes:
   (LiteLLM, Ollama via an adapter, ...) with the usual flattened tools.
   ``auto`` advertises ``local/`` aliases only when explicitly configured.
 
-The implementation is intentionally dependency-free. Codex uses its ordinary
+The implementation needs a single runtime dependency (protobuf, for the
+Devin provider's generated bindings). Codex uses its ordinary
 provider transport; Claude CLI mode deliberately delegates inference to the
 locally installed official Claude Code client.
 """
@@ -27,6 +28,7 @@ locally installed official Claude Code client.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import ipaddress
 import json
@@ -43,10 +45,13 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.client import HTTPException
 from typing import Any, Iterable
 
 from muse_providers import (
@@ -67,12 +72,14 @@ from muse_providers import (
     correct_codex_effort,
     discover_claude_credentials,
     discover_codex_credentials,
+    demote_codex_encrypted_reasoning,
     endpoint_for,
     prepare_codex_request,
     refresh_claude_oauth,
     refresh_codex_oauth,
     resolve_claude_credentials,
     resolve_codex_credentials,
+    response_sse_line,
     responses_to_anthropic,
     translate_anthropic_sse,
     validate_claude_endpoint,
@@ -80,6 +87,8 @@ from muse_providers import (
     validate_codex_endpoint,
     validate_codex_token_url,
 )
+import muse_devin
+from muse_capture import CaptureSession, CapturingWriter, current_capture
 
 
 DEFAULT_UPSTREAM = "https://openrouter.ai/api/v1"
@@ -102,6 +111,9 @@ DEFAULT_CLAUDE_MODELS = (
 # Bundled Meta catalog limits; output limits are unverified fallback values.
 # See README.md for discovery and capability limitations.
 DEFAULT_META_UPSTREAM = "https://api.meta.ai/v1"
+# Devin (Codeium Cascade) Connect RPC base. Paths are service routes, not
+# Responses endpoints, so provider_url("devin") returns this verbatim.
+DEFAULT_DEVIN_UPSTREAM = "https://server.codeium.com"
 DEFAULT_META_MODELS = (
     "muse-spark-1.3",
     "muse-spark-1.2",
@@ -387,6 +399,19 @@ class Config:
                 or _default_upstream_for("local")
             )
         ).rstrip("/")
+        self.devin_upstream: str = (
+            self.upstream
+            if provider == "devin"
+            else str(
+                getattr(args, "devin_upstream", None)
+                or _default_upstream_for("devin")
+            )
+        ).rstrip("/")
+        self.devin_api_key: str | None = getattr(args, "devin_api_key", None)
+        self.devin_auth_db: str | None = getattr(args, "devin_auth_db", None)
+        self.devin_credential_id: str | None = getattr(
+            args, "devin_credential_id", None
+        )
         # Gateway fork: model discovery runs only when the local upstream was
         # explicitly configured (flag or env), so an unconfigured install
         # advertises no local/ entries and makes no discovery calls.
@@ -409,6 +434,7 @@ class Config:
         self.log_file: str = os.path.abspath(
             getattr(args, "log_file", None) or "muse-gateway.log"
         )
+        self.capture_dir: str | None = getattr(args, "capture_dir", None)
         self.timeout: float = float(getattr(args, "timeout", 600.0) or 600.0)
         self.max_body_bytes: int = int(
             getattr(args, "max_body_bytes", DEFAULT_MAX_BODY_BYTES)
@@ -446,8 +472,19 @@ class Config:
         self.local_models: list[str] = _parse_model_list(
             getattr(args, "local_models", None), ()
         )
+        # Devin: an explicit list curates discovered logical ids/uids (never
+        # fabricated: discovery owns routing metadata).
+        self.devin_models: list[str] = _parse_model_list(
+            getattr(args, "devin_models", None), ()
+        )
+        self.devin_models_explicit: bool = bool(getattr(args, "devin_models", None))
         self.model_discovery: bool = bool(getattr(args, "model_discovery", True))
         self._model_catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        # Devin roster stash: logical_id -> DevinModel, refreshed with the
+        # catalog so requests reuse discovery without extra RPCs.
+        self._devin_roster: dict[str, Any] = {}
+        self._devin_rosters: dict[str, tuple[dict[str, Any], int]] = {}
+        self._devin_dropped_fusion: int = 0
         if not _is_loopback_host(self.host) and not self.allow_non_loopback:
             raise ProviderError(
                 f"refusing non-loopback bind address {self.host!r}; "
@@ -485,6 +522,8 @@ class Config:
             return f"{self.meta_upstream}/responses"
         if selected == "local":
             return f"{self.local_upstream}/responses"
+        if selected == "devin":
+            return self.devin_upstream
         return self.upstream_url("responses")
 
     def resolve_model(self, model: Any) -> tuple[str, str]:
@@ -527,8 +566,16 @@ class Config:
                         code="model_provider_mismatch",
                     )
                 return "local", value[len(prefix) :]
+        for prefix in ("devin/", "devin:"):
+            if value.startswith(prefix):
+                if self.provider not in {"auto", "devin"}:
+                    raise ProviderError(
+                        "selected model belongs to Devin.",
+                        code="model_provider_mismatch",
+                    )
+                return "devin", value[len(prefix) :]
 
-        if self.provider in {"generic", "codex", "claude", "meta", "local"}:
+        if self.provider in {"generic", "codex", "claude", "meta", "local", "devin"}:
             return self.provider, value
         # Gateway fork: explicit membership wins over the name heuristics
         # below, so a user-configured local alias is never misrouted.
@@ -540,6 +587,8 @@ class Config:
             return "meta", value
         if value in self.claude_models or value.lower().startswith("claude-"):
             return "claude", value
+        if value in self.devin_models:
+            return "devin", value
         if value in self.codex_models or value.lower().startswith(
             ("gpt-", "o1", "o3", "o4")
         ):
@@ -568,6 +617,7 @@ class Config:
             self.access_token,
             self.meta_api_key,
             self.local_api_key,
+            self.devin_api_key,
         ):
             if isinstance(value, str) and value:
                 values.append(value)
@@ -1030,9 +1080,10 @@ def _provider_is_available(config: Config, provider: str) -> bool:
     Codex needs stored credentials; Claude needs its CLI executable (the
     default print transport owns auth) or HTTP credentials. Meta is always
     listed: subscription forwarding cannot be verified statically and launch
-    mode provides it. Local stays opt-in through its own configured-list and
-    discovery rules below. Any lookup failure means unavailable, never an
-    exception: the menu must degrade, not crash.
+    mode provides it. Devin needs a ready credential.
+    Local stays opt-in through its own configured-list and discovery rules
+    below. Any lookup failure means unavailable, never an exception: the
+    menu must degrade, not crash.
     """
     try:
         if provider == "codex":
@@ -1041,18 +1092,115 @@ def _provider_is_available(config: Config, provider: str) -> bool:
             if config.claude_transport == "cli":
                 return shutil.which(config.claude_cli) is not None
             return discover_claude_credentials(config) is not None
+        if provider == "devin":
+            return _devin_provider_ready(config)
     except Exception:
         return False
     return True
 
 
+def _devin_provider_ready(config: Config) -> bool:
+    """Devin rows list only when a credential is ready."""
+    try:
+        state = muse_devin.credential_state(
+            auth_db_path=config.devin_auth_db,
+            credential_id=config.devin_credential_id,
+            api_key=config.devin_api_key,
+        )
+    except (OSError, ValueError):
+        return False
+    return isinstance(state, dict) and state.get("state") == "ready"
+
+
+def _devin_cache_key(config: Config, token: str) -> str:
+    return "devin:" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def _devin_catalog_entries(config: Config, access_token=None) -> list[dict[str, Any]]:
+    """Devin rows with their own roster stash (uid/routing the generic item
+    shape cannot carry). Explicit devin_models curate; fusion pairings are
+    dropped inside discovery (option B) with the count stashed for doctor."""
+    try:
+        token = access_token
+        if token is None:
+            token, _identity = muse_devin.resolve_access_token(
+                auth_db_path=config.devin_auth_db,
+                credential_id=config.devin_credential_id,
+                api_key=config.devin_api_key,
+            )
+    except (muse_devin.DevinCredentialError, muse_devin.DevinWireError, OSError, ValueError):
+        config._devin_roster = {}
+        config._devin_dropped_fusion = 0
+        return []
+    cache_key = _devin_cache_key(config, token)
+    cached = config._model_catalog_cache.get(cache_key)
+    if cached and time.time() - cached[0] < MODEL_CATALOG_TTL_SECONDS:
+        config._devin_roster, config._devin_dropped_fusion = config._devin_rosters[cache_key]
+        return cached[1]
+    dropped = 0
+    if config.model_discovery:
+        try:
+            models, dropped, _warnings = muse_devin.discover_models(
+                token, config.devin_upstream
+            )
+        except (muse_devin.DevinWireError, OSError, ValueError):
+            models = []
+        if not models:
+            models = muse_devin.seed_models(config.devin_upstream)
+    else:
+        models = muse_devin.seed_models(config.devin_upstream)
+    if config.devin_models_explicit:
+        wanted = set(config.devin_models)
+        models = [
+            model
+            for model in models
+            if model.logical_id in wanted or model.uid in wanted
+        ]
+    roster = {}
+    for model in models:
+        roster[model.logical_id] = model
+        roster.setdefault(model.uid, model)
+    config._devin_roster = roster
+    config._devin_dropped_fusion = dropped
+    ordered = sorted(models, key=lambda model: not model.is_default)
+    entries = [
+        _catalog_entry(
+            "devin",
+            model.logical_id,
+            context_limit=model.context_limit,
+            output_limit=min(model.output_limit, config.max_output_tokens)
+            if config.max_output_tokens
+            else model.output_limit,
+            is_default=index == 0,
+            limits_verified=not model.unverified,
+            supports_images=model.supports_images,
+            reasoning_efforts=model.efforts or None,
+            default_reasoning_effort=model.default_effort,
+        )
+        for index, model in enumerate(ordered)
+    ]
+    if not entries and config.model_discovery:
+        stamped = time.time() - (
+            MODEL_CATALOG_TTL_SECONDS - MODEL_CATALOG_RETRY_SECONDS
+        )
+    else:
+        stamped = time.time()
+    config._devin_rosters[cache_key] = (roster, dropped)
+    config._model_catalog_cache[cache_key] = (stamped, entries)
+    return entries
+
+
 def provider_model_catalog(
     config: Config, provider: str, *, authorization: str | None = None
 ) -> list[dict[str, Any]]:
+    if provider == "devin":
+        if not _provider_is_available(config, provider):
+            return []
+        return _devin_catalog_entries(config)
     cached = config._model_catalog_cache.get(provider)
     if cached and time.time() - cached[0] < MODEL_CATALOG_TTL_SECONDS:
         return cached[1]
-    if provider in {"codex", "claude"} and not _provider_is_available(
+    if provider in {"codex", "claude", "devin"} and not _provider_is_available(
         config, provider
     ):
         # Never advertise rows that could only fail at request time. Not
@@ -1540,6 +1688,32 @@ def _upstream_diagnostic(payload: bytes) -> dict[str, Any]:
     return result or {"reason": "upstream_rejected_request"}
 
 
+def _capture_http_error(error) -> bytes:
+    """Keep normal error projection unchanged; drain evidence only on opt-in."""
+    first = error.read(65536)
+    capture = current_capture()
+    if capture is not None:
+        label = "upstream.error" if "upstream.error.body" not in capture.streams else capture.label("upstream.error")
+        capture.json(label + ".headers", {"status": error.code, "headers": dict(error.headers or {})})
+        capture.bytes(label + ".body", first)
+        observed = len(first)
+        while observed < 64 * 1024 * 1024:
+            try:
+                chunk = error.read(min(65536, 64 * 1024 * 1024 - observed))
+            except (OSError, HTTPException) as capture_error:
+                capture.event(label + ".incomplete", kind=type(capture_error).__name__, complete=False)
+                capture.errors.append("upstream_error_capture_incomplete")
+                break
+            if not chunk:
+                capture.event(label + ".eof", bytes=observed)
+                break
+            observed += len(chunk)
+            capture.bytes(label + ".body", chunk)
+        else:
+            capture.event(label + ".limit", bytes=observed, complete=False)
+    return first
+
+
 def _request_diagnostic(body: dict[str, Any]) -> dict[str, Any]:
     """Record shape and recognized settings, never prompts or tool arguments."""
     reasoning = body.get("reasoning")
@@ -1572,14 +1746,26 @@ def _ssl_context(config: Config) -> ssl.SSLContext | None:
 
 def _iter_upstream_chunks(upstream: Any, *, content_type: str) -> Iterable[bytes]:
     """Yield promptly from an upstream stream without a large read buffer."""
+    def observed(chunk):
+        data = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        capture = current_capture()
+        if capture is not None:
+            capture.event("upstream.read", bytes=len(data))
+            capture.bytes("upstream.body", data)
+            if "text/event-stream" in content_type.lower():
+                capture.observe_sse("upstream", data)
+        return data
+
     if "text/event-stream" in content_type.lower():
         reader = getattr(upstream, "readline", None)
         if callable(reader):
             while True:
                 chunk = reader()
                 if not chunk:
+                    if current_capture() is not None:
+                        current_capture().event("upstream.eof")
                     return
-                yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+                yield observed(chunk)
 
     reader = getattr(upstream, "read1", None)
     if not callable(reader):
@@ -1589,8 +1775,10 @@ def _iter_upstream_chunks(upstream: Any, *, content_type: str) -> Iterable[bytes
     while True:
         chunk = reader(8192)
         if not chunk:
+            if current_capture() is not None:
+                current_capture().event("upstream.eof")
             return
-        yield chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        yield observed(chunk)
 
 
 def _write_upstream_body(handler: BaseHTTPRequestHandler, upstream: Any, *, stream: bool, content_type: str) -> None:
@@ -1628,6 +1816,10 @@ def _write_upstream_body(handler: BaseHTTPRequestHandler, upstream: Any, *, stre
             observe_frame()
         return
     payload = upstream.read()
+    capture = current_capture()
+    if capture is not None:
+        capture.bytes("upstream.body", payload.encode() if isinstance(payload, str) else payload)
+        capture.event("upstream.eof")
     if payload:
         handler.wfile.write(payload.encode("utf-8") if isinstance(payload, str) else payload)
         handler.wfile.flush()
@@ -1677,6 +1869,23 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     server_version = "muse-gateway/0.5.0"
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        super().setup()
+        self._capture_request = None
+        if getattr(self.server, "capture_session", None) is not None:
+            self.wfile = CapturingWriter(self.wfile)
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        finally:
+            capture = getattr(self, "_capture_request", None)
+            if capture is not None:
+                capture.finish(status=getattr(self, "_response_status", None),
+                               stream_failed=getattr(self, "_stream_failed", False),
+                               close_connection=self.close_connection)
+                self._capture_request = None
+
     @property
     def config(self) -> Config:
         return self.server.config  # type: ignore[attr-defined]
@@ -1688,6 +1897,9 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             **getattr(self, "_diagnostic", {}),
             **fields,
         }
+        capture = current_capture()
+        if capture is not None:
+            capture.event("gateway." + event, **{key: value for key, value in record.items() if key != "event"})
         known_secrets = self.config.secret_values()
         known_secrets.append(self.headers.get("Authorization", ""))
         rendered = _redact_bytes(
@@ -1718,8 +1930,14 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     def send_provider_error(self, error: ProviderError | ShimError, *, status: int | None = None) -> None:
         error_status = status or getattr(error, "status", 400)
         code = getattr(error, "code", "shim_error")
+        extra = dict(getattr(self, "_upstream_diagnostic", {}))
+        if "code" in extra:
+            # The upstream error code must not collide with our own `code=`
+            # (that TypeError killed the error response and the client saw
+            # a dropped connection as "malformed response data").
+            extra["upstream_code"] = extra.pop("code")
         self._log_event("provider_error", status=error_status, code=code,
-                        **getattr(self, "_upstream_diagnostic", {}))
+                        **extra)
         if getattr(self, "_response_started", False):
             # A partial response cannot be replaced by a second HTTP response.
             self.close_connection = True
@@ -1748,6 +1966,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     "service": "muse-gateway",
                     "provider": self.config.provider,
                     "claude_transport": self.config.claude_transport,
+                    **(self.server.capture_session.health() if self.server.capture_session is not None else {}),
                 },
             )
             return
@@ -1761,7 +1980,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             inbound_auth = self.headers.get("Authorization")
             if self.config.provider == "auto":
                 models: list[dict[str, Any]] = []
-                for route in ("codex", "claude", "meta", "local"):
+                for route in ("codex", "claude", "meta", "devin", "local"):
                     models.extend(
                         dict(item)
                         for item in provider_model_catalog(
@@ -1770,7 +1989,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     )
                 self.send_json(200, muse_catalog_response(models))
                 return
-            if self.config.provider in {"codex", "claude", "meta", "local"} and not self.config.model:
+            if self.config.provider in {"codex", "claude", "meta", "devin", "local"} and not self.config.model:
                 entries = provider_model_catalog(
                     self.config, self.config.provider, authorization=inbound_auth
                 )
@@ -1783,11 +2002,12 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 "codex": "codex-model-from-request",
                 "claude": "claude-model-from-request",
                 "meta": "meta-model-from-request",
+                "devin": "devin-model-from-request",
                 "local": "local-model-from-request",
             }.get(self.config.provider, "upstream-model")
             provider = (
                 self.config.provider
-                if self.config.provider in {"codex", "claude", "meta", "local"}
+                if self.config.provider in {"codex", "claude", "meta", "devin", "local"}
                 else "generic"
             )
             self.send_json(
@@ -1829,6 +2049,11 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             raise ShimError("request body must be valid JSON") from exc
         if not isinstance(body, dict):
             raise ShimError("request body must be a JSON object")
+        capture = current_capture()
+        if capture is not None:
+            capture.json("incoming", body)
+            capture.json("incoming.headers", dict(self.headers))
+            capture.bytes("incoming.body", raw)
         return body
 
     def do_POST(self) -> None:
@@ -1837,6 +2062,15 @@ class MuseShimHandler(BaseHTTPRequestHandler):
         self._stream_failed = False
         self._diagnostic: dict[str, Any] = {}
         self._upstream_diagnostic: dict[str, Any] = {}
+        session = getattr(self.server, "capture_session", None)
+        if session is not None:
+            try:
+                self._capture_request = session.request(
+                    self._request_id,
+                    [*self.config.secret_values(), self.headers.get("Authorization", "")],
+                )
+            except OSError as capture_error:
+                self._log_event("capture_unavailable", kind=type(capture_error).__name__)
         path = self.path.split("?", 1)[0].rstrip("/")
         if path not in {"/responses", "/v1/responses"}:
             self.send_json(404, {"error": {"message": "not found", "type": "shim_error"}})
@@ -1857,6 +2091,9 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             )
             transformed["model"] = upstream_model
             self._diagnostic["provider"] = provider
+            if current_capture() is not None:
+                current_capture().json("transformed", transformed)
+                current_capture().event("route.selected", provider=provider, model=upstream_model)
         except (ProviderError, ShimError, ValueError) as error:
             local_error = (
                 error
@@ -1878,6 +2115,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 self.forward_meta(transformed)
             elif provider == "local":
                 self.forward_local(transformed)
+            elif provider == "devin":
+                self.forward_devin(transformed)
             else:
                 self.forward_generic(transformed)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
@@ -1887,7 +2126,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             self.send_provider_error(error)
         except urllib.error.HTTPError as error:
             try:
-                detail = _upstream_diagnostic(error.read(65536))
+                detail = _upstream_diagnostic(_capture_http_error(error))
             finally:
                 error.close()
             self._log_event("upstream_error", status=error.code, **detail)
@@ -1900,11 +2139,31 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 "Upstream connection failed; check the gateway log and upstream availability.",
                 status=502, code="upstream_unreachable",
             ))
+        except Exception as error:
+            # Last resort: a dropped connection surfaces client-side as
+            # "malformed response data" after 10 blind retries. Always
+            # answer instead, and leave the traceback in the diagnostics
+            # log (frames only, no prompt or response content).
+            self._log_event(
+                "internal_error", kind=type(error).__name__,
+                traceback=traceback.format_exc(limit=8)[-2000:],
+            )
+            if getattr(self, "_response_started", False):
+                self.close_connection = True
+                return
+            self.send_provider_error(ProviderError(
+                "gateway internal error; see the gateway log",
+                status=500, code="internal_error",
+            ))
         else:
             self._log_event("request_finished", status=getattr(self, "_response_status", None),
                             stream_failed=self._stream_failed)
 
     def _send_upstream_headers(self, upstream: Any, *, content_type: str, stream: bool) -> None:
+        capture = current_capture()
+        if capture is not None:
+            capture.json("upstream.headers", {"status": int(getattr(upstream, "status", 200)),
+                                               "headers": dict(upstream.headers)})
         self.send_response(int(getattr(upstream, "status", 200)))
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache" if stream else "no-store")
@@ -1969,6 +2228,104 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             )
         self._post_responses(local_url, body, authorization)
 
+    def forward_devin(self, body: dict[str, Any]) -> None:
+        """Translate one Responses request onto Devin's Connect RPCs."""
+        if "previous_response_id" in body:
+            if body.get("previous_response_id") and not (body.get("input") or body.get("messages")):
+                raise ProviderError(
+                    "Devin response chaining requires complete inline conversation input.",
+                    code="devin_previous_response_unsupported",
+                )
+            # Devin has no server-side chaining; the complete inline history
+            # stands in for the unresolvable reference. Same event the Codex
+            # path logs so diagnostics stay uniform.
+            body = {key: value for key, value in body.items() if key != "previous_response_id"}
+            notify = getattr(self, "_log_event", None)
+            if callable(notify):
+                notify("previous_response_id_dropped")
+        config = self.config
+        try:
+            token, _identity = muse_devin.resolve_access_token(
+                auth_db_path=config.devin_auth_db,
+                credential_id=config.devin_credential_id,
+                api_key=config.devin_api_key,
+            )
+            if current_capture() is not None:
+                current_capture().add_secret(token)
+        except muse_devin.DevinCredentialError as error:
+            raise ProviderError(str(error), code="devin_credential_unavailable") from error
+        _ = _devin_catalog_entries(config, access_token=token)
+        logical_id = str(body.get("model") or "").strip()
+        roster, _dropped = config._devin_rosters[_devin_cache_key(config, token)]
+        model = roster.get(logical_id)
+        if model is None:
+            raise ProviderError(
+                f"unknown Devin model {logical_id!r}; see --models for the roster.",
+                code="devin_unknown_model",
+            )
+        reasoning = body.get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        if not isinstance(effort, str) or not effort:
+            effort = None
+        tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+        stream = body.get("stream") is True
+        conversation_id = self.headers.get("x-tbh-session-id") or body.get("conversation_id") or body.get("session_id")
+        self._log_event(
+            "devin_turn",
+            model=f"devin/{model.logical_id}",
+            effort=effort or model.default_effort or "default",
+            router=bool(model.is_router),
+        )
+        try:
+            if not stream:
+                final = muse_devin.run_turn_final(
+                    body, tools, model, token,
+                    base_url=config.devin_upstream, effort=effort, timeout=config.timeout,
+                    conversation_id=conversation_id,
+                )
+                self.send_json(200, final)
+                return
+            pending = muse_devin.run_turn_events(
+                body, tools, model, token,
+                base_url=config.devin_upstream, effort=effort, timeout=config.timeout,
+                conversation_id=conversation_id,
+            )
+            try:
+                first_event = next(pending)
+            except StopIteration:
+                raise muse_devin.DevinChatError(
+                    "Devin turn ended without a terminal event"
+                )
+            self._send_upstream_headers(
+                types.SimpleNamespace(status=200, headers={}),
+                content_type="text/event-stream",
+                stream=True,
+            )
+            event_type, payload = first_event
+            self.wfile.write(response_sse_line(event_type, payload))
+            self.wfile.flush()
+            for event_type, payload in pending:
+                if event_type == "response.failed":
+                    self._stream_failed = True
+                chunk = response_sse_line(event_type, payload)
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except muse_devin.DevinAuthError as error:
+            raise AuthError(str(error), code="devin_upstream_unauthorized") from error
+        except muse_devin.DevinChatError as error:
+            status = 400 if error.code == "devin_context_overflow" else 502
+            raise ProviderError(
+                str(error), status=status, code=error.code or "devin_chat_error"
+            ) from error
+        except muse_devin.DevinHttpError as error:
+            raise ProviderError(
+                str(error), status=502, code="devin_upstream_error"
+            ) from error
+        except muse_devin.DevinWireError as error:
+            raise ProviderError(
+                str(error), status=502, code="devin_wire_error"
+            ) from error
+
     def _post_responses(
         self, url: str, body: dict[str, Any], authorization: str
     ) -> None:
@@ -1984,6 +2341,13 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 "User-Agent": self.server_version,
             },
         )
+        capture = current_capture()
+        if capture is not None:
+            capture.add_secret(authorization)
+            capture.bytes("outgoing.body", request.data)
+            capture.json("outgoing", body)
+            capture.json("outgoing.headers", dict(request.header_items()))
+            capture.event("upstream.open", url=url)
         with urllib.request.urlopen(
             request,
             timeout=self.config.timeout,
@@ -2001,6 +2365,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
 
     def forward_codex(self, body: dict[str, Any]) -> None:
         state = resolve_codex_credentials(self.config)
+        if current_capture() is not None:
+            current_capture().add_secret(state.access_token)
         if not body.get("model"):
             raise ProviderError(
                 "Codex request is missing model; set MUSE_GATEWAY_MODEL or send model.",
@@ -2043,13 +2409,23 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        for attempt in range(2):
+        capture = current_capture()
+        if capture is not None:
+            capture.bytes("outgoing.body", encoded_body)
+            capture.event("upstream.request_encoded", bytes=len(encoded_body))
+        auth_refreshed = False
+        reasoning_recovered = False
+        for attempt in range(3):
             request = urllib.request.Request(
                 endpoint,
                 data=encoded_body,
                 method="POST",
                 headers=codex_headers(state.access_token),
             )
+            if capture is not None:
+                capture.add_secret(state.access_token)
+                capture.json("outgoing.headers", dict(request.header_items()))
+                capture.event("upstream.open", attempt=attempt, url=endpoint)
             try:
                 with urllib.request.urlopen(
                     request,
@@ -2067,7 +2443,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     )
                     return
             except urllib.error.HTTPError as error:
-                if error.code in {401, 403} and attempt == 0:
+                if error.code in {401, 403} and not auth_refreshed:
                     try:
                         state = resolve_codex_credentials(self.config, force_refresh=True)
                     except ProviderError as refresh_error:
@@ -2076,6 +2452,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                             "Run `codex login` and try again.",
                             code="codex_upstream_unauthorized",
                         ) from refresh_error
+                    auth_refreshed = True
                     continue
                 if error.code in {401, 403}:
                     raise AuthError(
@@ -2083,13 +2460,24 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                         code="codex_upstream_unauthorized",
                     ) from error
                 try:
-                    raw_detail = error.read(65536)
+                    raw_detail = _capture_http_error(error)
                 except OSError:
                     raw_detail = b""
                 finally:
                     error.close()
                 detail = _upstream_diagnostic(raw_detail)
                 self._upstream_diagnostic = detail
+                if error.code == 400 and detail.get("code") == "invalid_encrypted_content" and not reasoning_recovered:
+                    recovered, count = demote_codex_encrypted_reasoning(codex_body)
+                    if count:
+                        codex_body = recovered
+                        encoded_body = json.dumps(codex_body, ensure_ascii=False, separators=(",", ":")).encode()
+                        reasoning_recovered = True
+                        self._log_event("codex_reasoning_demoted", count=count,
+                                        reason="upstream_rejected_encrypted_content")
+                        if capture is not None:
+                            capture.bytes("outgoing.recovered.body", encoded_body)
+                        continue
                 raise ProviderError(
                     f"Codex upstream returned HTTP {error.code}. "
                     f"detail={json.dumps(detail)}",
@@ -2262,6 +2650,7 @@ class MuseShimServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], config: Config) -> None:
         self.config = config
+        self.capture_session = CaptureSession(config.capture_dir) if config.capture_dir else None
         super().__init__(address, MuseShimHandler)
         # Credentialed upstreams must never follow a redirect onto another
         # origin. Installed here so every server path is covered; tests that
@@ -2282,6 +2671,10 @@ class MuseShimServer(ThreadingHTTPServer):
         self.diagnostics.propagate = False
         self.diagnostics.addHandler(self._log_handler)
         self.diagnostics.info(json.dumps({"event": "gateway_started", "port": self.server_port}))
+        if self.capture_session is not None:
+            self.diagnostics.info(json.dumps({"event": "private_capture_enabled",
+                                             **self.capture_session.health(),
+                                             "directory": str(self.capture_session.directory)}))
 
     def server_close(self) -> None:
         super().server_close()
@@ -2306,6 +2699,11 @@ def _default_upstream_for(provider: str) -> str:
         return env_value(
             "MUSE_GATEWAY_META_UPSTREAM",
             env_value("MUSE_GATEWAY_META_BASE_URL", DEFAULT_META_UPSTREAM),
+        )
+    if provider == "devin":
+        return env_value(
+            "MUSE_GATEWAY_DEVIN_UPSTREAM",
+            env_value("MUSE_GATEWAY_DEVIN_BASE_URL", DEFAULT_DEVIN_UPSTREAM),
         )
     if provider == "local":
         return env_value(
@@ -2334,13 +2732,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("auto", "generic", "http", "codex", "claude", "meta", "local", "doctor"),
+        choices=("auto", "generic", "http", "codex", "claude", "meta", "devin", "local", "doctor"),
         default=env_value("MUSE_GATEWAY_PROVIDER", "auto"),
         help="provider mode or doctor",
     )
     parser.add_argument(
         "--provider",
-        choices=("auto", "generic", "http", "codex", "claude", "meta", "local"),
+        choices=("auto", "generic", "http", "codex", "claude", "meta", "devin", "local"),
     )
     parser.add_argument("--host", default=env_value("MUSE_GATEWAY_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(env_value("MUSE_GATEWAY_PORT", str(DEFAULT_PORT))))
@@ -2389,6 +2787,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="local upstream API key (prefer the MUSE_GATEWAY_LOCAL_API_KEY env var; falls back to MUSE_GATEWAY_API_KEY)",
     )
     parser.add_argument(
+        "--devin-upstream",
+        default=env_value("MUSE_GATEWAY_DEVIN_UPSTREAM"),
+        help="Devin Connect RPC base URL (default: https://server.codeium.com)",
+    )
+    parser.add_argument(
+        "--devin-api-key",
+        default=env_value(
+            "MUSE_GATEWAY_DEVIN_API_KEY", env_value("DEVIN_API_KEY")
+        ),
+        help="Devin session token (prefer env vars; else the OMP credential store)",
+    )
+    parser.add_argument(
+        "--devin-auth-db",
+        default=env_value("MUSE_GATEWAY_DEVIN_AUTH_DB"),
+        help="OMP agent.db path for Devin credentials (default: ~/.omp/agent/agent.db)",
+    )
+    parser.add_argument(
+        "--devin-credential-id",
+        default=env_value("MUSE_GATEWAY_DEVIN_CREDENTIAL_ID"),
+        help="Devin credential row id/identity when several are active",
+    )
+    parser.add_argument(
+        "--devin-models",
+        default=env_value("MUSE_GATEWAY_DEVIN_MODELS"),
+        help="comma-separated devin/ ids to list (curates discovery, default: all)",
+    )
+    parser.add_argument(
         "--no-model-discovery",
         action="store_false",
         dest="model_discovery",
@@ -2435,6 +2860,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"maximum incoming JSON body size (default: {DEFAULT_MAX_BODY_BYTES})",
     )
     parser.add_argument("--timeout", type=float, default=float(env_value("MUSE_GATEWAY_TIMEOUT", "600")))
+    parser.add_argument(
+        "--capture-dir", default=env_value("MUSE_GATEWAY_CAPTURE_DIR"),
+        help="opt-in private request/response captures (contains conversation content; credentials scrubbed)",
+    )
     parser.add_argument("--refresh-skew", type=int, default=int(env_value("MUSE_GATEWAY_REFRESH_SKEW", "120")))
     parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME"))
     parser.add_argument("--codex-auth-path", default=env_value("MUSE_GATEWAY_CODEX_AUTH"))
@@ -2454,7 +2883,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--doctor-provider",
-        choices=("generic", "codex", "claude", "meta", "local"),
+        choices=("generic", "codex", "claude", "meta", "devin", "local"),
         default=None,
     )
     parser.add_argument(
@@ -2466,7 +2895,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--models-provider",
-        choices=("codex", "claude", "meta", "local"),
+        choices=("codex", "claude", "meta", "devin", "local"),
         default=None,
         help="with --models, list only this provider's catalog",
     )
@@ -2568,6 +2997,23 @@ def _credential_status(config: Config, provider: str) -> tuple[bool, str]:
         if executable:
             return True, f"Claude CLI print transport; executable={executable}"
         return False, f"Claude CLI executable {config.claude_cli!r} not found"
+    if provider == "devin":
+        state = muse_devin.credential_state(
+            auth_db_path=config.devin_auth_db,
+            credential_id=config.devin_credential_id,
+            api_key=config.devin_api_key,
+        )
+        status = state.get("state")
+        if status == "ready":
+            identity = state.get("identity")
+            if not identity:
+                identity = (
+                    "Devin CLI login"
+                    if state.get("source") == "devin-cli"
+                    else "explicit token"
+                )
+            return True, f"credential ready ({identity})"
+        return False, state.get("note") or f"credential {status}"
     try:
         state = discover_codex_credentials(config) if provider == "codex" else discover_claude_credentials(config)
     except Exception:
@@ -2588,13 +3034,13 @@ def run_doctor(config: Config, *, output: Any = None) -> int:
     print(f"listen: {config.host}:{config.port}", file=output)
     print(f"generic endpoint configured: {'yes' if bool(config.upstream) else 'no'}", file=output)
     selected = getattr(config, "doctor_provider", None)
-    if selected is None and config.provider in {"codex", "claude", "meta", "local"}:
+    if selected is None and config.provider in {"codex", "claude", "meta", "local", "devin"}:
         selected = config.provider
     if selected:
         providers = (selected,)
     elif config.provider in {"auto", "doctor"}:
         # Include local routes configured through discovery or explicit IDs.
-        providers = ("codex", "claude", "meta")
+        providers = ("codex", "claude", "meta", "devin")
         if config.local_models or config.local_upstream_explicit:
             providers = (*providers, "local")
     else:
@@ -2632,10 +3078,10 @@ def run_models(config: Config, provider: str | None = None, *, output: Any = Non
     output = output or sys.stdout
     if provider:
         providers = (provider,)
-    elif config.provider in {"codex", "claude", "meta", "local"}:
+    elif config.provider in {"codex", "claude", "meta", "local", "devin"}:
         providers = (config.provider,)
     else:
-        providers = ("codex", "claude", "meta")
+        providers = ("codex", "claude", "meta", "devin")
         if config.local_models or config.local_upstream_explicit:
             providers = (*providers, "local")
     for name in providers:
@@ -2653,7 +3099,7 @@ def run_models(config: Config, provider: str | None = None, *, output: Any = Non
 
 def _server_destination(config: Config) -> str:
     if config.provider == "auto":
-        return "Codex + Claude + Meta + Local (select with Muse /model)"
+        return "Codex + Claude + Meta + Devin + Local (select with Muse /model)"
     if config.provider == "claude" and config.claude_transport == "cli":
         return f"Claude CLI ({config.claude_cli} -p)"
     return config.provider_url()
@@ -2826,6 +3272,11 @@ ends option parsing and everything from there goes to `muse`.
   --local-upstream URL       local Responses base URL
   --local-api-key KEY        local upstream API key
   --local-models A,B         restrict local/ entries to these upstream IDs
+  --devin-upstream URL       Devin Connect RPC base URL
+  --devin-api-key KEY        Devin session token (else OMP credential store)
+  --devin-auth-db PATH       OMP agent.db path for Devin credentials
+  --devin-credential-id ID   Devin credential row when several are active
+  --devin-models A,B         restrict devin/ entries to these IDs
   --check-only               preflight + catalog check, then exit (no Muse)
   --env-file PATH            config file (default: muse_gateway.py dir, else ./)
   --muse-bin PATH            Muse executable (default: auto-detect)
@@ -2841,6 +3292,11 @@ _LAUNCH_VALUE_OPTIONS = {
     "--local-upstream": "local_upstream",
     "--local-api-key": "local_api_key",
     "--local-models": "local_models",
+    "--devin-upstream": "devin_upstream",
+    "--devin-api-key": "devin_api_key",
+    "--devin-auth-db": "devin_auth_db",
+    "--devin-credential-id": "devin_credential_id",
+    "--devin-models": "devin_models",
     "--env-file": "env_file",
     "--muse-bin": "muse_bin",
     "--log-file": "log_file",
@@ -3031,6 +3487,16 @@ def launch_main(
         server_args.local_api_key = launch_opts.local_api_key
     if launch_opts.local_models is not None:
         server_args.local_models = launch_opts.local_models
+    for option in (
+        "devin_upstream",
+        "devin_api_key",
+        "devin_auth_db",
+        "devin_credential_id",
+        "devin_models",
+    ):
+        value = getattr(launch_opts, option, None)
+        if value is not None:
+            setattr(server_args, option, value)
     if launch_opts.log_file is not None:
         server_args.log_file = launch_opts.log_file
     # Subscription launch must not retain a static key captured by argparse.
@@ -3111,6 +3577,9 @@ def launch_main(
             "`codex login` works",
             file=sys.stderr,
         )
+    ok, detail = _credential_status(config, "devin")
+    if not ok:
+        print(f"warning: devin route not ready ({detail})", file=sys.stderr)
     print("meta/ via Muse subscription login (OAuth forwarding)")
 
     base_url = f"http://{config.host}:{config.port}"
@@ -3139,6 +3608,21 @@ def launch_main(
             print(
                 "warning: reusing the running gateway; this terminal's "
                 "--local-* settings are ignored while it runs.",
+                file=sys.stderr,
+            )
+        if any(
+            getattr(launch_opts, option, None) is not None
+            for option in (
+                "devin_upstream",
+                "devin_api_key",
+                "devin_auth_db",
+                "devin_credential_id",
+                "devin_models",
+            )
+        ):
+            print(
+                "warning: reusing the running gateway; this terminal's "
+                "--devin-* settings are ignored while it runs.",
                 file=sys.stderr,
             )
     else:

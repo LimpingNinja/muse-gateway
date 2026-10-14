@@ -17,7 +17,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Run unit tests (stdlib only)
+      - name: Install package (protobuf runtime dep)
+        run: python -m pip install .
+      - name: Run unit tests
         run: python -m unittest -v
 
   public-surface:
@@ -27,6 +29,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install package (protobuf runtime dep)
+        run: python -m pip install .
       - name: Check launcher syntax
         run: bash -n muse-gateway
       - name: Check launch help renders

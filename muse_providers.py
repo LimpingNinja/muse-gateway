@@ -1303,7 +1303,71 @@ def prepare_codex_request(body: Mapping[str, Any]) -> dict[str, Any]:
                 code="codex_previous_response_unsupported",
             )
     payload.pop("previous_response_id", None)
+    history = payload.get("input")
+    if isinstance(history, list):
+        # Muse qualifies replayed item ids as response_id:item_id. Codex
+        # accepts only alphanumerics, underscores and dashes. Keep the native
+        # component when unambiguous; hash other invalid ids without changing
+        # call_id (which pairs function calls with their results).
+        occupied = {
+            item["id"] for item in history if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]+", item["id"])
+        }
+        remapped = {}
+        for item in history:
+            if not isinstance(item, dict) or item.get("type") == "item_reference":
+                continue
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or re.fullmatch(r"[A-Za-z0-9_-]+", item_id):
+                continue
+            if item_id not in remapped:
+                prefix = {"reasoning": "rs_", "function_call": "fc_"}.get(item.get("type"), "msg_")
+                tail = item_id.rsplit(":", 1)[-1]
+                candidate = tail if tail.startswith(prefix) and re.fullmatch(r"[A-Za-z0-9_-]+", tail) else ""
+                if not candidate or candidate in occupied:
+                    candidate = prefix + hashlib.sha256(item_id.encode()).hexdigest()[:32]
+                    while candidate in occupied:
+                        candidate = prefix + hashlib.sha256(candidate.encode()).hexdigest()[:32]
+                occupied.add(candidate)
+                remapped[item_id] = candidate
+            item["id"] = remapped[item_id]
+        for item in history:
+            if (isinstance(item, dict) and item.get("type") == "item_reference"
+                    and isinstance(item.get("id"), str) and item["id"] in remapped):
+                item["id"] = remapped[item["id"]]
     return payload
+
+
+def demote_codex_encrypted_reasoning(body: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+    """Portable fallback only after Codex explicitly rejects encrypted state."""
+    payload = copy.deepcopy(dict(body))
+    history = payload.get("input")
+    if not isinstance(history, list):
+        return payload, 0
+    portable = []
+    demoted = 0
+    demoted_ids = set()
+    for item in history:
+        if not (isinstance(item, dict) and item.get("type") == "reasoning" and item.get("encrypted_content")):
+            portable.append(item)
+            continue
+        summary = item.get("summary", [])
+        text = summary if isinstance(summary, str) else "\n".join(
+            part["text"] for part in summary
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ) if isinstance(summary, list) else ""
+        if text:
+            portable.append({"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text", "text": text}]})
+        if isinstance(item.get("id"), str):
+            demoted_ids.add(item["id"])
+        demoted += 1
+    payload["input"] = [item for item in portable if not (
+        isinstance(item, dict) and item.get("type") == "item_reference"
+        and isinstance(item.get("id"), str) and item["id"] in demoted_ids
+    )]
+    return payload, demoted
 
 
 def _flatten_tools(tools: Any) -> list[Any]:

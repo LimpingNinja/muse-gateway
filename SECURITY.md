@@ -40,3 +40,8 @@ Out of scope examples: third-party provider outages, Muse CLI bugs unrelated to 
 - Review diagnostics before sharing: provider errors and request metadata may
   contain sensitive information. This project does not guarantee universal
   redaction of arbitrary upstream error messages.
+- `--capture-dir` / `MUSE_GATEWAY_CAPTURE_DIR` is a separate, opt-in debugging
+  mode that saves conversation bodies and wire evidence. Captures are private
+  local files with authentication credentials scrubbed; conversation content
+  can still contain sensitive information. Leave capture disabled normally and
+  review its files before sharing them.

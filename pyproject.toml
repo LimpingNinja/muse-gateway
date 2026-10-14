@@ -40,7 +40,11 @@ classifiers = [
   "Topic :: Internet :: Proxy Servers",
   "Topic :: Software Development",
 ]
-dependencies = []
+dependencies = [
+    # Single runtime dependency: protobuf for the Devin provider's generated
+    # bindings. Everything else is stdlib-only.
+    "protobuf>=7.35.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/LimpingNinja/muse-gateway"
@@ -54,4 +58,5 @@ muse-gateway = "muse_gateway:main"
 muse-shim = "muse_gateway:main"
 
 [tool.setuptools]
-py-modules = ["muse_gateway", "muse_shim", "muse_providers"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
+py-modules = ["muse_gateway", "muse_shim", "muse_providers", "muse_devin", "muse_devin_wire", "devin_pb2", "muse_capture"]

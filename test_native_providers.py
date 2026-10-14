@@ -268,6 +268,24 @@ class CodexAuthTests(NoCredentialEnvTest):
         with self.assertRaises(ProviderError) as rejected:
             prepare_codex_request(history)
         self.assertEqual(rejected.exception.code, "codex_system_content_unsupported")
+        replay = {"input": [
+            {"type": "reasoning", "id": "rs_outer:rs_inner", "summary": [], "encrypted_content": "opaque"},
+            {"type": "message", "id": "msg_native", "role": "assistant", "content": []},
+            {"type": "reasoning", "id": "rs_other:rs_inner", "summary": []},
+            {"type": "item_reference", "id": "rs_outer:rs_inner"},
+            {"type": "function_call", "id": "fc_outer:fc_inner", "call_id": "call_1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+        ]}
+        original = json.dumps(replay)
+        fixed = prepare_codex_request(replay)["input"]
+        self.assertEqual(fixed[0]["id"], "rs_inner")
+        self.assertEqual(fixed[0]["encrypted_content"], "opaque")
+        self.assertEqual(fixed[1]["id"], "msg_native")
+        self.assertNotEqual(fixed[2]["id"], fixed[0]["id"])
+        self.assertEqual(fixed[3]["id"], fixed[0]["id"])
+        self.assertEqual(fixed[4]["id"], "fc_inner")
+        self.assertEqual(fixed[4]["call_id"], fixed[5]["call_id"])
+        self.assertEqual(json.dumps(replay), original)
 
     def test_refresh_uses_public_client_and_redacts_token(self):
         refresh = "refresh-secret"

@@ -19,6 +19,7 @@ import threading
 import unittest
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 from muse_gateway import (
     Config,
@@ -45,6 +46,15 @@ def _clean_environment(explicit_models=False):
         if not key.startswith(("MUSE_GATEWAY_", "MUSE_SHIM_"))
         and key != "META_API_KEY"
     }
+    # Staged subprocesses must resolve the same interpreter that runs the
+    # suite: the gateway has a hard protobuf dependency, so whatever `python`
+    # the wrapper finds needs the package deps installed.
+    bin_dir = os.path.dirname(sys.executable)
+    environment["PATH"] = (
+        bin_dir + os.pathsep + environment.get("PATH", "")
+        if bin_dir
+        else environment.get("PATH", "")
+    )
     environment.update({
         "MUSE_GATEWAY_NO_MODEL_DISCOVERY": "1",
         "MUSE_GATEWAY_CODEX_ACCESS_TOKEN": "launcher-test-token",
@@ -58,7 +68,15 @@ def _stage_checkout(directory):
     root = Path(__file__).resolve().parent
     work = Path(directory)
     launcher = "muse-gateway.ps1" if os.name == "nt" else "muse-gateway"
-    for name in (launcher, "muse_gateway.py", "muse_providers.py"):
+    for name in (
+        launcher,
+        "muse_gateway.py",
+        "muse_providers.py",
+        "muse_capture.py",
+        "muse_devin.py",
+        "muse_devin_wire.py",
+        "devin_pb2.py",
+    ):
         shutil.copyfile(root / name, work / name)
     return work, launcher
 
@@ -142,7 +160,11 @@ class ModelsAndReuseTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 missing = str(Path(directory) / ".env")
                 out, err = io.StringIO(), io.StringIO()
-                with redirect_stdout(out), redirect_stderr(err):
+                # This pins the codex/meta surface; devin availability reads
+                # machine credential state, covered by test_devin.py instead.
+                with redirect_stdout(out), redirect_stderr(err), patch(
+                    "muse_gateway._devin_provider_ready", return_value=False
+                ):
                     code = main(["--models", "--env-file", missing])
         finally:
             os.environ.clear()

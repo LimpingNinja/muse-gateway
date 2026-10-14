@@ -253,6 +253,12 @@ class ProxyTests(unittest.TestCase):
             "muse_gateway._provider_is_available", return_value=True
         )
         availability.start()
+        # Devin rows are out of scope here (covered by test_devin.py) and
+        # would otherwise reflect machine credential state.
+        devin_branch = patch(
+            "muse_gateway._devin_catalog_entries", return_value=[]
+        )
+        devin_branch.start()
         try:
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{shim.server_port}/muse-code/models",
@@ -290,6 +296,7 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(repeated, payload)
         finally:
             availability.stop()
+            devin_branch.stop()
             shim.shutdown()
             shim.server_close()
 
@@ -738,6 +745,12 @@ class GatewayProxyTests(unittest.TestCase):
             "muse_gateway._provider_is_available", return_value=True
         )
         availability.start()
+        # Devin rows are out of scope here (covered by test_devin.py) and
+        # would otherwise reflect machine credential state.
+        devin_branch = patch(
+            "muse_gateway._devin_catalog_entries", return_value=[]
+        )
+        devin_branch.start()
         try:
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{shim.server_port}/muse-code/models",
@@ -758,6 +771,7 @@ class GatewayProxyTests(unittest.TestCase):
             self.assertEqual(meta["limit"]["context"], 1048576)
         finally:
             availability.stop()
+            devin_branch.stop()
             shim.shutdown()
             shim.server_close()
 
