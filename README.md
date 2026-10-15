@@ -201,77 +201,85 @@ not implemented; incoming signatures are not forwarded as provider-owned state.
 
 ### Kiro Gateway
 
-Run [Kiro Gateway](https://github.com/jwadow/kiro-gateway) as a separate service, authenticate it with your Kiro account,
-and set its proxy API key. muse-gateway connects to that service's Anthropic
-Messages API; it does not read your Kiro login or manage its refresh tokens.
-The proxy key is separate from your Muse subscription and Claude credentials.
+Follow the [Kiro Gateway README](https://github.com/jwadow/kiro-gateway) for
+installation, Kiro sign-in, and service configuration. It runs separately;
+muse-gateway connects to its Messages API, not your Kiro login files. From
+its Python checkout, the basic start command after setup is:
 
-Add these settings to a private env file:
+```bash
+python main.py
+```
+
+#### Connect it to Muse
+
+Add these settings to muse-gateway's private env file. Use the same value as
+Kiro Gateway's `PROXY_API_KEY`, not a Kiro refresh token, Muse key, or Claude
+credential:
 
 ```dotenv
 MUSE_GATEWAY_KIRO_UPSTREAM=http://127.0.0.1:8000/v1
 MUSE_GATEWAY_KIRO_API_KEY=replace-with-your-kiro-gateway-proxy-key
-# Optional: start with a model your account can use.
-MUSE_GATEWAY_KIRO_MODELS=claude-sonnet-4.5
 ```
 
-Start Muse on a free gateway port from the project you want to work in:
+Then launch from the project you want Muse to work in:
 
 ```bash
 python -m muse_gateway launch --env-file /path/to/private.env --port 8791
 ```
 
-Choose `kiro/claude-sonnet-4.5` in `/model`. Model names are passed to Kiro
-Gateway without the prefix; `kiro:` is also accepted. In auto mode, an
-unprefixed Claude name still selects the native Claude route. Kiro Gateway
-must already be running: this launcher does not install, start, or stop that
-separate service.
+Keep Kiro Gateway running; our launcher does not start or stop it. The
+muse-gateway port must be free: Kiro-configured launches do not attach to an
+existing gateway, whose proxy settings might differ. For local use, bind the
+separate Kiro Gateway service to loopback too (`SERVER_HOST=127.0.0.1` in its
+configuration). Remote Kiro endpoints require verified HTTPS.
 
-Discovery uses its authenticated `/v1/models` endpoint. The
-`MUSE_GATEWAY_KIRO_MODELS` list curates the menu; without discovery, only
-explicitly configured IDs appear.
-The launch option `--kiro-models` overrides that list and restricts the menu
-to the IDs you provide. Upgrading your Kiro account does not expand an
-explicit list. If the separate service advertises an older roster, supply
-the current IDs explicitly; the gateway passes those IDs through without
-requiring them to appear in discovery.
-An advertised model is not proof of account access or a tested capability.
-No key means no automatic Kiro entries or discovery calls.
+#### Models
 
-This route supports text and structured function tools, including tool-result
-continuation. Muse runs the tools. Conversations must carry their full history
-inline; a redundant `previous_response_id` can be dropped, but ID-only chaining
-and unresolved state references are not supported. Visible reasoning summaries
-can be retained; foreign encrypted reasoning and signed-thinking state cannot.
+Choose a `kiro/<model-id>` entry in `/model`. The prefix is removed before
+forwarding; `kiro:` also works. In auto mode, an unprefixed Claude name still
+uses the native Claude route.
 
-Replaying earlier tool calls requires a nonempty current tool list on this
-route. Stock Kiro Gateway turns that history into plain text when no tools
-are offered, including with `tool_choice: "none"`. The gateway rejects that
-combination before inference instead of silently changing the history or
-re-enabling tools. Conversations without tool-call history can still use
-`tool_choice: "none"`.
+Models come from the service's authenticated `/v1/models` endpoint. Optional
+`MUSE_GATEWAY_KIRO_MODELS` curates that list; `--kiro-models` takes precedence.
+An explicit list stays restricted after an account upgrade. You can supply
+current IDs if the service's catalog is stale, or when discovery is disabled.
+Listed IDs are not proof of account access or tested capabilities. Without a
+proxy key, there are no automatic Kiro entries or discovery calls.
 
-The initial route advertises text-only input and no reasoning variants. It
-sends `thinking: {"type": "disabled"}`. In Kiro Gateway's own configuration,
-we recommend `FAKE_REASONING=false`, `WEB_SEARCH_ENABLED=false`,
-`TRUNCATION_RECOVERY=false`, and `AUTO_TRIM_PAYLOAD=false`. These are settings
-for the separate service, not muse-gateway flags. Disabling per-request thinking
-alone may not remove Kiro Gateway's global thinking-system additions.
+#### Behavior and caveats
 
-`MUSE_GATEWAY_KIRO_CONTEXT_LIMIT` (65,536 by default) and
-`MUSE_GATEWAY_KIRO_OUTPUT_LIMIT` (8,192) are positive, configurable planning
-hints for Muse. They are **unverified**, not measured capacities or
-backend-enforced output caps. Kiro Gateway's translated payload can also hit
-its own byte-size limit. This integration does not trim conversation history
-or add inference retries. Sampling controls, required/named tool choices, and
-`parallel_tool_calls: false` are rejected before inference because Kiro Gateway
-does not enforce them. Omit the parallel-call option or use `true` only if
-your client permits multiple calls in one turn.
+- **Text and tools:** text streams, and Muse executes returned function calls.
+  Full conversation and tool-result history must travel inline. Redundant
+  `previous_response_id` values can be dropped; ID-only chaining and unresolved
+  references are rejected. Media, foreign encrypted reasoning, and signed-thinking
+  replay are unsupported; visible reasoning summaries can be retained.
+- **Tools disabled after earlier calls:** stock Kiro Gateway converts that
+  structured history to plain text when no current tools are offered, including
+  with `tool_choice: "none"`. We reject this combination before inference,
+  without changing history or re-enabling tools. `none` still works in
+  conversations without tool-call history.
+- **Unsupported controls:** sampling/stop controls, required or named tool
+  choices, and `parallel_tool_calls: false` are rejected before inference. Use
+  another route if single-call turns are required; allowing multiple calls is
+  not a substitute for that policy.
+- **Reasoning and recovery:** the route advertises no reasoning variants and
+  sends `thinking: {"type": "disabled"}`. In
+  [Kiro Gateway's own configuration](https://github.com/jwadow/kiro-gateway/blob/main/.env.example),
+  we recommend `FAKE_REASONING=false`, `WEB_SEARCH_ENABLED=false`,
+  `TRUNCATION_RECOVERY=false`, and `AUTO_TRIM_PAYLOAD=false` to avoid injected
+  thinking/search tools, recovery turns, and history trimming. These are not
+  muse-gateway settings; per-request thinking does not override every global
+  service setting. Our adapter adds no history trimming or inference retries.
+- **Budgets:** `MUSE_GATEWAY_KIRO_CONTEXT_LIMIT` (65,536) and
+  `MUSE_GATEWAY_KIRO_OUTPUT_LIMIT` (8,192) are configurable, **unverified**
+  planning hints, not measured capacity or backend-enforced caps. The separate
+  service also has a payload byte-size limit.
 
-Offline contracts and the installed-Muse harness check the translated protocol
-using local peers. They do not certify a live Kiro Messages session, account
-entitlement, TUI model selection, or resume; check those with your intended
-service, model, and Muse version before relying on them.
+For errors, retry hints, and cancellation limits, see [Logs and doctor](#logs-and-doctor).
+Muse may label a Kiro 401 as a Meta-key error; check the gateway's route and
+upstream evidence before changing credentials. Offline checks cover the
+translated protocol, not live entitlement, TUI model selection, or resume;
+check those with your intended account, service, model, and Muse version.
 
 ### Local LLMs and other Responses endpoints
 
