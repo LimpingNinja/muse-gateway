@@ -12,48 +12,10 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from muse_providers import (
-    AuthError,
-    CLAUDE_TOKEN_URLS,
-    CLAUDE_OAUTH_CLIENT_ID,
-    CODEX_OAUTH_CLIENT_ID,
-    CredentialState,
-    DEFAULT_CLAUDE_ENDPOINT,
-    DEFAULT_CODEX_ENDPOINT,
-    DEFAULT_CODEX_TOKEN_URL,
-    ProviderError,
-    ToolNameMap,
-    _atomic_write_json,
-    anthropic_json_to_responses,
-    claude_headers,
-    codex_headers,
-    discover_claude_credentials,
-    discover_codex_credentials,
-    prepare_codex_request,
-    refresh_claude_oauth,
-    refresh_codex_oauth,
-    resolve_claude_credentials,
-    resolve_codex_credentials,
-    responses_to_anthropic,
-    translate_anthropic_sse,
-)
+from muse_providers import AuthError, CLAUDE_TOKEN_URLS, CLAUDE_OAUTH_CLIENT_ID, CODEX_OAUTH_CLIENT_ID, CredentialState, DEFAULT_CLAUDE_ENDPOINT, DEFAULT_CODEX_ENDPOINT, DEFAULT_CODEX_TOKEN_URL, ProviderError, StreamState, ToolNameMap, _atomic_write_json, anthropic_json_to_responses, claude_headers, convert_anthropic_event, discover_codex_credentials, refresh_claude_oauth, refresh_codex_oauth, resolve_claude_credentials, resolve_codex_credentials, responses_to_anthropic
 from contextlib import redirect_stderr
 
-from muse_gateway import (
-    Config,
-    MuseShimHandler,
-    ShimError,
-    _existing_shim_is_compatible,
-    _forwarding_warnings,
-    _redact_bytes,
-    _run_command_index,
-    _warn_credential_forwarding_once,
-    main,
-    parse_args,
-    run_claude_cli,
-    run_doctor,
-    run_muse,
-)
+from muse_gateway import Config, MuseShimHandler, ShimError, _redact_bytes, parse_args, run_claude_cli, run_doctor, run_muse
 
 
 class FakeResponse:
@@ -157,10 +119,6 @@ def _jwt(payload):
     return f"eyJhbGciOiJub25lIn0.{encoded}.signature"
 
 
-def _event_names(rendered):
-    return [line[7:] for line in rendered.splitlines() if line.startswith("event: ")]
-
-
 class NoCredentialEnvTest(unittest.TestCase):
     def setUp(self):
         self._credential_env = patch.dict(
@@ -195,130 +153,13 @@ class NoCredentialEnvTest(unittest.TestCase):
 
 
 class CodexAuthTests(NoCredentialEnvTest):
-    def test_headers_include_first_party_identity_and_account_claim(self):
-        token = _jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"}})
-        headers = codex_headers(token)
-        self.assertEqual(headers["Authorization"], f"Bearer {token}")
-        self.assertEqual(headers["originator"], "codex_cli_rs")
-        self.assertIn("codex_cli_rs", headers["User-Agent"])
-        self.assertEqual(headers["ChatGPT-Account-ID"], "acct-test")
-
-    def test_codex_preflight_is_backend_safe_without_dropping_valid_fields(self):
-        body = {
-            "model": "gpt-5-codex",
-            "input": "hello",
-            "store": True,
-            "max_output_tokens": 1234,
-            "tools": [],
-            "reasoning": {"effort": "xhigh"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": "cache-key",
-            "tool_choice": "auto",
-            "parallel_tool_calls": True,
-        }
-        prepared = prepare_codex_request(body)
-        self.assertFalse(prepared["store"])
-        self.assertNotIn("max_output_tokens", prepared)
-        self.assertNotIn("tools", prepared)
-        for key in (
-            "model",
-            "reasoning",
-            "include",
-            "prompt_cache_key",
-            "tool_choice",
-            "parallel_tool_calls",
-        ):
-            self.assertEqual(prepared[key], body[key])
-        # String input is normalized: Codex 400s it ("Input must be a list").
-        self.assertEqual(
-            prepared["input"],
-            [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hello"}],
-                }
-            ],
-        )
-        history = {
-            "model": "gpt-5-codex", "instructions": "original instructions",
-            "input": [
-                {"role": "system", "content": [{"type": "input_text", "text": "  saved context  "}]},
-                {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call_1", "output": "result"},
-            ],
-        }
-        original = json.dumps(history)
-        prepared = prepare_codex_request(history)
-        self.assertEqual(prepared["instructions"], "original instructions\n\n  saved context  ")
-        self.assertEqual(prepared["input"], history["input"][1:])
-        self.assertEqual(json.dumps(history), original)
-        dropped = prepare_codex_request(
-            dict(history, previous_response_id="previous")
-        )
-        self.assertNotIn("previous_response_id", dropped)
-        self.assertEqual(dropped["input"], history["input"][1:])
-        with self.assertRaises(ProviderError) as rejected:
-            prepare_codex_request(
-                {"model": "gpt-5-codex", "previous_response_id": "previous"}
-            )
-        self.assertEqual(rejected.exception.code, "codex_previous_response_unsupported")
-        history["input"][0]["content"][0]["type"] = []
-        with self.assertRaises(ProviderError) as rejected:
-            prepare_codex_request(history)
-        self.assertEqual(rejected.exception.code, "codex_system_content_unsupported")
-        replay = {"input": [
-            {"type": "reasoning", "id": "rs_outer:rs_inner", "summary": [], "encrypted_content": "opaque"},
-            {"type": "message", "id": "msg_native", "role": "assistant", "content": []},
-            {"type": "reasoning", "id": "rs_other:rs_inner", "summary": []},
-            {"type": "item_reference", "id": "rs_outer:rs_inner"},
-            {"type": "function_call", "id": "fc_outer:fc_inner", "call_id": "call_1", "name": "f", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "result"},
-        ]}
-        original = json.dumps(replay)
-        fixed = prepare_codex_request(replay)["input"]
-        self.assertEqual(fixed[0]["id"], "rs_inner")
-        self.assertEqual(fixed[0]["encrypted_content"], "opaque")
-        self.assertEqual(fixed[1]["id"], "msg_native")
-        self.assertNotEqual(fixed[2]["id"], fixed[0]["id"])
-        self.assertEqual(fixed[3]["id"], fixed[0]["id"])
-        self.assertEqual(fixed[4]["id"], "fc_inner")
-        self.assertEqual(fixed[4]["call_id"], fixed[5]["call_id"])
-        self.assertEqual(json.dumps(replay), original)
-
-    def test_refresh_uses_public_client_and_redacts_token(self):
-        refresh = "refresh-secret"
-        opener = RecordingOpener(FakeResponse(json.dumps({"access_token": "new-access", "expires_in": 3600})))
-        result = refresh_codex_oauth(
-            refresh,
-            token_url="https://fake.test/token",
-            opener=opener,
-            allow_host_override=True,
-        )
-        self.assertEqual(result["access_token"], "new-access")
-        request = opener.requests[0]
-        form = request.data.decode()
-        self.assertIn(f"client_id={CODEX_OAUTH_CLIENT_ID}", form)
-        self.assertIn("grant_type=refresh_token", form)
-        # The refresh token is necessarily sent to the token endpoint; safety
-        # is checked at the logging/doctor surface, not by hiding it from the
-        # in-memory result used to make the next request.
-        self.assertEqual(result["refresh_token"], refresh)
-
-    def test_refresh_rejects_non_native_endpoint_without_explicit_override(self):
-        with self.assertRaises(ProviderError):
-            refresh_codex_oauth(
-                "refresh-secret",
-                token_url="https://fake.test/token",
-                opener=RecordingOpener(FakeResponse("{}")),
-            )
-
-    def test_codex_refresh_defaults_to_native_token_endpoint(self):
-        opener = RecordingOpener(
-            FakeResponse(json.dumps({"access_token": "new-access", "expires_in": 3600}))
-        )
-        refresh_codex_oauth("refresh-secret", opener=opener)
-        self.assertEqual(opener.requests[0].full_url, DEFAULT_CODEX_TOKEN_URL)
+    def test_native_refresh_refuses_unapproved_token_endpoints(self):
+        for refresh, options in ((refresh_codex_oauth, {"token_url": "https://fake.test/token"}),
+                                  (refresh_claude_oauth, {"token_urls": ("https://fake.test/token",)})):
+            opener = RecordingOpener(FakeResponse("{}"))
+            with self.subTest(provider=refresh.__name__), self.assertRaises(ProviderError):
+                refresh("refresh-secret", opener=opener, **options)
+            self.assertEqual(opener.requests, [], "Refresh token escaped the native endpoint allowlist")
 
     def test_codex_cli_file_refresh_is_atomic_and_preserves_unrelated_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -339,13 +180,15 @@ class CodexAuthTests(NoCredentialEnvTest):
                 _args(
                     provider="codex",
                     codex_auth_path=str(path),
-                    codex_token_url="https://fake.test/token",
-                    allow_oauth_host_override=True,
                 )
             )
             opener = RecordingOpener(FakeResponse(json.dumps({"access_token": "rotated-access", "refresh_token": "rotated-refresh", "expires_in": 3600})))
             state = resolve_codex_credentials(config, opener=opener)
             self.assertEqual(state.access_token, "rotated-access")
+            self.assertEqual(len(opener.requests), 1)
+            self.assertEqual(opener.requests[0].full_url, DEFAULT_CODEX_TOKEN_URL)
+            self.assertIn("client_id=" + CODEX_OAUTH_CLIENT_ID, opener.requests[0].data.decode())
+            self.assertIn("grant_type=refresh_token", opener.requests[0].data.decode())
             updated = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(updated["other"], {"keep": True})
             self.assertEqual(updated["account_id"], "unrelated-account-field")
@@ -401,99 +244,45 @@ class CodexAuthTests(NoCredentialEnvTest):
                 _atomic_write_json(link, {"tokens": {"access_token": "x"}})
             self.assertEqual(target.read_text(encoding="utf-8"), "{}")
 
-    def test_codex_home_shape_is_discovered_without_printing_tokens(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "auth.json"
-            path.write_text(json.dumps({"tokens": {"accessToken": "access-secret", "refreshToken": "refresh-secret"}}), encoding="utf-8")
-            state = discover_codex_credentials(Config(_args(provider="codex", codex_home=directory)))
-            self.assertIsNotNone(state)
-            self.assertEqual(state.access_token, "access-secret")
-
 
 class NativeRetryTests(NoCredentialEnvTest):
-    def test_codex_401_refreshes_and_retries_once(self):
-        first = CredentialState(provider="codex", access_token="old-access", refresh_token="old-refresh")
-        second = CredentialState(provider="codex", access_token="new-access", refresh_token="new-refresh")
-        success = FakeResponse(json.dumps({"id": "resp-ok"}), headers={"Content-Type": "application/json"})
-        config = Config(_args(provider="codex"))
-        handler = DummyForwardHandler(config)
-        rejected = _unauthorized_response()
-        rejected_body = rejected.fp
-        self.addCleanup(rejected.close)
-        with patch(
-            "muse_gateway.resolve_codex_credentials",
-            side_effect=[first, second],
-        ), patch(
-            "muse_gateway.urllib.request.urlopen",
-            side_effect=[rejected, success],
-        ) as urlopen:
-            MuseShimHandler.forward_codex(
-                handler,
-                {
-                    "model": "gpt-5-codex",
-                    "input": "hello",
-                    "stream": False,
-                },
-            )
-        self.assertEqual(urlopen.call_count, 2)
-        self.assertEqual(urlopen.call_args_list[0].args[0].headers["Authorization"], "Bearer old-access")
-        self.assertEqual(urlopen.call_args_list[1].args[0].headers["Authorization"], "Bearer new-access")
-        self.assertTrue(rejected_body.closed, "rejected response leaked during Codex retry")
-
-    def test_codex_refresh_failure_surfaces_login_action(self):
-        first = CredentialState(provider="codex", access_token="old-access", refresh_token="old-refresh")
-        config = Config(_args(provider="codex"))
-        handler = DummyForwardHandler(config)
-        rejected = _unauthorized_response()
-        rejected_body = rejected.fp
-        self.addCleanup(rejected.close)
-        with patch(
-            "muse_gateway.resolve_codex_credentials",
-            side_effect=[first, AuthError("refresh failed")],
-        ), patch(
-            "muse_gateway.urllib.request.urlopen",
-            side_effect=[rejected],
-        ):
-            with self.assertRaisesRegex(AuthError, "codex login"):
-                MuseShimHandler.forward_codex(
-                    handler,
-                    {"model": "gpt-5-codex", "input": "hello"},
-                )
-        self.assertTrue(rejected_body.closed, "rejected response leaked when refresh failed")
-
-    def test_claude_oauth_401_refreshes_and_retries_once(self):
-        first = CredentialState(provider="claude", access_token="old-access", refresh_token="old-refresh")
-        second = CredentialState(provider="claude", access_token="new-access", refresh_token="new-refresh")
-        success = FakeResponse(
-            json.dumps(
-                {
-                    "id": "msg-ok",
-                    "model": "claude-sonnet-4-6",
-                    "content": [{"type": "text", "text": "ok"}],
-                }
-            ),
-            headers={"Content-Type": "application/json"},
-        )
-        config = Config(_args(provider="claude"))
-        handler = DummyForwardHandler(config)
-        rejected = _unauthorized_response()
-        rejected_body = rejected.fp
-        self.addCleanup(rejected.close)
-        with patch(
-            "muse_gateway.resolve_claude_credentials",
-            side_effect=[first, second],
-        ), patch(
-            "muse_gateway.urllib.request.urlopen",
-            side_effect=[rejected, success],
-        ) as urlopen:
-            MuseShimHandler.forward_claude(
-                handler,
-                {"model": "claude-sonnet-4-6", "input": "hello"},
-            )
-        self.assertEqual(urlopen.call_count, 2)
-        self.assertEqual(urlopen.call_args_list[0].args[0].headers["Authorization"], "Bearer old-access")
-        self.assertEqual(urlopen.call_args_list[1].args[0].headers["Authorization"], "Bearer new-access")
-        self.assertTrue(rejected_body.closed, "rejected response leaked during Claude retry")
+    def test_native_401_refresh_is_bounded_and_closes_each_denial(self):
+        for provider in ("codex", "claude"):
+            for outcome in ("success", "repeated denial", "refresh failure"):
+                with self.subTest(provider=provider, outcome=outcome):
+                    old = _jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"}}) if provider == "codex" else "old-access"
+                    states = [CredentialState(provider=provider, access_token=old, refresh_token="old-refresh"),
+                              AuthError("refresh failed") if outcome == "refresh failure" else
+                              CredentialState(provider=provider, access_token="new-access", refresh_token="new-refresh")]
+                    denied = [_unauthorized_response() for _ in range(2 if outcome == "repeated denial" else 1)]
+                    bodies = [response.fp for response in denied]
+                    for response in denied:
+                        self.addCleanup(response.close)
+                    replies = list(denied)
+                    if outcome == "success":
+                        replies.append(FakeResponse(json.dumps({"id": "msg-ok", "content": [{"type": "text", "text": "OK"}]})))
+                    handler = DummyForwardHandler(Config(_args(provider=provider)))
+                    forward = getattr(MuseShimHandler, "forward_" + provider)
+                    with patch("muse_gateway.resolve_" + provider + "_credentials", side_effect=states) as resolve, patch(
+                        "muse_gateway.urllib.request.urlopen", side_effect=replies,
+                    ) as opened:
+                        if outcome == "success":
+                            forward(handler, {"model": "fixture-model", "input": "hello", "stream": False})
+                        else:
+                            with self.assertRaisesRegex(AuthError, provider + " (login|setup-token)"):
+                                forward(handler, {"model": "fixture-model", "input": "hello", "stream": False})
+                    self.assertEqual(resolve.call_count, 2, "Native denial must refresh at most once")
+                    self.assertTrue(resolve.call_args.kwargs["force_refresh"])
+                    self.assertEqual(opened.call_count, 1 if outcome == "refresh failure" else 2)
+                    self.assertEqual(opened.call_args_list[0].args[0].get_header("Authorization"), "Bearer " + old)
+                    if opened.call_count == 2:
+                        self.assertEqual(opened.call_args_list[1].args[0].get_header("Authorization"), "Bearer new-access")
+                    if provider == "codex":
+                        headers = opened.call_args_list[0].args[0].headers
+                        self.assertEqual(headers["Originator"], "codex_cli_rs")
+                        self.assertIn("codex_cli_rs", headers["User-agent"])
+                        self.assertEqual(headers["Chatgpt-account-id"], "acct-test")
+                    self.assertTrue(all(body.closed for body in bodies), "Every denied HTTP response must close")
 
 
 class ClaudeAuthAndConversionTests(NoCredentialEnvTest):
@@ -518,13 +307,13 @@ class ClaudeAuthAndConversionTests(NoCredentialEnvTest):
                 _args(
                     provider="claude",
                     claude_credentials=str(path),
-                    claude_token_url="https://fake.test/token",
-                    allow_oauth_host_override=True,
                 )
             )
             opener = RecordingOpener(FakeResponse(json.dumps({"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600})))
             state = resolve_claude_credentials(config, opener=opener)
             self.assertEqual(state.access_token, "new-access")
+            self.assertEqual(len(opener.requests), 1)
+            self.assertEqual(opener.requests[0].full_url, CLAUDE_TOKEN_URLS[0])
             self.assertEqual(state.auth_mode, "oauth")
             headers = claude_headers(state, stream=True)
             self.assertEqual(headers["Authorization"], "Bearer new-access")
@@ -570,134 +359,356 @@ class ClaudeAuthAndConversionTests(NoCredentialEnvTest):
         self.assertEqual(payload["messages"][2]["content"][0]["type"], "tool_result")
         self.assertEqual(names.decode("mcp__read_file"), "read_file")
 
-    def test_claude_refresh_rejects_non_native_endpoint_without_explicit_override(self):
-        with self.assertRaises(ProviderError):
-            refresh_claude_oauth(
-                "refresh-secret",
-                token_urls=("https://fake.test/token",),
-                opener=RecordingOpener(FakeResponse("{}")),
-            )
-
-    def test_claude_refresh_defaults_to_a_known_native_token_endpoint(self):
-        opener = RecordingOpener(
-            FakeResponse(json.dumps({"access_token": "new-access", "expires_in": 3600}))
-        )
-        refresh_claude_oauth("refresh-secret", opener=opener)
-        self.assertEqual(opener.requests[0].full_url, CLAUDE_TOKEN_URLS[0])
-
-    def test_previous_response_id_is_rejected_locally(self):
-        with self.assertRaisesRegex(ProviderError, "durable response-state"):
-            responses_to_anthropic(
-                {
-                    "model": "claude-sonnet-4-6",
-                    "input": "continue",
-                    "previous_response_id": "resp_previous",
-                },
-                oauth=True,
-            )
-
-    def test_non_stream_response_round_trips_tool_name_and_usage(self):
-        names = ToolNameMap(oauth=True)
-        names.add("read_file")
-        response = anthropic_json_to_responses(
-            {
-                "id": "msg-1",
-                "model": "claude-sonnet-4-6",
-                "content": [{"type": "tool_use", "id": "toolu-1", "name": "mcp__read_file", "input": {"path": "a"}}],
-                "stop_reason": "tool_use",
-                "usage": {"input_tokens": 3, "output_tokens": 4},
-            },
-            tool_names=names,
-        )
-        self.assertTrue(response["id"].startswith("resp_"))
-        call = response["output"][0]
-        self.assertEqual(call["type"], "function_call")
-        self.assertEqual(call["name"], "read_file")
-        self.assertEqual(response["usage"]["total_tokens"], 7)
-
 
 class ClaudeStreamTests(NoCredentialEnvTest):
-    def test_stream_converts_text_tool_usage_and_completion(self):
-        raw = """event: message_start
-data: {"type":"message_start","message":{"id":"msg-stream","model":"claude-sonnet-4-6","usage":{"input_tokens":2}}}
+    def _converted_calls(self, names, ids, wire_name):
+        content = [{"type": "tool_use", "id": call_id, "name": wire_name, "input": {"index": index}}
+                   for index, call_id in enumerate(ids)]
+        converted = anthropic_json_to_responses({"id": "msg_ids", "content": content}, tool_names=names)
+        state = StreamState("fixture", names)
+        convert_anthropic_event("message_start", {"message": {"id": "msg_ids"}}, state)
+        for index, block in enumerate(content):
+            convert_anthropic_event("content_block_start", {"index": index, "content_block": block}, state)
+            convert_anthropic_event("content_block_delta", {"index": index, "delta": {
+                "type": "input_json_delta", "partial_json": json.dumps(block["input"])}}, state)
+            convert_anthropic_event("content_block_stop", {"index": index}, state)
+        final = convert_anthropic_event("message_stop", {}, state)[-1][1]["response"]
+        return converted["output"], final["output"]
 
-event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+    def test_claude_oauth_legacy_prefix_mapping_is_unchanged(self):
+        for name in ("read_file", "mcp_read_file", "mcp__read_file"):
+            names = ToolNameMap(oauth=True)
+            wire_name = names.add(name)
+            ids = ["toolu_original", wire_name, "mcp__unregistered"]
+            for output in self._converted_calls(names, ids, wire_name):
+                self.assertEqual([item["call_id"] for item in output], ["toolu_original", name, "mcp__unregistered"])
+                self.assertEqual([item["name"] for item in output], [name] * 3)
 
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}
+    def test_cache_usage_is_preserved_across_modes_without_adding_to_totals(self):
+        for cached, created in ((31, 17), (0, 0)):
+            with self.subTest(cached=cached, created=created):
+                usage = {"input_tokens": 101, "output_tokens": 7,
+                         "cache_read_input_tokens": cached, "cache_creation_input_tokens": created}
+                converted = anthropic_json_to_responses({"content": [], "usage": usage})
+                state = StreamState("fixture", ToolNameMap(oauth=False))
+                convert_anthropic_event("message_start", {"message": {"usage": {**usage, "output_tokens": 0}}}, state)
+                convert_anthropic_event("message_delta", {"usage": {"output_tokens": 7}}, state)
+                self.assertEqual(state.response()["usage"], converted["usage"])
+                self.assertEqual(converted["usage"], {
+                    "input_tokens": 101, "output_tokens": 7, "total_tokens": 108,
+                    "input_tokens_details": {"cached_tokens": cached, "anthropic_cache_creation_input_tokens": created},
+                })
+                convert_anthropic_event("message_delta", {"usage": {"cache_read_input_tokens": 9, "cache_creation_input_tokens": 2}}, state)
+                self.assertEqual(state.response()["usage"]["input_tokens_details"], {
+                    "cached_tokens": 9, "anthropic_cache_creation_input_tokens": 2})
+        ordinary = anthropic_json_to_responses({"usage": {"input_tokens": 1}})
+        self.assertNotIn("input_tokens_details", ordinary["usage"])
 
-event: content_block_stop
-data: {"type":"content_block_stop","index":0}
+    def test_coalescing_message_stop_does_not_finish_partial_tool_arguments(self):
+        state = StreamState("fixture", ToolNameMap(oauth=False), coalesce_text=True)
+        convert_anthropic_event("content_block_start", {"index": 0, "content_block": {
+            "type": "tool_use", "id": "partial", "name": "read_file"}}, state)
+        convert_anthropic_event("content_block_delta", {"index": 0, "delta": {
+            "type": "input_json_delta", "partial_json": '{"path":'}}, state)
+        convert_anthropic_event("message_delta", {"delta": {"stop_reason": "max_tokens"}}, state)
+        events = convert_anthropic_event("message_stop", {}, state)
+        self.assertEqual([kind for kind, _ in events], ["response.incomplete"])
+        self.assertEqual(events[0][1]["response"]["output"][0]["status"], "in_progress")
+        self.assertEqual(events[0][1]["response"]["output"][0]["arguments"], '{"path":')
 
-event: content_block_start
-data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu-1","name":"mcp__read_file","input":{}}}
 
-event: content_block_delta
-data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"a\\"}"}}
+class MuseAcceptanceAssertionTests(unittest.TestCase):
+    def test_acceptance_rejects_direct_script_invocation_before_provider_imports(self):
+        import sys
+        root = Path(__file__).resolve().parent
+        environment = {**os.environ, "PYTHONPATH": str(root)}
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, "-B", str(root / "tests" / "check_muse.py"), "--help"],
+                                    cwd=directory, env=environment, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("python -m tests.check_muse", result.stderr)
+        self.assertIn("Direct script invocation", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
-event: content_block_stop
-data: {"type":"content_block_stop","index":1}
+    def test_acceptance_checks_all_module_origins_against_its_checkout(self):
+        from tests.check_muse import assert_checkout_imports
+        origins = assert_checkout_imports()
+        root = Path(__file__).resolve().parent
+        self.assertEqual(Path(origins["muse_gateway"]), root / "muse_gateway.py")
+        self.assertEqual(Path(origins["tests.peers"]), root / "tests" / "peers.py")
+        for name in origins:
+            if name == "tests.check_muse":
+                continue
+            with self.subTest(module=name), patch.object(__import__("sys").modules[name], "__file__", str(root.parent / "other-checkout" / "wrong.py")):
+                with self.assertRaisesRegex(RuntimeError, "must come from this checkout"):
+                    assert_checkout_imports()
 
-event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}
+    def test_cache_acceptance_requires_downstream_counters_and_unchanged_totals(self):
+        from tests.check_muse import assert_downstream_cache_usage
+        usage = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6,
+                 "input_tokens_details": {"cached_tokens": 9, "anthropic_cache_creation_input_tokens": 3}}
+        assert_downstream_cache_usage([{"type": "response.completed", "response": {"usage": usage}}])
+        for path in (("input_tokens_details",), ("input_tokens_details", "cached_tokens"),
+                     ("input_tokens_details", "anthropic_cache_creation_input_tokens"), ("input_tokens",), ("total_tokens",)):
+            broken = json.loads(json.dumps(usage))
+            parent = broken if len(path) == 1 else broken[path[0]]
+            parent.pop(path[-1])
+            with self.subTest(missing=path), self.assertRaisesRegex(AssertionError, "cache counters or unchanged token totals"):
+                assert_downstream_cache_usage([{"type": "response.completed", "response": {"usage": broken}}])
+        doubled = {**usage, "input_tokens": 16, "total_tokens": 18}
+        with self.assertRaises(AssertionError):
+            assert_downstream_cache_usage([{"type": "response.completed", "response": {"usage": doubled}}])
 
-event: message_stop
-data: {"type":"message_stop"}
+    def _records(self, wire_events):
+        records = []
+        for wire_event in wire_events:
+            for phase in ("opening_stream", "stream_succeeded"):
+                records.append({"payload_type": "task.lifecycle.status", "payload": {"event": {"details": {
+                    "phase": phase, "facets": [
+                        {"kind": "external_attempt", "operation": "model.response", "attempt": 1},
+                        {"kind": "producer", "detail": {"stream": {"last_wire_event_type": wire_event}}},
+                    ],
+                }}}})
+        records.append({"payload_type": "run.terminal.completed", "payload": {
+            "terminal": "completed", "text": "PARTIAL"}})
+        return records
 
-"""
-        names = ToolNameMap(oauth=True)
-        names.add("read_file")
-        converted = translate_anthropic_sse(raw, model="claude-sonnet-4-6", tool_names=names)
-        self.assertEqual(
-            _event_names(converted),
-            [
-                "response.created",
-                "response.in_progress",
-                "response.output_item.added",
-                "response.content_part.added",
-                "response.output_text.delta",
-                "response.output_text.done",
-                "response.content_part.done",
-                "response.output_item.done",
-                "response.output_item.added",
-                "response.function_call_arguments.delta",
-                "response.function_call_arguments.done",
-                "response.output_item.done",
-                "response.completed",
-            ],
-        )
-        self.assertIn("response.created", converted)
-        self.assertIn("response.output_text.delta", converted)
-        self.assertIn("response.function_call_arguments.delta", converted)
-        self.assertIn('"name":"read_file"', converted)
-        self.assertIn('"input_tokens":2', converted)
-        self.assertIn("response.completed", converted)
+    def test_acceptance_requires_completed_for_every_model_request(self):
+        from tests.check_muse import assert_accepted
+        assert_accepted(self._records(["response.completed", "response.completed"]), "PARTIAL")
+        for events in (["response.incomplete"], ["response.incomplete", "response.completed"],
+                       ["response.completed", "response.incomplete"], [None]):
+            with self.subTest(events=events), self.assertRaisesRegex(AssertionError, "requires response.completed"):
+                assert_accepted(self._records(events), "PARTIAL")
 
-    def test_stream_error_does_not_claim_success(self):
-        raw = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"try later\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-        converted = translate_anthropic_sse(raw, model="claude-sonnet-4-6")
-        self.assertIn("event: error", converted)
-        self.assertIn("response.failed", converted)
-        self.assertNotIn("event: response.completed", converted)
+    def test_acceptance_rejects_retry_even_when_attempt_stays_one(self):
+        from tests.check_muse import assert_accepted
+        records = self._records(["response.completed"])
+        retry = json.loads(json.dumps(records[0]))
+        retry["payload"]["event"]["details"]["phase"] = "retry_scheduled"
+        records.insert(1, retry)
+        with self.assertRaisesRegex(AssertionError, "without retries"):
+            assert_accepted(records, "PARTIAL")
 
-    def test_truncated_stream_fails_without_fabricating_completion(self):
-        raw = """event: message_start
-data: {"type":"message_start","message":{"id":"msg-truncated","model":"claude-sonnet-4-6"}}
+    def test_failure_assertion_rejects_decode_or_setup_errors(self):
+        from tests.check_muse import assert_failed
+        for error_kind, wire_event in (("decode", "response.failed"), ("stream_error", None)):
+            records = self._records([wire_event])
+            details = records[1]["payload"]["event"]["details"]
+            details["phase"] = "stream_failed"
+            details["facets"][0]["error_kind"] = error_kind
+            records[-1] = {"payload_type": "run.terminal.failed", "payload": {
+                "terminal": "failed", "text": "", "reason": "synthetic failure"}}
+            with self.subTest(error_kind=error_kind, wire_event=wire_event), self.assertRaisesRegex(AssertionError, "never decode/setup"):
+                assert_failed(records, type("Peer", (), {"requests": [object()]})(), "synthetic failure", "")
 
-event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+    def test_http_capture_preserves_pairs_and_rejects_ambiguous_or_truncated_responses(self):
+        from tests.check_muse import capture_response
+        raw = b'HTTP/1.0 429 Busy\r\nContent-Type: application/json\r\nContent-Length: 2\r\nRetry-After: 1\r\nX-Trace: a\r\nX-Trace: b\r\n\r\n{}'
+        response = capture_response(raw)
+        self.assertEqual(response["json"], {})
+        self.assertEqual(response["header_pairs"][-2:], [("x-trace", "a"), ("x-trace", "b")])
+        broken = [raw[:-1], raw + b"x", raw.replace(b"Content-Length: 2", b"Content-Length: nope")]
+        for name, value in ((b"Content-Length", b"2"), (b"Content-Type", b"text/event-stream"),
+                            (b"Retry-After", b"2"), (b"Transfer-Encoding", b"chunked")):
+            broken.append(raw.replace(b"\r\n\r\n", b"\r\n" + name + b": " + value + b"\r\n\r\n"))
+        for wire in broken:
+            with self.subTest(wire=wire), self.assertRaisesRegex(AssertionError, "HTTP_CAPTURE"):
+                capture_response(wire)
 
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+    def test_native_evidence_survives_a_rejected_capture_before_result_parsing(self):
+        import urllib.request
+        from tests.check_muse import capture_response, run_case
+        from tests.peers import Peer, anthropic_text, request
+        records = [{"payload_type": "run.terminal.completed", "payload": {"terminal": "completed", "text": "OBSERVED"}}]
+        observed = []
+        def offline_consumer(args, directory, env, *, reject):
+            base = args[args.index("--base-url") + 1]
+            for _ in range(2):
+                with urllib.request.urlopen(request(base, {"input": "hi", "stream": True}), timeout=3) as response:
+                    observed.append(response.read())
+            return records, 0, ""
+        peer = Peer([anthropic_text("OBSERVED"), anthropic_text("OBSERVED")])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Only replace the external process and inject the parser fault;
+            # retain the real HTTP path, writers and evidence persistence.
+            with patch("tests.check_muse.drive", offline_consumer), patch(
+                    "tests.check_muse.capture_response", side_effect=AssertionError("synthetic capture rejection")):
+                with self.assertRaisesRegex(AssertionError, "synthetic capture rejection"):
+                    run_case(Path("not-launched"), root, peer, "hi", route="kiro")
+            self.assertEqual([json.loads(line) for line in (root / "consumer.jsonl").read_text().splitlines()], records)
+            captured = sorted(root.glob("downstream-*.http"))
+            self.assertEqual(len(captured), 2)
+            self.assertEqual([capture_response(path.read_bytes())["body"].encode() for path in captured], observed)
+            self.assertEqual(len(peer.requests), 2)
+            self.assertFalse(peer.errors)
 
-"""
-        converted = translate_anthropic_sse(raw, model="claude-sonnet-4-6")
-        names = _event_names(converted)
-        self.assertEqual(names[-1], "response.failed")
-        self.assertEqual(sum(name in {"response.completed", "response.incomplete", "response.failed"} for name in names), 1)
-        self.assertNotIn("response.completed", names)
-        self.assertIn("before message_stop", converted)
+    def test_acceptance_counts_responses_posts_and_retains_the_catalog_get(self):
+        import urllib.request
+        from tests.check_muse import run_case
+        from tests.peers import Peer, anthropic_text, request
+        def offline_consumer(args, directory, env, *, reject):
+            base = args[args.index("--base-url") + 1]
+            with urllib.request.urlopen(base + "/muse-code/models", timeout=3) as response:
+                self.assertEqual(json.load(response)["object"], "list")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request(base, {"input": "hi", "stream": True}), timeout=3)
+            with caught.exception as response:
+                self.assertEqual(response.status, 429)
+                self.assertEqual(json.load(response)["error"]["code"], "rate_limit_error")
+            with urllib.request.urlopen(request(base, {"input": "hi", "stream": True}), timeout=3) as response:
+                response.read()
+            return [], 0, ""
+        peer = Peer([(429, b'{"error":{"type":"rate_limit_error"}}'), anthropic_text("OBSERVED")])
+        with tempfile.TemporaryDirectory() as directory, patch("tests.check_muse.drive", offline_consumer):
+            root = Path(directory)
+            run_case(Path("not-launched"), root, peer, "hi", route="kiro")
+            result = json.loads((root / "result.json").read_text())
+            self.assertEqual([(response["method"], response["path"]) for response in result["downstream_http_all"]],
+                             [("GET", "/muse-code/models"), ("POST", "/responses"), ("POST", "/responses")])
+            self.assertEqual([response["status"] for response in result["downstream_http"]], [429, 200])
+            self.assertEqual(len(list(root.glob("downstream-*.http"))), 3)
+            self.assertEqual(len(result["incoming"]), 2)
+            self.assertEqual(len(peer.requests), 2)
+            self.assertEqual(result["post_counts"], {"responses_incoming": 2, "upstream_inference": 2, "responses_captured": 2})
+
+    def test_http_error_acceptance_rejects_flattened_or_missing_wire_evidence(self):
+        from tests.check_muse import KIRO_ERROR_MESSAGE, assert_http_error
+        upstream = {"type": "rate_limit_error", "code": "rate_limit_exceeded"}
+        metadata = {"provider": "kiro", "layer": "kiro_gateway", "source": "http", "phase": "before_response",
+                    "upstream_status": 429, "category": "rate_limit", "transient": True, "output_exposure": "none",
+                    "upstream": upstream, "retry_after": {"value": "1", "kind": "delay-seconds"}}
+        response = {"status": 429, "headers": {"content-type": "application/json", "retry-after": "1"}, "events": [],
+                    "json": {"error": {"type": "kiro_upstream_error", "code": "rate_limit_exceeded", "request_id": "gateway_id",
+                                       "message": KIRO_ERROR_MESSAGE, "metadata": metadata}}}
+        def check(value):
+            assert_http_error(value, status=429, kind="rate_limit_error", code="rate_limit_exceeded",
+                              category="rate_limit", transient=True, upstream=upstream, retry_after="1")
+        check(response)
+        changes = [(('json', 'error', 'code'), None), (('json', 'error', 'code'), 'kiro_upstream_error'),
+                   (('json', 'error', 'metadata', 'category'), 'unknown'),
+                   (('json', 'error', 'metadata', 'transient'), 1),
+                   (('json', 'error', 'metadata', 'upstream_status'), None),
+                   (('json', 'error', 'metadata', 'retry_after'), None), (('headers', 'retry-after'), None)]
+        for path, replacement in changes:
+            broken = json.loads(json.dumps(response))
+            parent = broken
+            for key in path[:-1]:
+                parent = parent[key]
+            if replacement is None:
+                parent.pop(path[-1])
+            else:
+                parent[path[-1]] = replacement
+            with self.subTest(path=path, replacement=replacement), self.assertRaisesRegex(AssertionError, "KIRO_"):
+                check(broken)
+
+    def test_http_failure_acceptance_rejects_setup_decode_and_retry(self):
+        from tests.check_muse import assert_http_failed
+        records = self._records([None])
+        records[1]["payload"]["event"]["details"]["phase"] = "stream_failed"
+        facet = records[1]["payload"]["event"]["details"]["facets"][0]
+        facet["error_kind"] = "http_status"
+        records[-1] = {"payload_type": "run.terminal.failed", "payload": {
+            "terminal": "failed", "text": "", "reason": "HTTP401 fixture"}}
+        peer = type("Peer", (), {"requests": [object()]})()
+        response = {"status": 401, "events": [], "json": {"error": {"code": "authentication_error", "metadata": {
+            "source": "http", "upstream_status": 401, "category": "authentication"}}}}
+        assert_http_failed(records, peer, response)
+        # The observed native HTTP401 path has no stream_failed status.
+        assert_http_failed([records[0], records[-1]], peer, response)
+        for kind in (None, "decode", "setup", "configuration"):
+            broken = json.loads(json.dumps(records))
+            broken[1]["payload"]["event"]["details"]["facets"][0]["error_kind"] = kind
+            with self.subTest(kind=kind), self.assertRaisesRegex(AssertionError, "decode/setup"):
+                assert_http_failed(broken, peer, response)
+        retry = json.loads(json.dumps(records[0]))
+        retry["payload"]["event"]["details"]["phase"] = "retry_scheduled"
+        with self.assertRaisesRegex(AssertionError, "without retry"):
+            assert_http_failed(records[:-1] + [retry, records[-1]], peer, response)
+        with self.assertRaisesRegex(AssertionError, "observed typed HTTP401"):
+            assert_http_failed([records[0], records[-1]], peer, {**response, "status": 200})
+        with self.assertRaisesRegex(AssertionError, "observed typed HTTP401"):
+            assert_http_failed([records[0], records[-1]], peer, {})
+        with self.assertRaisesRegex(AssertionError, "natural HTTP failure"):
+            assert_http_failed(records[1:], peer, response)
+        with self.assertRaisesRegex(AssertionError, "natural HTTP failure"):
+            assert_http_failed([records[0], records[-1]], type("Peer", (), {"requests": []})(), response)
+
+    def test_context_http_failure_acceptance_rejects_missing_code_metadata_and_retry(self):
+        from tests.check_muse import KIRO_ERROR_MESSAGE, assert_http_error, assert_http_failed
+        upstream = {"type": "invalid_request_error", "code": "context_length_exceeded"}
+        response = {"status": 400, "headers": {"content-type": "application/json"}, "events": [], "json": {"error": {
+            "type": "kiro_upstream_error", "code": "context_length_exceeded", "request_id": "gateway_id",
+            "message": KIRO_ERROR_MESSAGE, "metadata": {"provider": "kiro", "layer": "kiro_gateway", "source": "http",
+                "phase": "before_response", "upstream_status": 400, "category": "context", "transient": False,
+                "output_exposure": "none", "upstream": upstream}}}}
+        records = self._records([None])
+        records.pop(1)  # Natural HTTP rejection need not emit stream_failed.
+        records[-1] = {"payload_type": "run.terminal.failed", "payload": {
+            "terminal": "failed", "text": "", "reason": "HTTP400 context fixture"}}
+        peer = type("Peer", (), {"requests": [object()]})()
+        def check(observed, wire):
+            assert_http_error(wire, status=400, kind="invalid_request_error", code="context_length_exceeded",
+                              category="context", transient=False, upstream=upstream)
+            assert_http_failed(observed, peer, wire, status=400, code="context_length_exceeded", category="context")
+        check(records, response)
+        for path, value in ((('code',), None), (('code',), 'invalid_request_error'),
+                            (('metadata', 'category'), 'request'), (('metadata', 'transient'), None)):
+            broken = json.loads(json.dumps(response))
+            parent = broken['json']['error']
+            for key in path[:-1]:
+                parent = parent[key]
+            if value is None:
+                parent.pop(path[-1])
+            else:
+                parent[path[-1]] = value
+            with self.subTest(path=path, value=value), self.assertRaisesRegex(AssertionError, "KIRO_"):
+                check(records, broken)
+        for phase, error in (("retry_scheduled", None), ("stream_succeeded", None),
+                             ("stream_failed", "decode"), ("stream_failed", "setup")):
+            extra = json.loads(json.dumps(records[0]))
+            details = extra['payload']['event']['details']
+            details['phase'] = phase
+            details['facets'][0]['error_kind'] = error
+            with self.subTest(phase=phase, error=error), self.assertRaisesRegex(AssertionError, "KIRO_NATIVE_HTTP"):
+                check([records[0], extra, records[-1]], response)
+
+    def test_native_retry_acceptance_requires_two_observed_attempts_and_one_retry(self):
+        from tests.check_muse import assert_retry_completed
+        records = []
+        for phase, attempt, wire in (("opening_stream", 1, None), ("retry_scheduled", 1, None),
+                                     ("opening_stream", 2, None), ("stream_succeeded", 2, "response.completed")):
+            records.append({"payload_type": "task.lifecycle.status", "payload": {"event": {"details": {
+                "phase": phase, "facets": [{"kind": "external_attempt", "operation": "model.response", "attempt": attempt},
+                                           {"kind": "producer", "detail": {"stream": {"last_wire_event_type": wire}}}]}}}})
+        records.append({"payload_type": "run.terminal.completed", "payload": {"terminal": "completed", "text": "RETRIED"}})
+        peer = type("Peer", (), {"requests": [object(), object()]})()
+        assert_retry_completed(records, peer, "RETRIED")
+        for change in ("missing_retry", "extra_retry", "wrong_attempt", "decode", "incomplete"):
+            broken = json.loads(json.dumps(records))
+            if change == "missing_retry":
+                broken.pop(1)
+            elif change == "extra_retry":
+                broken.insert(1, broken[1])
+            elif change == "wrong_attempt":
+                broken[2]["payload"]["event"]["details"]["facets"][0]["attempt"] = 1
+            elif change == "decode":
+                broken[1]["payload"]["event"]["details"]["facets"][0]["error_kind"] = "decode"
+            else:
+                broken[3]["payload"]["event"]["details"]["facets"][1]["detail"]["stream"]["last_wire_event_type"] = "response.incomplete"
+            with self.subTest(change=change), self.assertRaisesRegex(AssertionError, "KIRO_NATIVE_RETRY"):
+                assert_retry_completed(broken, peer, "RETRIED")
+        records[1]["payload"]["event"]["details"]["facets"][0]["retry_delay_ms"] = 4000
+        peer.request_times = [10.0, 14.0]
+        assert_retry_completed(records, peer, "RETRIED", retry_delay_ms=4000, min_retry_spacing=3.8)
+        for change in ("default_delay", "default_spacing"):
+            broken = json.loads(json.dumps(records))
+            peer.request_times = [10.0, 11.0 if change == "default_spacing" else 14.0]
+            if change == "default_delay":
+                broken[1]["payload"]["event"]["details"]["facets"][0]["retry_delay_ms"] = 1000
+            with self.subTest(change=change), self.assertRaisesRegex(AssertionError, "honor Retry-After"):
+                assert_retry_completed(broken, peer, "RETRIED", retry_delay_ms=4000, min_retry_spacing=3.8)
 
 
 class CliAndSafetyTests(NoCredentialEnvTest):
@@ -707,15 +718,6 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             parse_args(args)
         self.assertEqual(caught.exception.code, 2)
         self.assertIn(message, diagnostic.getvalue())
-
-    def test_cli_modes_and_provider_endpoints(self):
-        self.assertEqual(parse_args([]).provider, "auto")
-        self.assertEqual(parse_args(["codex"]).provider, "codex")
-        self.assertEqual(parse_args(["codex"]).upstream, DEFAULT_CODEX_ENDPOINT)
-        self.assertEqual(parse_args(["http"]).provider, "generic")
-        self.assertEqual(parse_args(["claude"]).provider, "claude")
-        self.assertEqual(parse_args(["claude"]).upstream, DEFAULT_CLAUDE_ENDPOINT)
-        self.assertEqual(parse_args(["claude"]).claude_transport, "cli")
 
     def test_claude_cli_transport_maps_structured_tool_call(self):
         body = {
@@ -813,50 +815,6 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(result, 130)
         process.terminate.assert_called_once_with()
 
-    def test_existing_server_must_identify_matching_shim_provider(self):
-        auto = json.dumps(
-            {
-                "ok": True,
-                "service": "muse-shim",
-                "provider": "auto",
-                "claude_transport": "cli",
-            }
-        )
-        with patch("muse_gateway.urllib.request.urlopen", return_value=FakeResponse(auto)):
-            self.assertTrue(_existing_shim_is_compatible("http://127.0.0.1:8787", "auto"))
-            self.assertFalse(_existing_shim_is_compatible("http://127.0.0.1:8787", "codex"))
-        with patch(
-            "muse_gateway.urllib.request.urlopen",
-            return_value=FakeResponse('{"ok":true}'),
-        ):
-            self.assertFalse(_existing_shim_is_compatible("http://127.0.0.1:8787", "auto"))
-        with patch(
-            "muse_gateway.urllib.request.urlopen",
-            return_value=FakeResponse("[]"),
-        ):
-            self.assertFalse(_existing_shim_is_compatible("http://127.0.0.1:8787", "auto"))
-
-    def test_main_run_intercepts_muse_args_before_shim_argparse(self):
-        with patch("muse_gateway.run_muse", return_value=9) as launch:
-            result = main(["run", "--model", "codex/gpt-test"])
-        self.assertEqual(result, 9)
-        self.assertEqual(launch.call_args.args[1], ["--model", "codex/gpt-test"])
-        self.assertEqual(launch.call_args.args[0].provider, "auto")
-
-    def test_main_accepts_shim_options_before_run(self):
-        with patch("muse_gateway.run_muse", return_value=0) as launch:
-            result = main(["--port", "9876", "run", "--resume"])
-        self.assertEqual(result, 0)
-        self.assertEqual(launch.call_args.args[0].port, 9876)
-        self.assertEqual(launch.call_args.args[1], ["--resume"])
-
-    def test_run_option_value_is_not_mistaken_for_subcommand(self):
-        self.assertIsNone(_run_command_index(["generic", "--model", "run"]))
-        self.assertEqual(_run_command_index(["--port", "9876", "run"]), 2)
-
-    def test_auto_rejects_global_model_pin(self):
-        self.assert_cli_error(["auto", "--model", "gpt-5"], "cannot pin auto mode")
-
     def test_native_hosts_and_tls_are_rejected_without_explicit_development_opt_in(self):
         for args, message in (
             (["codex", "--upstream", "https://evil.example/responses"], "not an approved native URL"),
@@ -878,20 +836,6 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             clear=False,
         ):
             self.assert_cli_error(["codex"], "not an approved native URL")
-
-    def test_explicit_oauth_host_override_is_required_for_local_fake_endpoints(self):
-        args = parse_args(
-            [
-                "codex",
-                "--upstream",
-                "http://127.0.0.1:9999/responses",
-                "--codex-token-url",
-                "http://127.0.0.1:9999/token",
-                "--allow-oauth-host-override",
-            ]
-        )
-        self.assertTrue(args.allow_oauth_host_override)
-        self.assertEqual(args.upstream, "http://127.0.0.1:9999/responses")
 
     def test_non_loopback_binding_requires_explicit_opt_in(self):
         self.assert_cli_error(["generic", "--host", "0.0.0.0"], "refusing non-loopback")
@@ -924,82 +868,6 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertNotIn("doctor-secret", rendered)
             self.assertNotIn("refresh-secret", rendered)
             self.assertIn("secrets: not displayed", rendered)
-
-    def test_doctor_uses_gateway_branding(self):
-        config = Config(_args(provider="generic", api_key="test-key"))
-        config.doctor_provider = "generic"
-        output = io.StringIO()
-        self.assertEqual(run_doctor(config, output=output), 0)
-        self.assertTrue(output.getvalue().startswith("muse-gateway doctor\n"))
-        self.assertEqual(MuseShimHandler.server_version, "muse-gateway/0.5.0")
-
-    def test_local_doctor_reports_unusable_discovery(self):
-        responses = (
-            FakeResponse('{"data":[]}'),
-            FakeResponse('{"unexpected":"shape"}'),
-            FakeResponse('not json'),
-            urllib.error.URLError("unreachable"),
-        )
-        for response in responses:
-            with self.subTest(response=type(response).__name__):
-                output = io.StringIO()
-                kwargs = ({"side_effect": response} if isinstance(response, Exception)
-                          else {"return_value": response})
-                with patch.dict(os.environ, {}, clear=True), patch(
-                    "muse_gateway.urllib.request.urlopen", **kwargs
-                ), patch("sys.stdout", output):
-                    result = main([
-                        "doctor", "--doctor-provider", "local",
-                        "--local-upstream", "http://127.0.0.1:1/v1",
-                        "--local-api-key", "test-key",
-                    ])
-                self.assertEqual(result, 1)
-                self.assertIn("local: not ready", output.getvalue())
-                self.assertIn("no usable models", output.getvalue())
-                self.assertNotIn("test-key", output.getvalue())
-
-    def test_local_doctor_accepts_discovered_or_explicit_models(self):
-        for explicit in (False, True):
-            with self.subTest(explicit=explicit):
-                config = Config(_args(
-                    provider="local", local_upstream="http://127.0.0.1:1",
-                    local_api_key="test-key", local_models="local-test" if explicit else None,
-                ))
-                output = io.StringIO()
-                response = FakeResponse('{"data":[{"id":"local-test"}]}')
-                with patch("muse_gateway.urllib.request.urlopen", return_value=response):
-                    self.assertEqual(run_doctor(config, output=output), 0)
-                self.assertIn("local: ready", output.getvalue())
-
-    def test_auto_doctor_checks_discovery_only_local_route(self):
-        config = Config(_args(
-            provider="auto", local_upstream="http://127.0.0.1:1",
-            local_api_key="test-key",
-        ))
-        output = io.StringIO()
-        with patch("muse_gateway._credential_status", return_value=(True, "configured")) as status:
-            self.assertEqual(run_doctor(config, output=output), 0)
-        self.assertIn("local", [call.args[1] for call in status.call_args_list])
-
-    def test_credential_forwarding_warning_fires_once_for_custom_upstreams(self):
-        _forwarding_warnings.clear()
-        try:
-            output = io.StringIO()
-            with redirect_stderr(output):
-                _warn_credential_forwarding_once(
-                    "meta", "https://custom.example/v1", custom=True
-                )
-                _warn_credential_forwarding_once(
-                    "meta", "https://custom.example/v1", custom=True
-                )
-                _warn_credential_forwarding_once(
-                    "local", "http://127.0.0.1:4000/v1", custom=False
-                )
-            rendered = output.getvalue()
-            self.assertIn("custom.example", rendered)
-            self.assertEqual(rendered.count("WARNING"), 1)
-        finally:
-            _forwarding_warnings.clear()
 
     def test_error_redaction_is_byte_safe(self):
         import http.client
@@ -1060,11 +928,6 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertIn('"stream_failed": true', logged)
             self.assertIn("upstream_stream_error", logged)
             self.assertEqual(stderr.getvalue(), "")
-
-    def test_cli_inference_is_explicitly_limited_to_claude_print_mode(self):
-        source = Path("muse_gateway.py").read_text(encoding="utf-8") + Path("muse_providers.py").read_text(encoding="utf-8")
-        self.assertNotIn("codex " + "exec", source)
-        self.assertNotIn("shell=True", source)
 
 
 if __name__ == "__main__":

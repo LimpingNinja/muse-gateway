@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "muse-gateway"
 version = "0.5.0"
-description = "Bring Muse Spark, Codex, Claude, Devin, and local models into Muse Code's /model menu (muse-shim fork)"
+description = "Bring Muse Spark, Codex, Claude, Devin, Kiro Gateway, and local models into Muse Code's /model menu (muse-shim fork)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -21,6 +21,7 @@ keywords = [
   "claude-code-cli",
   "claude-print-mode",
   "anthropic-messages-api",
+  "kiro-gateway",
   "openrouter",
   "local-proxy",
   "ai-coding-agent",
@@ -59,4 +60,4 @@ muse-shim = "muse_gateway:main"
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
-py-modules = ["muse_gateway", "muse_shim", "muse_providers", "muse_devin", "muse_devin_wire", "devin_pb2", "muse_capture"]
+py-modules = ["muse_gateway", "muse_shim", "muse_providers", "muse_devin", "muse_devin_wire", "devin_pb2", "muse_capture", "muse_kiro"]

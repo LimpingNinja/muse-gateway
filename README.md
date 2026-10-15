@@ -29,6 +29,8 @@ affiliated with Meta, OpenAI, Anthropic, Cognition, or AWS.
   `muse login` for the usual subscription-based launch.
 - **Access to the providers you want to use.** You do not need to install every
   provider CLI. See [provider support](#provider-support) for each one's setup.
+  Kiro models use a separately installed Kiro Gateway service; it is not a
+  Python dependency of this project.
 
 The Python entry point is shared across Windows, macOS, and Linux/WSL.
 PowerShell and Bash wrappers are also included. A virtual environment is
@@ -76,6 +78,10 @@ running there, it reuses it and leaves it running afterward. An unrelated or
 incompatible listener is an error; use `--port 9000` rather than stopping a
 process you do not recognise.
 
+With Kiro configured, launch requires a free port rather than reusing an
+existing gateway. This keeps it from attaching to a server that has different
+proxy settings. Pick another port if one is already running.
+
 ### 3. Choose a model
 
 Open `/model` in Muse and choose a provider/model entry. Start with a short
@@ -83,8 +89,10 @@ prompt, then try a file read or another tool call.
 
 Meta is listed for subscription forwarding. Codex and Devin entries need local
 credentials; Claude needs its CLI or HTTP credentials. Local entries appear
-when you configure a local endpoint or model list. These checks make the menu
-useful, but an entry is not a guarantee of account access or a successful turn.
+when you configure a local endpoint or model list. Kiro entries need a Kiro
+Gateway proxy key and discovery or an explicit model list. These checks make
+the menu useful, but an entry is not a guarantee of account access or a
+successful turn.
 
 Warnings about an unconfigured provider do not mean you must install it. In
 particular, the launcher warns when no local API key is set and skips that
@@ -193,6 +201,78 @@ not implemented; incoming signatures are not forwarded as provider-owned state.
 
 ### Kiro Gateway
 
+Run [Kiro Gateway](https://github.com/jwadow/kiro-gateway) as a separate service, authenticate it with your Kiro account,
+and set its proxy API key. muse-gateway connects to that service's Anthropic
+Messages API; it does not read your Kiro login or manage its refresh tokens.
+The proxy key is separate from your Muse subscription and Claude credentials.
+
+Add these settings to a private env file:
+
+```dotenv
+MUSE_GATEWAY_KIRO_UPSTREAM=http://127.0.0.1:8000/v1
+MUSE_GATEWAY_KIRO_API_KEY=replace-with-your-kiro-gateway-proxy-key
+# Optional: start with a model your account can use.
+MUSE_GATEWAY_KIRO_MODELS=claude-sonnet-4.5
+```
+
+Start Muse on a free gateway port from the project you want to work in:
+
+```bash
+python -m muse_gateway launch --env-file /path/to/private.env --port 8791
+```
+
+Choose `kiro/claude-sonnet-4.5` in `/model`. Model names are passed to Kiro
+Gateway without the prefix; `kiro:` is also accepted. In auto mode, an
+unprefixed Claude name still selects the native Claude route. Kiro Gateway
+must already be running: this launcher does not install, start, or stop that
+separate service.
+
+Discovery uses its authenticated `/v1/models` endpoint. The
+`MUSE_GATEWAY_KIRO_MODELS` list curates the menu; without discovery, only
+explicitly configured IDs appear.
+The launch option `--kiro-models` overrides that list and restricts the menu
+to the IDs you provide. Upgrading your Kiro account does not expand an
+explicit list. If the separate service advertises an older roster, supply
+the current IDs explicitly; the gateway passes those IDs through without
+requiring them to appear in discovery.
+An advertised model is not proof of account access or a tested capability.
+No key means no automatic Kiro entries or discovery calls.
+
+This route supports text and structured function tools, including tool-result
+continuation. Muse runs the tools. Conversations must carry their full history
+inline; a redundant `previous_response_id` can be dropped, but ID-only chaining
+and unresolved state references are not supported. Visible reasoning summaries
+can be retained; foreign encrypted reasoning and signed-thinking state cannot.
+
+Replaying earlier tool calls requires a nonempty current tool list on this
+route. Stock Kiro Gateway turns that history into plain text when no tools
+are offered, including with `tool_choice: "none"`. The gateway rejects that
+combination before inference instead of silently changing the history or
+re-enabling tools. Conversations without tool-call history can still use
+`tool_choice: "none"`.
+
+The initial route advertises text-only input and no reasoning variants. It
+sends `thinking: {"type": "disabled"}`. In Kiro Gateway's own configuration,
+we recommend `FAKE_REASONING=false`, `WEB_SEARCH_ENABLED=false`,
+`TRUNCATION_RECOVERY=false`, and `AUTO_TRIM_PAYLOAD=false`. These are settings
+for the separate service, not muse-gateway flags. Disabling per-request thinking
+alone may not remove Kiro Gateway's global thinking-system additions.
+
+`MUSE_GATEWAY_KIRO_CONTEXT_LIMIT` (65,536 by default) and
+`MUSE_GATEWAY_KIRO_OUTPUT_LIMIT` (8,192) are positive, configurable planning
+hints for Muse. They are **unverified**, not measured capacities or
+backend-enforced output caps. Kiro Gateway's translated payload can also hit
+its own byte-size limit. This integration does not trim conversation history
+or add inference retries. Sampling controls, required/named tool choices, and
+`parallel_tool_calls: false` are rejected before inference because Kiro Gateway
+does not enforce them. Omit the parallel-call option or use `true` only if
+your client permits multiple calls in one turn.
+
+Offline contracts and the installed-Muse harness check the translated protocol
+using local peers. They do not certify a live Kiro Messages session, account
+entitlement, TUI model selection, or resume; check those with your intended
+service, model, and Muse version before relying on them.
+
 ### Local LLMs and other Responses endpoints
 
 Use the `local/` route for a local model server, a LiteLLM proxy, or another
@@ -260,10 +340,12 @@ Common settings (the provider sections above explain authentication):
 | `MUSE_GATEWAY_META_MODELS` | Curate Meta model IDs; discovery enriches their limits |
 | `MUSE_GATEWAY_CODEX_MODELS`, `MUSE_GATEWAY_CLAUDE_MODELS` | Set fallback model IDs; discovery can add models |
 | `MUSE_GATEWAY_DEVIN_MODELS` | Restrict Devin discovery to selected IDs |
+| `MUSE_GATEWAY_KIRO_UPSTREAM`, `MUSE_GATEWAY_KIRO_API_KEY`, `MUSE_GATEWAY_KIRO_MODELS` | Separate Kiro Gateway endpoint, proxy key, and optional curated IDs |
+| `MUSE_GATEWAY_KIRO_CONTEXT_LIMIT`, `MUSE_GATEWAY_KIRO_OUTPUT_LIMIT` | Unverified positive Muse planning budgets; not backend-enforced capacities |
 | `MUSE_GATEWAY_LOCAL_UPSTREAM`, `MUSE_GATEWAY_LOCAL_API_KEY`, `MUSE_GATEWAY_LOCAL_MODELS` | Local endpoint, key, and model list |
 | `MUSE_GATEWAY_UPSTREAM`, `MUSE_GATEWAY_API_KEY` | Generic endpoint/key; the generic key is also a fallback for local requests |
 | `MUSE_GATEWAY_NO_MODEL_DISCOVERY=1` | Disable discovery and use configured/bundled models |
-| `MUSE_GATEWAY_MAX_OUTPUT_TOKENS` | Cap requested output tokens |
+| `MUSE_GATEWAY_MAX_OUTPUT_TOKENS` | Cap requested output tokens; backend enforcement depends on the route (not enforced by Kiro Gateway) |
 | `MUSE_GATEWAY_PORTABLE=1` | Remove reasoning/cache fields on non-Meta routes |
 | `MUSE_GATEWAY_TIMEOUT` | Upstream timeout in seconds; default 600 |
 | `MUSE_GATEWAY_LOG_FILE`, `MUSE_GATEWAY_VERBOSE=1` | Log path and extra HTTP access events |
@@ -301,7 +383,9 @@ bash ./muse-gateway resume <session-id>
 You can invoke those scripts by absolute path from another project. The
 PowerShell wrapper also accepts `-EnvFile`, `-MuseBin`, `-LogFile`,
 `-LocalUpstream`, `-LocalApiKey`, and `-LocalModels`. Prefer config/environment
-settings to command-line secrets. With `powershell -File`, omit the `--`
+settings to command-line secrets. Kiro options are `-KiroUpstream`, `-KiroApiKey`,
+`-KiroModels`, `-KiroContextLimit`, and `-KiroOutputLimit`, corresponding to the
+same `--kiro-*` launch flags. With `powershell -File`, omit the `--`
 separator and pass Muse arguments directly.
 
 ### Manual server setup
@@ -323,7 +407,8 @@ muse --provider meta --base-url http://127.0.0.1:8787
 For Meta API-key billing, set `MUSE_GATEWAY_META_API_KEY` on the server and the
 appropriate `META_API_KEY` for Muse instead of using the subscription launcher.
 
-`python -m muse_gateway --help` lists server flags and modes, including `devin`.
+`python -m muse_gateway --help` lists server flags and modes, including `devin`
+and `kiro`.
 Server options go **before** the `launch` token when combining the interfaces,
 for example `python -m muse_gateway --timeout 120 launch`. `launch` always
 serves the combined auto catalog; `--model` pins a model only in a
@@ -352,6 +437,14 @@ Health and catalog checks confirm the listener and model listing, not inference.
 - **Devin authentication fails:** sign in again; the gateway does not refresh
   that login. A token rejected during this gateway process is quarantined in
   memory, so restart after replacing a bad token if needed.
+- **Kiro is missing or fails authentication:** check the separate service and
+  its proxy key. Muse and native Claude credentials are never a fallback for
+  this route. Successful catalog discovery does not establish model access.
+  Muse can label a Kiro 401 as a rejected Meta key because it uses the Meta
+  client interface; check the gateway's route and upstream error evidence
+  before changing credentials.
+- **Kiro launch refuses an occupied port:** use a free `--port`; the launcher
+  will not ignore your Kiro configuration by attaching to another gateway.
 - **Muse reports malformed data or retries:** match the Muse session error to
   the gateway request ID and capture the failing stream if needed. Use the
   terminal event and decoder error to distinguish completion from a partial
@@ -377,6 +470,21 @@ Review even redacted logs before sharing. On PowerShell:
 Get-Content .\muse-gateway.log -Wait
 ```
 
+Kiro errors also preserve bounded, validated error codes and correlation IDs
+in `error.metadata`, separately from the gateway request ID. HTTP rejections
+keep their upstream status and valid `Retry-After` headers; errors after
+streaming begins retain the partial answer and end with `response.failed`.
+Unknown or conflicting evidence stays explicit. These fields do not add
+retries, judge answer quality, or recover details already discarded by Kiro
+Gateway. Muse may not display every field; use the matching gateway record.
+
+Client disconnects are detected when forwarding encounters an error. If the
+upstream stream is idle, its connection can remain open until more data
+arrives or the configured read timeout expires (`--timeout`, 600 seconds by
+default). Do not assume immediate upstream cancellation or stopped billing
+when closing the client. A forced-disconnect check does not establish how
+Muse's Escape-key cancellation behaves.
+
 Doctor reads the environment, not `.env`, and checks configuration/credential
 availability rather than running an inference request:
 
@@ -384,14 +492,19 @@ availability rather than running an inference request:
 python -m muse_gateway doctor --doctor-provider codex
 python -m muse_gateway doctor --doctor-provider claude
 python -m muse_gateway doctor --doctor-provider devin
+python -m muse_gateway doctor --doctor-provider kiro
 python -m muse_gateway doctor --doctor-provider local
 ```
 
-Bare `doctor` checks the default routes and configured local route. It can
+Bare `doctor` checks the default routes and configured local/Kiro routes. It can
 report Meta as not ready without a static key even when subscription forwarding
 will work once Muse sends its bearer. For local models, keyless setups or
 unusable discovery can also make doctor report not ready; that is a preflight
 result, not an attempted model turn.
+
+Kiro preflight distinguishes a configured proxy key from an authenticated
+catalog response. Neither means inference has been validated. It does not
+sign in to Kiro or refresh the external service's credentials.
 
 HTTP endpoints:
 
@@ -415,9 +528,11 @@ python -m muse_gateway --capture-dir "$env:TEMP\muse-gateway-captures" launch --
 capture session as well as the process/source. Each gateway request gets its
 own directory containing request transforms, outgoing bytes, upstream headers
 and error bodies, downstream HTTP/SSE bytes, and a monotonic read/frame/write
-timeline. Devin protobufs are also saved in readable form. Credentials are
-scrubbed before writing; frames that cannot safely be scrubbed are marked
-omitted, and hashes of original bytes are identified as such.
+timeline. Devin protobufs are also saved in readable form. Known credentials
+and identifying truncated prefixes are scrubbed before writing; this can also
+remove matching fragments from conversation data. Saved Devin frames are
+scrubbed, potentially re-encoded copies. Frames that cannot safely be scrubbed
+are marked omitted, and hashes of original bytes are identified as such.
 
 **Captures contain conversation content.** Owner-only permissions are applied,
 including a protected Windows ACL, and the gateway does not upload these files.
@@ -434,8 +549,9 @@ checks after updating Muse; they are specific to the executable being tested.
 and which account/TUI workflows still need verification.
 
 Advertised model limits are discovery data or fallbacks, not measurements.
-Local/Meta and undiscovered Devin limits are marked unverified; legacy native
-fallback labels are not proof of live-verified limits either. Model quality,
+Local/Meta, Kiro planning budgets, and undiscovered Devin limits are marked
+unverified; legacy native fallback labels are not proof of live-verified limits
+either. Model quality,
 tool reliability, and features such as signed reasoning remain provider-specific.
 Switching providers does not make their opaque reasoning state interchangeable.
 
@@ -449,6 +565,11 @@ generic gateway key, then incoming authorization. Meta uses its static route
 key or incoming authorization. Without a dedicated key, your configured server
 may receive Muse's subscription bearer. A custom Meta URL also receives native
 Meta payloads; an OpenAI-compatible label alone does not establish support.
+
+The Kiro route requires its own proxy key and never forwards Muse's bearer or
+native Claude credentials. Plain HTTP is allowed only for loopback Kiro
+endpoints; remote Kiro endpoints require verified HTTPS. Credentialed Kiro
+requests reject redirects rather than sending the key to a different URL.
 
 Native Codex/Claude OAuth destinations are allowlisted, and credentialed
 requests do not follow cross-origin redirects. Do not use
@@ -465,6 +586,9 @@ Community guidelines: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 Licensed under [MIT](LICENSE), retaining muse-shim's original copyright and
 attribution. Devin protocol adaptations also retain the upstream notices in
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+
+Kiro Gateway remains a separate service under its own license. Its source is
+not bundled or copied into this project.
 
 The `muse_shim` module, `muse-shim` console command and wrapper, `MUSE_SHIM_*`
 settings, older health-service identifiers, and `shim_error` wire type remain

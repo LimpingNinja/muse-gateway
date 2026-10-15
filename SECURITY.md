@@ -51,6 +51,14 @@ vulnerabilities. Please do not send provider account-abuse reports here.
   keys, and any external gateway's credentials like passwords. Provider login
   files can be updated during OAuth refresh; Devin logins are not refreshed
   by this integration.
+- Kiro Gateway is a separate service with its own login/refresh lifecycle.
+  muse-gateway reads only the proxy key you configure, not Kiro's login files
+  or database. The `kiro/` route never falls back to Muse, Claude, Codex, or
+  generic credentials. Treat its proxy key like a password and keep it in a
+  private environment/config file rather than command history.
+- Kiro endpoints must use verified HTTPS unless they are loopback HTTP.
+  Kiro catalog and inference requests reject redirects. The native
+  `--allow-oauth-host-override` escape hatch does not relax these rules.
 - Meta, local, and generic routes can forward incoming authorization when no
   route key is configured. Only configure upstream URLs you trust; use a
   dedicated local API key rather than forwarding a Muse subscription token to
@@ -65,13 +73,27 @@ vulnerabilities. Please do not send provider account-abuse reports here.
   headers. Verbose mode adds HTTP access metadata, not full wire capture.
   Request metadata can still be sensitive in shared environments. Keep `.env`,
   logs, and captures outside public repositories and shared folders.
+- Kiro error metadata accepts bounded machine identifiers and validated retry
+  timing, not arbitrary upstream error prose. Known credentials are excluded,
+  but correlation IDs and parameter names can still be sensitive. They are
+  evidence supplied by the configured service, not trusted instructions or
+  proof of which underlying account or model produced an error.
 - `--capture-dir` / `MUSE_GATEWAY_CAPTURE_DIR` is a separate, opt-in debugging
   mode that saves conversation bodies and wire evidence. Captures are private
   local files with authentication credentials scrubbed; prompts, file contents,
   tool output, and model responses can still contain sensitive information.
+  Scrubbing also removes matching fragments of known credentials when they
+  contain at least 16 bytes and half the known form. Shorter fragments and
+  arbitrary encodings are not covered by that rule.
   Owner-only permissions, a per-request budget, and credential scrubbing do
   not make a capture safe to publish. Leave capture disabled normally, choose
   a private directory outside the repository, and review any files you share.
+
+Kiro integration does not enable the external service's trimming, synthetic
+thinking, web search, or truncation recovery. Review that service's own
+configuration and security policy separately. The recommended settings in
+the README preserve tool ownership and visible history at the Muse boundary;
+they do not turn this unauthenticated local listener into a shared service.
 
 See [README.md](README.md#private-failure-captures) for capture details and
 [CONTRIBUTING.md](CONTRIBUTING.md#keeping-tests-useful) for synthetic test-fixture

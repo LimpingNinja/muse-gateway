@@ -31,12 +31,27 @@ Muse accepted a stream or completed a tool turn.
 | --- | --- | --- |
 | `python -m unittest -v` | Local schema/auth/transform/security tests, launcher startup checks, and public HTTP contracts below | Live account access, a working TUI session, or every Muse release |
 | `python -m tests.check_regressions` | Selected historical defects actually make the behavioral tests fail | An exhaustive mutation score or absence of other bugs |
-| `python -m tests.check_muse --muse-bin /path/to/muse-binary` | Installed Muse accepts translated text, executes a file tool and continues, and explicitly rejects a missing-sequence stream | TUI model picker/resume, live provider entitlement, or Claude CLI installation |
+| `python -m tests.check_muse --muse-bin /path/to/muse-binary` | Installed Muse accepts Devin/Claude/Kiro translations, executes file tools with continuation, and explicitly rejects missing-sequence streams | TUI model picker/resume, live provider entitlement, or Claude CLI/Kiro Gateway installation |
 
 The HTTP contracts exercise routing, framing and converters against loopback
 protocol peers. They check stream/final agreement, tool identity and arguments,
 large-history replay, context budgets, error outcomes, bounded recovery, and
 incremental delivery. These are protocol checks, not live provider tests.
+Kiro error checks exercise status and typed-evidence preservation, retry-hint validation,
+unknown/conflicting categories, credential-safe metadata, and truthful partial
+failures. A preserved retry hint is not permission to replay a request, and
+classification alone does not establish the native client's retry policy.
+Kiro also rejects unsupported tool controls and history combinations before
+inference. Usage validation must cover every forwarded counter, including
+cache details, in both JSON and streaming responses; malformed upstream data
+must not produce a successful terminal.
+For retry timing, use a hint distinct from the client's default and compare
+the reported delay with monotonic request spacing. Keep forced disconnects,
+graceful cancellation, controlled retry stops, and natural terminals separate.
+Live task checks need ground truth absent from the initial prompt: verify the
+actual tool result and final answer independently. Exact-output checks must
+not silently strip whitespace or formatting; a completed stream is not proof
+that a task was answered correctly.
 
 The regression challenge runner deliberately introduces selected historical
 defects in temporary source copies outside the checkout. It requires a passing
@@ -49,8 +64,11 @@ workspace directories, dummy credentials and local upstreams, with no paid
 inference. It requires successful run completion, actual file-tool execution
 and replay, and an explicit decode rejection for the negative control.
 Missing executables and inconclusive results fail rather than skip. Its known
-Muse model profile is pinned to Devin/Claude HTTP at the gateway, so it does
-not exercise the TUI's model picker or Claude CLI installation.
+Muse model profile is pinned to Devin/Claude HTTP/Kiro at the gateway, so it
+does not exercise the TUI's model picker, native unknown-model compaction,
+Claude CLI installation, or a real Kiro service. Kiro checks observe the
+Messages endpoint, dedicated proxy key, disabled thinking, actual file-tool
+execution, original call ID, and tool result in the next inline request.
 
 For a release, record the Muse version and consumer result, then check the
 TUI catalog, a new session and a resumed cross-provider session with the intended
@@ -76,8 +94,10 @@ narrow platform skips, such as unavailable symlink privileges, are reported.
 
 Background: [layered testing](https://martinfowler.com/articles/practical-test-pyramid.html)
 and [mutation testing](https://mutmut.readthedocs.io/en/latest/).
-Protocol references: [Connect](https://connectrpc.com/docs/protocol/)
-and [SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html).
+Protocol references: [Connect](https://connectrpc.com/docs/protocol/),
+[SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html),
+[Messages errors](https://platform.claude.com/docs/en/api/errors), and
+[HTTP Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after).
 
 ## Areas of the codebase
 
@@ -85,6 +105,9 @@ and [SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html).
   diagnostics, the unified `launch` command, and the inherited low-level
   `run` launcher.
 - `muse_providers.py`: provider authentication and protocol adapters.
+- `muse_kiro.py`: Kiro-specific history preparation, endpoint/response
+  validation, and Messages stream lifecycle. Shared Anthropic codecs stay
+  in `muse_providers.py`; native Claude authentication is not reused.
 - `muse_devin.py`, `muse_devin_wire.py`: Devin credentials, catalog, history,
   stream conversion, and Connect transport. `devin.proto` and `devin_pb2.py`
   are the wire schema and generated bindings; do not hand-edit the bindings.
@@ -93,6 +116,8 @@ and [SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html).
 - `test_muse_shim.py` and `test_native_providers.py`: provider regression tests.
 - `test_devin.py`: Devin schema golden vectors, credentials, discovery,
   translation, and stream-state tests.
+- `test_kiro.py`: Kiro routing/auth/catalog/history/error contracts against
+  local Messages peers. These are not account or external-service tests.
 - `test_launchers.py`: launcher contract tests (wrapper and direct `launch`
   startup, argument splitting, env-file loading).
 - `tests/`: public HTTP contracts, protocol peers, selected fault challenges,
@@ -110,6 +135,15 @@ Avoid cosmetic renames that break existing setups. Use **muse-gateway** in new u
   on non-Meta routes.
 - Codex inference uses HTTP. Claude deliberately uses official `claude -p`
   by default, with its built-in tools disabled; Muse executes returned tools.
+- Kiro Gateway remains a separate service. Reuse protocol codecs, not native
+  Claude credentials or endpoint policy. Do not read Kiro's login database,
+  add competing refresh/retry loops, or copy the service's AGPL source into
+  this MIT project. Keep Kiro model names prefixed and operational budgets
+  explicitly unverified; accepted parameters are not proof of enforcement.
+- Before claiming live Kiro support, separately record the service/Muse
+  versions, exact model, Messages text, file-tool continuation, TUI selection,
+  resume, retained cross-provider history, and large-history outcomes. Offline
+  green, a catalog roster, and a Chat Completions response do not prove these.
 - Prefer extending an existing behavioral contract test over adding a test for
   each small change. Cover successful and degraded outcomes together. A mocked
   response, log-line assertion, or source-string check is not evidence of a

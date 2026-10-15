@@ -1,26 +1,23 @@
 import argparse
 import io
 import json
+import os
+from pathlib import Path
+import tempfile
+import time
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import contextmanager, redirect_stderr
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from muse_gateway import (
-    Config,
-    MuseShimHandler,
-    MuseShimServer,
-    ProviderError,
-    ShimError,
-    _select_bearer,
-    flatten_namespace_tools,
-    muse_catalog_response,
-    provider_model_catalog,
-    transform_request,
-)
+from tests.contracts import consume
+from tests.peers import responses_text
+
+from muse_gateway import Config, MuseShimServer, ProviderError, muse_catalog_response, provider_model_catalog, parse_args, run_doctor
 
 
 def config(**overrides):
@@ -40,66 +37,6 @@ def config(**overrides):
 
 
 class TransformTests(unittest.TestCase):
-    def test_flattens_muse_namespace(self):
-        tools = [
-            {
-                "type": "namespace",
-                "name": "muse",
-                "description": "Muse tools",
-                "tools": [
-                    {
-                        "type": "function",
-                        "name": "read_file",
-                        "parameters": {"type": "object"},
-                    }
-                ],
-            }
-        ]
-        self.assertEqual(flatten_namespace_tools(tools), [tools[0]["tools"][0]])
-
-    def test_rejects_duplicate_names(self):
-        tools = [
-            {"type": "namespace", "name": "a", "tools": [{"type": "function", "name": "x"}]},
-            {"type": "namespace", "name": "b", "tools": [{"type": "function", "name": "x"}]},
-        ]
-        with self.assertRaises(ShimError):
-            flatten_namespace_tools(tools)
-
-    def test_model_cap_and_portable_mode(self):
-        body = {
-            "model": "muse-spark-1.2",
-            "max_output_tokens": 128000,
-            "reasoning": {"effort": "high"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": "abc",
-        }
-        result = transform_request(
-            body, config(model="anthropic/claude-sonnet-4", portable=True, max_output_tokens=16000)
-        )
-        self.assertEqual(result["model"], "anthropic/claude-sonnet-4")
-        self.assertEqual(result["max_output_tokens"], 16000)
-        self.assertNotIn("reasoning", result)
-        self.assertNotIn("include", result)
-        self.assertNotIn("prompt_cache_key", result)
-
-    def test_auto_routes_catalog_ids_and_unprefixed_native_models(self):
-        auto = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            codex_models="gpt-test",
-            claude_models="claude-test",
-        )
-        self.assertEqual(auto.resolve_model("codex/gpt-test"), ("codex", "gpt-test"))
-        self.assertEqual(auto.resolve_model("claude/claude-test"), ("claude", "claude-test"))
-        self.assertEqual(auto.resolve_model("gpt-5"), ("codex", "gpt-5"))
-        self.assertEqual(auto.resolve_model("claude-sonnet-4"), ("claude", "claude-sonnet-4"))
-
-    def test_auto_rejects_ambiguous_model(self):
-        auto = config(provider="auto", upstream=None, model_discovery=False)
-        with self.assertRaisesRegex(Exception, "cannot infer a provider"):
-            auto.resolve_model("mystery-model")
-
     def test_mocked_codex_discovery_replaces_bundled_fallbacks(self):
         class Response:
             def __enter__(self):
@@ -160,16 +97,16 @@ class TransformTests(unittest.TestCase):
 
 
 class FakeUpstreamHandler(BaseHTTPRequestHandler):
-    # An opaque sentinel for a byte-passthrough test, NOT a valid Responses
-    # fixture or evidence of client acceptance.
-    wire = b": opaque passthrough sentinel\n\ndata: opaque payload\n\n"
+    wire = responses_text("FORWARDED")
     request_body = None
     authorization = None
+    path_seen = None
 
     def log_message(self, *args):
         pass
 
     def do_POST(self):
+        type(self).path_seen = self.path
         type(self).authorization = self.headers.get("Authorization")
         type(self).request_body = json.loads(
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -183,152 +120,66 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
 
 
 class ProxyTests(unittest.TestCase):
-    def test_http_dispatch_selects_provider_branch(self):
-        shim_config = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-        )
-        shim = MuseShimServer(("127.0.0.1", 0), shim_config)
-        shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
-        routed = []
-
-        def record(provider):
-            def forward(handler, body):
-                routed.append((provider, body["model"]))
-                handler.send_json(200, {"ok": True})
-
-            return forward
-
-        with (
-            patch("muse_gateway.MuseShimHandler.forward_codex", new=record("codex")),
-            patch("muse_gateway.MuseShimHandler.forward_claude_cli", new=record("claude")),
-        ):
-            shim_thread.start()
-            try:
-                for model in ("codex/gpt-selected", "claude/claude-selected"):
-                    request = urllib.request.Request(
-                        f"http://127.0.0.1:{shim.server_port}/responses",
-                        data=json.dumps({"model": model, "input": "hello"}).encode(),
-                        headers={"Content-Type": "application/json"},
-                    )
-                    with urllib.request.urlopen(request, timeout=5) as response:
-                        self.assertEqual(response.status, 200)
-            finally:
-                shim.shutdown()
-                shim.server_close()
-        self.assertEqual(
-            routed,
-            [("codex", "gpt-selected"), ("claude", "claude-selected")],
-        )
-
-    def test_muse_catalog_endpoint_shape(self):
-        shim_config = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            codex_models="gpt-one,gpt-two",
-            claude_models="claude-one",
-        )
-        shim = MuseShimServer(("127.0.0.1", 0), shim_config)
-        shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
-        shim_thread.start()
-        # Menu-shape test: simulate installed providers so availability gating
-        # does not hide the asserted rows.
-        availability = patch(
-            "muse_gateway._provider_is_available", return_value=True
-        )
-        availability.start()
-        # Devin rows are out of scope here (covered by test_devin.py) and
-        # would otherwise reflect machine credential state.
-        devin_branch = patch(
-            "muse_gateway._devin_catalog_entries", return_value=[]
-        )
-        devin_branch.start()
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{shim.server_port}/muse-code/models",
-                timeout=5,
-            ) as response:
-                payload = json.loads(response.read())
-            self.assertEqual(payload["object"], "list")
-            self.assertEqual(
-                [item["id"] for item in payload["data"]],
-                [
-                    "codex/gpt-one",
-                    "codex/gpt-two",
-                    "claude/claude-one",
-                    # Gateway fork: auto always advertises Meta defaults too.
-                    "meta/muse-spark-1.3",
-                    "meta/muse-spark-1.2",
-                ],
-            )
-            metadata = payload["data"][0]["metadata"]["muse-code"]
-            self.assertEqual(metadata["name"], "Codex · gpt-one")
-            self.assertEqual(
-                metadata["description"],
-                "(ctx 272k) OpenAI Codex subscription model",
-            )
-            self.assertNotIn("cost", metadata)
-            self.assertFalse(metadata["is_hidden"])
-            self.assertEqual(metadata["limit"]["context"], 272000)
-            self.assertTrue(metadata["tool_call"])
-            self.assertEqual(metadata["modalities"]["input"], ["text", "image"])
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{shim.server_port}/muse-code/models",
-                timeout=5,
-            ) as response:
-                repeated = json.loads(response.read())
-            self.assertEqual(repeated, payload)
-        finally:
-            availability.stop()
-            devin_branch.stop()
-            shim.shutdown()
-            shim.server_close()
-
-    def test_transforms_request_and_preserves_opaque_upstream_bytes(self):
+    def test_public_routes_preserve_history_namespaces_and_key_precedence(self):
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
-        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
-        upstream_thread.start()
-
-        shim_config = config(
-            upstream=f"http://127.0.0.1:{upstream.server_port}/v1",
-            model="openai/gpt-5",
-        )
-        shim = MuseShimServer(("127.0.0.1", 0), shim_config)
-        shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
-        shim_thread.start()
+        worker = threading.Thread(target=upstream.serve_forever, daemon=True)
+        worker.start()
         try:
-            body = {
-                "model": "muse-spark-1.2",
-                "stream": True,
-                "input": "hello",
-                "tools": [
-                    {
-                        "type": "namespace",
-                        "name": "muse",
-                        "tools": [{"type": "function", "name": "read_file"}],
-                    }
-                ],
-            }
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{shim.server_port}/responses",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(request, timeout=5) as response:
-                payload = response.read()
-
-            self.assertEqual(payload, FakeUpstreamHandler.wire)
-            self.assertEqual(FakeUpstreamHandler.authorization, "Bearer test-key")
-            self.assertEqual(FakeUpstreamHandler.request_body["model"], "openai/gpt-5")
-            self.assertEqual(FakeUpstreamHandler.request_body["tools"][0]["name"], "read_file")
-            self.assertEqual(FakeUpstreamHandler.request_body["tools"][0]["type"], "function")
+            endpoint = f"http://127.0.0.1:{upstream.server_port}/v1"
+            for route in ("generic", "meta", "local"):
+                with self.subTest(route=route):
+                    cfg = config(provider=route, upstream=endpoint, meta_upstream=endpoint, local_upstream=endpoint,
+                                 model_discovery=False, meta_api_key="meta-key", local_api_key="local-key",
+                                 model="pinned-model" if route == "generic" else None,
+                                 portable=True, max_output_tokens=16000)
+                    body = {"model": "requested-model", "stream": True, "max_output_tokens": 128000,
+                            "reasoning": {"effort": "high"}, "include": ["reasoning.encrypted_content"],
+                            "prompt_cache_key": "cache-sentinel",
+                            "tools": [{"type": "namespace", "name": "muse", "tools": [{
+                                "type": "function", "name": "read_file", "parameters": {"type": "object"}}]}],
+                            "input": [{"role": "user", "content": "Read it"},
+                                      {"type": "function_call", "call_id": "call_original", "name": "muse.read_file", "arguments": '{"path":"C:/fixture.txt"}'},
+                                      {"type": "function_call_output", "call_id": "call_original", "output": '1|C:/fixture.txt\n{"exit_code":7,"is_error":true}\n' + "x" * 10000}]}
+                    original = json.loads(json.dumps(body))
+                    shim = MuseShimServer(("127.0.0.1", 0), cfg)
+                    thread = threading.Thread(target=shim.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        keys = {"generic": ["test-key"], "meta": ["meta-key", "incoming-key"],
+                                "local": ["local-key", "test-key"]}[route]
+                        for index, expected_key in enumerate(keys):
+                            if index:
+                                setattr(cfg, route + "_api_key", None)
+                            req = urllib.request.Request(f"http://127.0.0.1:{shim.server_port}/responses",
+                                data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "Authorization": "Bearer incoming-key"})
+                            with urllib.request.urlopen(req, timeout=5) as response:
+                                wire = response.read()
+                            self.assertEqual(wire, FakeUpstreamHandler.wire)
+                            self.assertEqual(consume(wire)["output"][0]["content"][0]["text"], "FORWARDED")
+                            self.assertEqual(FakeUpstreamHandler.path_seen, "/v1/responses")
+                            self.assertEqual(FakeUpstreamHandler.authorization, "Bearer " + expected_key)
+                            sent = FakeUpstreamHandler.request_body
+                            self.assertEqual(sent["model"], "pinned-model" if route == "generic" else "requested-model")
+                            self.assertEqual(sent["max_output_tokens"], 16000)
+                            if route == "meta":
+                                self.assertEqual(sent["tools"], original["tools"])
+                                self.assertEqual(sent["input"], original["input"])
+                                for key in ("reasoning", "include", "prompt_cache_key"):
+                                    self.assertEqual(sent[key], original[key])
+                            else:
+                                self.assertEqual(sent["tools"], original["tools"][0]["tools"])
+                                self.assertEqual(sent["input"][1], {**original["input"][1], "name": "read_file"})
+                                self.assertEqual(sent["input"][2], original["input"][2])
+                                self.assertFalse(set(sent) & {"reasoning", "include", "prompt_cache_key"})
+                            self.assertEqual(body, original)
+                    finally:
+                        shim.shutdown()
+                        shim.server_close()
+                        thread.join(timeout=5)
         finally:
-            shim.shutdown()
-            shim.server_close()
             upstream.shutdown()
             upstream.server_close()
+            worker.join(timeout=5)
 
     def test_missing_key_is_a_json_error(self):
         shim_config = config(api_key=None)
@@ -355,37 +206,26 @@ class ProxyTests(unittest.TestCase):
 class GatewayRoutingTests(unittest.TestCase):
     """Gateway fork: meta/ + local/ routes with native Meta passthrough."""
 
-    def test_auto_routes_prefixed_meta_and_local_models(self):
+    def test_kiro_prefixes_do_not_steal_native_bare_model_names(self):
         auto = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            local_models="qwen-local,llama-local",
+            provider="auto", upstream=None, model_discovery=False,
+            kiro_api_key="synthetic-proxy-key", kiro_models="claude-haiku-4.5,auto",
         )
-        self.assertEqual(
-            auto.resolve_model("meta/muse-spark-1.3"), ("meta", "muse-spark-1.3")
-        )
-        self.assertEqual(
-            auto.resolve_model("meta:muse-spark-1.2"), ("meta", "muse-spark-1.2")
-        )
-        self.assertEqual(
-            auto.resolve_model("local/qwen-local"), ("local", "qwen-local")
-        )
-        self.assertEqual(
-            auto.resolve_model("local:llama-local"), ("local", "llama-local")
-        )
-
-    def test_auto_infers_bare_muse_and_configured_local_models(self):
-        auto = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            local_models="my-alias",
-        )
-        self.assertEqual(
-            auto.resolve_model("muse-spark-1.3"), ("meta", "muse-spark-1.3")
-        )
-        self.assertEqual(auto.resolve_model("my-alias"), ("local", "my-alias"))
+        for name in ("kiro/claude-haiku-4.5", "kiro:claude-haiku-4.5"):
+            self.assertEqual(auto.resolve_model(name), ("kiro", "claude-haiku-4.5"))
+        self.assertEqual(auto.resolve_model("kiro/auto"), ("kiro", "auto"))
+        self.assertEqual(auto.resolve_model("claude-haiku-4.5"), ("claude", "claude-haiku-4.5"))
+        with self.assertRaisesRegex(ProviderError, "cannot infer"):
+            auto.resolve_model("auto")
+        with self.assertRaisesRegex(ProviderError, "belongs to Kiro"):
+            config(provider="claude", upstream=None).resolve_model("kiro/auto")
+        with self.assertRaisesRegex(ProviderError, "empty"):
+            auto.resolve_model("kiro/")
+        # An explicitly selected single-provider mode intentionally accepts
+        # bare upstream IDs, just like Codex/Claude/local modes.
+        single = config(provider="kiro", upstream=None)
+        self.assertEqual(single.resolve_model("auto"), ("kiro", "auto"))
+        self.assertEqual(single.resolve_model("claude-haiku-4.5"), ("kiro", "claude-haiku-4.5"))
 
     def test_single_modes_reject_foreign_prefixes(self):
         codex_only = config(provider="codex", upstream=None, model_discovery=False)
@@ -397,110 +237,6 @@ class GatewayRoutingTests(unittest.TestCase):
         meta_only = config(provider="meta", upstream=None, model_discovery=False)
         with self.assertRaisesRegex(ProviderError, "belongs to Codex"):
             meta_only.resolve_model("codex/gpt-x")
-
-    def test_single_meta_and_local_modes_pass_bare_names_through(self):
-        meta_only = config(provider="meta", upstream=None, model_discovery=False)
-        self.assertEqual(
-            meta_only.resolve_model("muse-spark-1.3"), ("meta", "muse-spark-1.3")
-        )
-        local_only = config(provider="local", upstream=None, model_discovery=False)
-        self.assertEqual(local_only.resolve_model("my-alias"), ("local", "my-alias"))
-
-    def test_transform_native_preserves_meta_wire_format(self):
-        body = {
-            "model": "meta/muse-spark-1.3",
-            "max_output_tokens": 128000,
-            "reasoning": {"effort": "high"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": "abc",
-            "tools": [
-                {
-                    "type": "namespace",
-                    "name": "muse",
-                    "tools": [{"type": "function", "name": "read_file"}],
-                }
-            ],
-        }
-        result = transform_request(
-            body, config(portable=True, max_output_tokens=16000), native=True
-        )
-        self.assertEqual(result["tools"][0]["type"], "namespace")
-        self.assertEqual(result["tools"][0]["tools"][0]["name"], "read_file")
-        self.assertEqual(result["include"], ["reasoning.encrypted_content"])
-        self.assertIn("reasoning", result)
-        self.assertIn("prompt_cache_key", result)
-        # Explicit caps still apply on the native route.
-        self.assertEqual(result["max_output_tokens"], 16000)
-
-    def test_transform_default_still_flattens(self):
-        body = {
-            "model": "local/my-alias",
-            "tools": [
-                {
-                    "type": "namespace",
-                    "name": "muse",
-                    "tools": [{"type": "function", "name": "read_file"}],
-                }
-            ],
-        }
-        result = transform_request(body, config())
-        self.assertEqual(result["tools"][0]["type"], "function")
-        self.assertEqual(result["tools"][0]["name"], "read_file")
-
-    def test_meta_catalog_entries(self):
-        auto = config(provider="auto", upstream=None, model_discovery=False)
-        catalog = provider_model_catalog(auto, "meta")
-        self.assertEqual(
-            [item["model_id"] for item in catalog],
-            ["meta/muse-spark-1.3", "meta/muse-spark-1.2"],
-        )
-        self.assertEqual(catalog[0]["display_label"], "Meta · muse-spark-1.3")
-        self.assertEqual(catalog[0]["context_limit"], 1_048_576)
-        self.assertEqual(
-            catalog[0]["description"], "(ctx 1M) Muse Spark model · limits unverified"
-        )
-        self.assertFalse(catalog[0]["limits_verified"])
-        self.assertTrue(catalog[0]["supports_images"])
-        self.assertTrue(catalog[0]["is_default"])
-
-    def test_local_catalog_is_opt_in(self):
-        auto = config(provider="auto", upstream=None, model_discovery=False)
-        self.assertEqual(provider_model_catalog(auto, "local"), [])
-        with_aliases = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            local_models="qwen,llama",
-        )
-        catalog = provider_model_catalog(with_aliases, "local")
-        self.assertEqual(
-            [item["model_id"] for item in catalog], ["local/qwen", "local/llama"]
-        )
-        self.assertEqual(catalog[0]["display_label"], "Local · qwen")
-        self.assertEqual(
-            catalog[0]["description"],
-            "(ctx 128k) Local model through muse-gateway · limits unverified",
-        )
-        self.assertFalse(catalog[0]["limits_verified"])
-        self.assertFalse(catalog[0]["supports_images"])
-
-    def test_unknown_catalog_provider_raises(self):
-        auto = config(provider="auto", upstream=None, model_discovery=False)
-        with self.assertRaisesRegex(ProviderError, "unknown provider"):
-            provider_model_catalog(auto, "generic")
-
-    def test_select_bearer_prefers_static_key_then_incoming(self):
-        static, incoming = "static-key", "incoming-key"
-        self.assertEqual(
-            _select_bearer(static, f"Bearer {incoming}", missing="nope"),
-            f"Bearer {static}",
-        )
-        self.assertEqual(
-            _select_bearer(None, f"Bearer {incoming}", missing="nope"),
-            f"Bearer {incoming}",
-        )
-        with self.assertRaisesRegex(ShimError, "nope"):
-            _select_bearer(None, None, missing="nope")
 
 
 class GatewayMetaDiscoveryTests(unittest.TestCase):
@@ -515,31 +251,6 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
         values.update(overrides)
         return config(**values)
 
-    def test_mocked_meta_discovery_replaces_bundled_fallbacks(self):
-        seen = {}
-
-        def fake_urlopen(request, timeout=None):
-            seen["url"] = request.full_url
-            seen["auth"] = request.get_header("Authorization")
-            return _ModelsResponse(
-                {"data": [
-                    {"id": "muse-spark-9", "context_window": 2000000,
-                     "max_output_tokens": 64000},
-                ]}
-            )
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(self._meta_config(), "meta")
-        self.assertEqual(seen["url"], "https://api.meta.ai/v1/models")
-        self.assertEqual(seen["auth"], "Bearer test-meta-key")
-        self.assertEqual(
-            [entry["model_id"] for entry in catalog], ["meta/muse-spark-9"]
-        )
-        self.assertEqual(catalog[0]["context_limit"], 2000000)
-        self.assertEqual(catalog[0]["output_limit"], 64000)
-        self.assertTrue(catalog[0]["limits_verified"])
-        self.assertEqual(catalog[0]["description"], "(ctx 2M) Muse Spark model")
-
     def test_no_static_key_keeps_bundled_catalog_without_request(self):
         def fail_urlopen(request, timeout=None):
             raise AssertionError("subscription setups must not probe Meta")
@@ -547,17 +258,6 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
         cfg = config(provider="auto", upstream=None)
         with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             catalog = provider_model_catalog(cfg, "meta")
-        self.assertEqual(
-            [entry["model_id"] for entry in catalog],
-            ["meta/muse-spark-1.3", "meta/muse-spark-1.2"],
-        )
-
-    def test_discovery_failure_keeps_bundled_fallbacks(self):
-        def fail_urlopen(request, timeout=None):
-            raise urllib.error.URLError("down")
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
-            catalog = provider_model_catalog(self._meta_config(), "meta")
         self.assertEqual(
             [entry["model_id"] for entry in catalog],
             ["meta/muse-spark-1.3", "meta/muse-spark-1.2"],
@@ -581,328 +281,6 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
             [(entry["model_id"], entry["context_limit"]) for entry in catalog],
             [("meta/muse-spark-1.3", 2000000)],
         )
-
-
-class GatewayForwardTests(unittest.TestCase):
-    """Exercise the forward methods without binding sockets."""
-
-    def _run_forward(self, method_name, cfg, body, incoming_auth=None):
-        handler = SimpleNamespace(
-            config=cfg,
-            headers={"Authorization": incoming_auth} if incoming_auth else {},
-            server_version="muse-shim-test",
-            wfile=io.BytesIO(),
-            _send_upstream_headers=lambda *args, **kwargs: None,
-        )
-        handler._post_responses = lambda url, payload, auth: (
-            MuseShimHandler._post_responses(handler, url, payload, auth)
-        )
-        seen: dict = {}
-
-        class FakeUpstream:
-            headers = {"Content-Type": "application/json"}
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self, *args):
-                return b'{"ok":true}'
-
-        def fake_urlopen(request, timeout=None, context=None):
-            seen["url"] = request.full_url
-            seen["auth"] = request.get_header("Authorization")
-            seen["body"] = json.loads(request.data.decode("utf-8"))
-            return FakeUpstream()
-
-        with patch("muse_gateway.urllib.request.urlopen", side_effect=fake_urlopen):
-            getattr(MuseShimHandler, method_name)(handler, body)
-        return seen
-
-    def test_forward_meta_posts_to_meta_upstream_with_static_key(self):
-        cfg = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            api_key=None,
-            meta_upstream="http://127.0.0.1:9/v1",
-            meta_api_key="meta-key",
-        )
-        body = {
-            "model": "muse-spark-1.3",
-            "input": "hi",
-            "tools": [{"type": "namespace", "name": "m", "tools": []}],
-        }
-        seen = self._run_forward(
-            "forward_meta", cfg, body, incoming_auth=f"Bearer {'placeholder'}"
-        )
-        self.assertEqual(seen["url"], "http://127.0.0.1:9/v1/responses")
-        self.assertEqual(seen["auth"], f"Bearer {'meta-key'}")
-        self.assertEqual(seen["body"]["tools"][0]["type"], "namespace")
-
-    def test_forward_meta_falls_back_to_incoming_bearer(self):
-        cfg = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            api_key=None,
-            meta_upstream="http://127.0.0.1:9/v1",
-            meta_api_key=None,
-        )
-        seen = self._run_forward(
-            "forward_meta",
-            cfg,
-            {"model": "muse-spark-1.3", "input": "hi"},
-            incoming_auth=f"Bearer {'placeholder'}",
-        )
-        self.assertEqual(seen["auth"], f"Bearer {'placeholder'}")
-
-    def test_forward_meta_missing_key_is_a_shim_error(self):
-        cfg = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            api_key=None,
-            meta_api_key=None,
-        )
-        with self.assertRaisesRegex(ShimError, "no Meta API key"):
-            self._run_forward(
-                "forward_meta", cfg, {"model": "muse-spark-1.3", "input": "hi"}
-            )
-
-    def test_forward_local_prefers_local_key_then_generic_key(self):
-        body = {"model": "my-alias", "input": "hi"}
-        local_first = config(
-            local_upstream="http://127.0.0.1:9/v1",
-            model_discovery=False,
-            api_key="generic-key",
-            local_api_key="local-key",
-        )
-        seen = self._run_forward("forward_local", local_first, body)
-        self.assertEqual(seen["auth"], f"Bearer {'local-key'}")
-        self.assertEqual(seen["url"], "http://127.0.0.1:9/v1/responses")
-        generic_fallback = config(
-            local_upstream="http://127.0.0.1:9/v1",
-            model_discovery=False,
-            api_key="generic-key",
-            local_api_key=None,
-        )
-        seen = self._run_forward("forward_local", generic_fallback, body)
-        self.assertEqual(seen["auth"], f"Bearer {'generic-key'}")
-
-    def test_forward_generic_posts_to_configured_upstream(self):
-        cfg = config(
-            upstream="http://127.0.0.1:9/v1",
-            model_discovery=False,
-            api_key="generic-key",
-        )
-        seen = self._run_forward(
-            "forward_generic",
-            cfg,
-            {"model": "anything", "input": "hi"},
-            incoming_auth=f"Bearer {'placeholder'}",
-        )
-        self.assertEqual(seen["url"], "http://127.0.0.1:9/v1/responses")
-        self.assertEqual(seen["auth"], f"Bearer {'generic-key'}")
-
-
-class GatewayProxyTests(unittest.TestCase):
-    """End-to-end route checks. Need loopback binds (see ProxyTests)."""
-
-    def test_auto_catalog_lists_all_routes(self):
-        shim_config = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-            codex_models="gpt-one",
-            claude_models="claude-one",
-            meta_models="muse-spark-1.3",
-            local_models="my-alias",
-        )
-        shim = MuseShimServer(("127.0.0.1", 0), shim_config)
-        shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
-        shim_thread.start()
-        # Menu-shape test: simulate installed providers so availability gating
-        # does not hide the asserted rows.
-        availability = patch(
-            "muse_gateway._provider_is_available", return_value=True
-        )
-        availability.start()
-        # Devin rows are out of scope here (covered by test_devin.py) and
-        # would otherwise reflect machine credential state.
-        devin_branch = patch(
-            "muse_gateway._devin_catalog_entries", return_value=[]
-        )
-        devin_branch.start()
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{shim.server_port}/muse-code/models",
-                timeout=5,
-            ) as response:
-                payload = json.loads(response.read())
-            self.assertEqual(
-                [item["id"] for item in payload["data"]],
-                [
-                    "codex/gpt-one",
-                    "claude/claude-one",
-                    "meta/muse-spark-1.3",
-                    "local/my-alias",
-                ],
-            )
-            meta = payload["data"][2]["metadata"]["muse-code"]
-            self.assertEqual(meta["name"], "Meta · muse-spark-1.3")
-            self.assertEqual(meta["limit"]["context"], 1048576)
-        finally:
-            availability.stop()
-            devin_branch.stop()
-            shim.shutdown()
-            shim.server_close()
-
-    def test_meta_dispatch_preserves_namespaces(self):
-        shim_config = config(
-            provider="auto",
-            upstream=None,
-            model_discovery=False,
-        )
-        shim = MuseShimServer(("127.0.0.1", 0), shim_config)
-        shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
-        routed = []
-
-        def record(provider):
-            def forward(handler, body):
-                routed.append((provider, body["model"], body.get("tools")))
-                handler.send_json(200, {"ok": True})
-
-            return forward
-
-        with (
-            patch("muse_gateway.MuseShimHandler.forward_meta", new=record("meta")),
-            patch("muse_gateway.MuseShimHandler.forward_local", new=record("local")),
-        ):
-            shim_thread.start()
-            try:
-                for model in ("meta/muse-spark-1.3", "local/my-alias"):
-                    request = urllib.request.Request(
-                        f"http://127.0.0.1:{shim.server_port}/responses",
-                        data=json.dumps(
-                            {
-                                "model": model,
-                                "input": "hello",
-                                "tools": [
-                                    {
-                                        "type": "namespace",
-                                        "name": "muse",
-                                        "tools": [
-                                            {
-                                                "type": "function",
-                                                "name": "read_file",
-                                            }
-                                        ],
-                                    }
-                                ],
-                            }
-                        ).encode(),
-                        headers={"Content-Type": "application/json"},
-                    )
-                    with urllib.request.urlopen(request, timeout=5) as response:
-                        self.assertEqual(response.status, 200)
-            finally:
-                shim.shutdown()
-                shim.server_close()
-        self.assertEqual(
-            [(provider, model) for provider, model, _ in routed],
-            [("meta", "muse-spark-1.3"), ("local", "my-alias")],
-        )
-        self.assertEqual(routed[0][2][0]["type"], "namespace")
-        self.assertEqual(routed[1][2][0]["type"], "function")
-
-
-class GatewayLocalHistoryTests(unittest.TestCase):
-    """Local route must flatten history call names alongside tool schemas.
-
-    Regression test for the GLM stall: tools were flattened (``muse`` group
-    -> bare ``search``) while history ``function_call`` names kept their
-    ``muse.search`` qualification, so from turn 2 the upstream model saw
-    calls to tools absent from its schema list and degenerated into
-    native-tag text.
-    """
-
-    NAMESPACED_TOOLS = [
-        {
-            "type": "namespace",
-            "name": "muse",
-            "tools": [
-                {"type": "function", "name": "search",
-                 "parameters": {"type": "object"}},
-                {"type": "function", "name": "read_file",
-                 "parameters": {"type": "object"}},
-            ],
-        }
-    ]
-
-    def _turn_two_body(self):
-        return {
-            "model": "local/glm",
-            "tools": [dict(group, tools=[dict(child) for child in group["tools"]])
-                      for group in self.NAMESPACED_TOOLS],
-            "input": [
-                {"type": "message", "role": "user",
-                 "content": [{"type": "input_text", "text": "hi"}]},
-                {"type": "function_call", "call_id": "call_1",
-                 "name": "muse.search", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call_1",
-                 "output": [{"type": "input_text", "text": "ok"}]},
-            ],
-        }
-
-    def test_flattens_qualified_history_call_names(self):
-        result = transform_request(self._turn_two_body(), config())
-        calls = [item for item in result["input"]
-                 if item.get("type") == "function_call"]
-        self.assertEqual([call["name"] for call in calls], ["search"])
-        self.assertEqual(
-            sorted(tool["name"] for tool in result["tools"]),
-            ["read_file", "search"],
-        )
-
-    def test_leaves_outputs_and_unknown_names_verbatim(self):
-        body = self._turn_two_body()
-        body["input"].extend([
-            {"type": "function_call", "call_id": "call_2",
-             "name": "search", "arguments": "{}"},
-            {"type": "function_call", "call_id": "call_3",
-             "name": "otherns.search", "arguments": "{}"},
-            {"type": "function_call", "call_id": "call_4",
-             "name": ["search"], "arguments": "{}"},
-        ])
-        result = transform_request(body, config())
-        calls = [item for item in result["input"]
-                 if item.get("type") == "function_call"]
-        self.assertEqual(
-            [(call["call_id"], call["name"]) for call in calls],
-            [("call_1", "search"), ("call_2", "search"),
-             ("call_3", "otherns.search"), ("call_4", ["search"])],
-        )
-        outputs = [item for item in result["input"]
-                   if item.get("type") == "function_call_output"]
-        self.assertEqual(outputs[0]["call_id"], "call_1")
-
-    def test_does_not_mutate_original_body(self):
-        body = self._turn_two_body()
-        transform_request(body, config())
-        calls = [item for item in body["input"]
-                 if item.get("type") == "function_call"]
-        self.assertEqual([call["name"] for call in calls], ["muse.search"])
-
-    def test_native_route_leaves_history_verbatim(self):
-        body = self._turn_two_body()
-        result = transform_request(body, config(), native=True)
-        calls = [item for item in result["input"]
-                 if item.get("type") == "function_call"]
-        self.assertEqual([call["name"] for call in calls], ["muse.search"])
 
 
 class _ModelsResponse:
@@ -933,47 +311,19 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
         values.update(overrides)
         return config(**values)
 
-    def test_discovers_aliases_from_upstream_models(self):
-        seen = {}
-
-        def fake_urlopen(request, timeout=None):
-            seen["url"] = request.full_url
-            seen["auth"] = request.get_header("Authorization")
-            return _ModelsResponse(
-                {"data": [{"id": "alpha"}, {"id": "beta"}, {"id": "  "}, {}]}
-            )
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(self._local_config(), "local")
-        self.assertEqual(seen["url"], "http://127.0.0.1:9/v1/models")
-        # (split literal: the tooling redacts "Bearer <word>" in file writes)
-        self.assertEqual(seen["auth"], "Bearer " + "test-local-key")
-        self.assertEqual(
-            [entry["model_id"] for entry in catalog],
-            ["local/alpha", "local/beta"],
-        )
-
-    def test_explicit_list_curates_names_with_discovered_limits(self):
-        def fake_urlopen(request, timeout=None):
-            return _ModelsResponse(
-                {"data": [
-                    {"id": "x", "max_input_tokens": 999,
-                     "max_output_tokens": 111},
-                    {"id": "extra", "max_input_tokens": 999,
-                     "max_output_tokens": 111},
-                ]}
-            )
-
-        cfg = self._local_config(local_models="x,y")
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(cfg, "local")
-        limits = {
-            entry["model_id"]: (entry["context_limit"], entry["output_limit"])
-            for entry in catalog
-        }
-        self.assertEqual(
-            limits, {"local/x": (999, 111), "local/y": (128000, 32768)}
-        )
+    def test_curated_catalog_preserves_positive_limits_and_requires_image_evidence(self):
+        payload = {"data": [{"id": "x", "max_input_tokens": 999, "max_output_tokens": 111, "supports_vision": True},
+                             {"id": "bad", "max_input_tokens": "nope", "max_output_tokens": -5},
+                             {"id": "unlisted", "max_input_tokens": 1, "max_output_tokens": 1}]}
+        with patch("muse_gateway.urllib.request.urlopen", return_value=_ModelsResponse(payload)):
+            catalog = provider_model_catalog(self._local_config(local_models="x,bad,missing"), "local")
+        self.assertEqual({entry["model_id"]: (entry["context_limit"], entry["output_limit"]) for entry in catalog},
+                         {"local/x": (999, 111), "local/bad": (128000, 32768), "local/missing": (128000, 32768)})
+        wire = muse_catalog_response(catalog)["data"]
+        self.assertEqual({entry["id"]: entry["metadata"]["muse-code"]["modalities"]["input"] for entry in wire},
+                         {"local/x": ["text", "image"], "local/bad": ["text"], "local/missing": ["text"]})
+        self.assertTrue(catalog[0]["limits_verified"])
+        self.assertTrue(all(not entry["limits_verified"] for entry in catalog[1:]))
 
     def test_explicit_list_keeps_defaults_when_discovery_down(self):
         def fail_urlopen(request, timeout=None):
@@ -988,32 +338,6 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
             [("local/x", 128000)],
         )
 
-    def test_unconfigured_upstream_makes_no_request(self):
-        def fail_urlopen(request, timeout=None):
-            raise AssertionError("discovery must not run when unconfigured")
-
-        cfg = config(provider="auto")
-        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
-            self.assertEqual(provider_model_catalog(cfg, "local"), [])
-
-    def test_discovery_failure_degrades_to_empty(self):
-        def fail_urlopen(request, timeout=None):
-            raise urllib.error.URLError("down")
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
-            self.assertEqual(
-                provider_model_catalog(self._local_config(), "local"), []
-            )
-
-    def test_malformed_payload_degrades_to_empty(self):
-        with patch(
-            "muse_gateway.urllib.request.urlopen",
-            new=lambda request, timeout=None: _ModelsResponse({"nope": True}),
-        ):
-            self.assertEqual(
-                provider_model_catalog(self._local_config(), "local"), []
-            )
-
     def test_no_model_discovery_flag_disables(self):
         def fail_urlopen(request, timeout=None):
             raise AssertionError("discovery must honor the flag")
@@ -1021,66 +345,6 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
         cfg = self._local_config(model_discovery=False)
         with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
             self.assertEqual(provider_model_catalog(cfg, "local"), [])
-
-    def test_discovery_carries_upstream_limits(self):
-        def fake_urlopen(request, timeout=None):
-            return _ModelsResponse(
-                {
-                    "data": [
-                        {"id": "big", "max_input_tokens": 524288,
-                         "max_output_tokens": 262144},
-                        {"id": "bare"},
-                        {"id": "bogus", "max_input_tokens": "nope",
-                         "max_output_tokens": -5},
-                    ]
-                }
-            )
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(self._local_config(), "local")
-        limits = {
-            entry["model_id"]: (entry["context_limit"], entry["output_limit"])
-            for entry in catalog
-        }
-        self.assertEqual(
-            limits,
-            {
-                "local/big": (524288, 262144),
-                "local/bare": (128000, 32768),
-                "local/bogus": (128000, 32768),
-            },
-        )
-
-    def test_bare_discovered_alias_routes_to_local(self):
-        def fake_urlopen(request, timeout=None):
-            return _ModelsResponse({"data": [{"id": "beta"}]})
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            cfg = self._local_config()
-            self.assertEqual(cfg.resolve_model("beta"), ("local", "beta"))
-            with self.assertRaises(ProviderError):
-                cfg.resolve_model("not-a-model-anywhere")
-
-    def test_discovery_reads_limit_aliases_and_image_evidence(self):
-        def fake_urlopen(request, timeout=None):
-            return _ModelsResponse(
-                {"data": [
-                    {"id": "m", "context_length": 500000,
-                     "max_completion_tokens": 8000,
-                     "capabilities": ["vision"]},
-                ]}
-            )
-
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(self._local_config(), "local")
-        self.assertEqual(catalog[0]["context_limit"], 500000)
-        self.assertEqual(catalog[0]["output_limit"], 8000)
-        self.assertTrue(catalog[0]["limits_verified"])
-        self.assertTrue(catalog[0]["supports_images"])
-        self.assertEqual(
-            catalog[0]["description"],
-            "(ctx 500k) Local model through muse-gateway",
-        )
 
     def test_ollama_tags_answer_when_models_is_empty(self):
         seen = []
@@ -1102,22 +366,470 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
         )
         self.assertFalse(catalog[0]["limits_verified"])
 
-    def test_wire_modalities_follow_image_evidence(self):
-        def fake_urlopen(request, timeout=None):
-            return _ModelsResponse(
-                {"data": [{"id": "plain"}, {"id": "seer", "supports_vision": True}]}
-            )
 
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(self._local_config(), "local")
-        wire = muse_catalog_response(catalog)["data"]
-        modalities = {
-            item["id"]: item["metadata"]["muse-code"]["modalities"]["input"]
-            for item in wire
-        }
-        self.assertEqual(
-            modalities, {"local/plain": ["text"], "local/seer": ["text", "image"]}
-        )
+class KiroConfigurationTests(unittest.TestCase):
+    def test_env_legacy_and_cli_precedence_and_single_provider_upstream(self):
+        with patch.dict(os.environ, {
+            "MUSE_SHIM_KIRO_API_KEY": "legacy-proxy-key",
+            "MUSE_SHIM_KIRO_MODELS": "legacy-model",
+            "MUSE_GATEWAY_KIRO_UPSTREAM": "http://127.0.0.1:1/v1/messages",
+            "MUSE_GATEWAY_KIRO_API_KEY": "current-proxy-key",
+            "MUSE_GATEWAY_KIRO_CONTEXT_LIMIT": "32768",
+            "MUSE_GATEWAY_KIRO_OUTPUT_LIMIT": "4096",
+        }, clear=True):
+            cfg = Config(parse_args(["kiro", "--kiro-models", "cli-model", "--no-model-discovery"]))
+            self.assertEqual(cfg.kiro_api_key, "current-proxy-key")
+            self.assertEqual(cfg.kiro_models, ["cli-model"])
+            self.assertEqual((cfg.kiro_context_limit, cfg.kiro_output_limit), (32768, 4096))
+            self.assertEqual(cfg.provider_url("kiro"), "http://127.0.0.1:1/v1/messages")
+            self.assertIn("current-proxy-key", cfg.secret_values())
+            override = Config(parse_args([
+                "kiro", "--upstream", "http://127.0.0.1:2", "--no-model-discovery",
+            ]))
+            self.assertEqual(override.provider_url(), "http://127.0.0.1:2/v1/messages")
+            del os.environ["MUSE_GATEWAY_KIRO_API_KEY"]
+            self.assertEqual(Config(parse_args(["auto"])).kiro_api_key, "legacy-proxy-key")
+
+    def test_invalid_kiro_settings_fail_before_serving(self):
+        for flags in (
+            ["--kiro-context-limit", "0"], ["--kiro-output-limit", "-1"],
+            ["--kiro-upstream", "http://remote.invalid/v1"],
+            ["--kiro-upstream", "https://user:password@remote.invalid/v1"],
+            ["--kiro-api-key", "key\r\ninjected"],
+        ):
+            with self.subTest(flags=flags[0]), patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parse_args(["auto", *flags])
+
+
+class _KiroRoutingHandler(BaseHTTPRequestHandler):
+    """Independent Messages JSON fixture; no production conversion in the peer."""
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, value, status=200):
+        raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self._reply_bytes(raw, status)
+
+    def _reply_bytes(self, raw, status=200):
+        if self.server.chunked_trickle:
+            self._reply_chunked_trickle(status)
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", self.server.content_type)
+        if not self.server.hold_body_open:
+            self.send_header("Content-Length", str(len(raw) + self.server.declared_extra))
+        self.end_headers()
+        try:
+            self.wfile.write(raw)
+            self.wfile.flush()
+            self.server.body_written.set()
+            if self.server.observe_client_close:
+                self.connection.settimeout(3)
+                try:
+                    closed = not self.connection.recv(1)
+                except ConnectionResetError:
+                    closed = True  # Closing with unread error bytes may send RST, not FIN.
+                if closed:
+                    self.server.client_closed.set()
+            if self.server.hold_body_open:
+                self.server.release_body.wait(timeout=5)
+        except (ConnectionError, OSError):
+            pass  # Rejected/oversized bodies deliberately close this peer early.
+        self.close_connection = True
+
+    def _reply_chunked_trickle(self, status):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            if self.server.chunked_trickle == "size":
+                # read1 must finish the size/extension line before any data
+                # is returned. Each fragment renews an inactivity timeout.
+                initial, ending = b"1;", b"\r\nx\r\n"
+            else:
+                # Zero-size chunk handling internally reads all trailer lines.
+                initial, ending = b"0\r\nX-Trace: ", b"\r\n\r\n"
+            self.wfile.write(initial)
+            self.wfile.flush()
+            for fragment in [b"x"] * 22 + [ending]:
+                if self.server.release_body.wait(timeout=0.05):
+                    return
+                self.wfile.write(fragment)
+                self.wfile.flush()
+            self.server.chunked_framing_finished.set()
+            self.server.release_body.wait(timeout=5)
+        except (ConnectionError, OSError):
+            self.server.client_closed.set()
+        finally:
+            self.close_connection = True
+
+    def do_GET(self):
+        self.server.observed.append((self.path, self.headers.get("Authorization"), None))
+        if self.server.catalog_bytes is not None:
+            self._reply_bytes(self.server.catalog_bytes)
+        elif self.server.catalog_status != 200:
+            self._reply({"error": {"message": "synthetic unavailable"}}, self.server.catalog_status)
+        else:
+            self._reply({"data": [{"id": "claude-haiku-4.5"}, {"id": "auto"}]})
+
+    def do_POST(self):
+        body = json.load(io.BytesIO(self.rfile.read(int(self.headers["Content-Length"]))))
+        self.server.observed.append((self.path, self.headers.get("Authorization"), body))
+        if self.server.response_bytes is not None:
+            self._reply_bytes(self.server.response_bytes, self.server.response_status)
+            return
+        self._reply({
+            "type": "message", "id": "msg_kiro_routing", "role": "assistant", "model": body["model"],
+            "content": [{"type": "text", "text": "Hello \U0001f332"}],
+            "stop_reason": "end_turn", "stop_sequence": None,
+            "usage": {"input_tokens": 4, "output_tokens": 3},
+        })
+
+
+class KiroPublicRoutingTests(unittest.TestCase):
+    @contextmanager
+    def _servers(self, *, capture=False, **overrides):
+        peer = ThreadingHTTPServer(("127.0.0.1", 0), _KiroRoutingHandler)
+        peer.observed = []
+        peer.catalog_status = 200
+        peer.catalog_bytes = None
+        peer.response_bytes = None
+        peer.response_status = 200
+        peer.declared_extra = 0
+        peer.content_type = "application/json"
+        peer.hold_body_open = False
+        peer.release_body = threading.Event()
+        peer.body_written = threading.Event()
+        peer.observe_client_close = False
+        peer.client_closed = threading.Event()
+        peer.chunked_trickle = None
+        peer.chunked_framing_finished = threading.Event()
+        peer_thread = threading.Thread(target=peer.serve_forever, daemon=True)
+        peer_thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                values = dict(
+                    provider="auto", upstream=None, model_discovery=False,
+                    kiro_upstream=f"http://127.0.0.1:{peer.server_port}/v1",
+                    log_file=str(Path(directory) / "gateway.log"),
+                    capture_dir=str(Path(directory) / "captures") if capture else None,
+                )
+                values.update(overrides)
+                cfg = config(**values)
+                server = MuseShimServer(("127.0.0.1", 0), cfg)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    yield cfg, f"http://127.0.0.1:{server.server_port}", peer
+                finally:
+                    peer.release_body.set()
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=5)
+        finally:
+            peer.shutdown()
+            peer.server_close()
+            peer_thread.join(timeout=5)
+
+    def _manifest(self, cfg):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            manifests = list(Path(cfg.capture_dir).glob("gateway-*/*/manifest.json"))
+            if manifests:
+                try:
+                    return manifests[0], json.loads(manifests[0].read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+            time.sleep(0.01)
+        self.fail("Request capture was not finalized")
+
+    def test_deeply_nested_optional_catalog_preserves_public_auto_menu_and_short_retry(self):
+        with self._servers(kiro_api_key="synthetic-proxy-key", model_discovery=True) as (cfg, base, peer):
+            peer.catalog_bytes = b"[" * 20000 + b"]" * 20000
+            # Only credential availability is replaced. No test may inspect
+            # private native stores or query an unrelated remote provider.
+            with patch("muse_gateway.discover_codex_credentials", return_value=None), patch(
+                "muse_gateway.discover_claude_credentials", return_value=None,
+            ), patch("muse_gateway._devin_provider_ready", return_value=False), patch(
+                "muse_gateway.shutil.which", return_value=None,
+            ):
+                for _ in range(2):
+                    with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as response:
+                        ids = [row["id"] for row in json.load(response)["data"]]
+                    self.assertIn("meta/muse-spark-1.3", ids, "KIRO_CATALOG_ISOLATION")
+                    self.assertFalse(any(name.startswith("kiro/") for name in ids))
+                self.assertEqual(len(peer.observed), 1, "Failed catalogs should have a short cache")
+                peer.catalog_bytes = None
+                from muse_gateway import MODEL_CATALOG_RETRY_SECONDS
+                with patch("muse_gateway.time.time", return_value=time.time() + MODEL_CATALOG_RETRY_SECONDS + 1):
+                    with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as response:
+                        ids = [row["id"] for row in json.load(response)["data"]]
+                self.assertIn("kiro/auto", ids)
+                self.assertEqual(len(peer.observed), 2)
+
+    def test_pre_forward_rejection_marks_capture_failed(self):
+        with self._servers(capture=True, kiro_api_key="synthetic-proxy-key") as (cfg, base, peer):
+            req = urllib.request.Request(base + "/responses", data=json.dumps({
+                "model": "kiro/auto", "input": "hello", "stream": True,
+                "tools": [{"type": "namespace", "name": group, "tools": [{
+                    "type": "function", "name": "duplicate", "parameters": {"type": "object"},
+                }]} for group in ("a", "b")],
+            }).encode(), headers={"Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=5)
+            with caught.exception as error:
+                self.assertEqual(error.code, 400)
+                self.assertIn("duplicate", json.load(error)["error"]["message"])
+            _, manifest = self._manifest(cfg)
+            self.assertTrue(manifest["outcome"]["stream_failed"], "KIRO_FAILURE_OUTCOME: pre-forward rejection is not success")
+            self.assertEqual(peer.observed, [])
+
+    def test_wrong_mime_capture_is_bounded_scrubbed_and_does_not_wait_for_open_body(self):
+        key = "arbitrary-proxy-key-sentinel"
+        with self._servers(capture=True, kiro_api_key=key) as (cfg, base, peer):
+            peer.content_type = "text/plain"
+            peer.response_bytes = b"synthetic rejection " + key.encode() + b"!" * (200 * 1024)
+            peer.hold_body_open = True
+            req = urllib.request.Request(base + "/responses", data=json.dumps({
+                "model": "kiro/auto", "input": "hello", "stream": True,
+            }).encode(), headers={"Content-Type": "application/json"})
+            started = time.monotonic()
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=3)
+            with caught.exception as error:
+                self.assertEqual(error.code, 502)
+                self.assertEqual(json.load(error)["error"]["type"], "kiro_invalid_response")
+            self.assertLess(time.monotonic() - started, 2, "KIRO_REJECT_CAPTURE_LIVENESS")
+            self.assertFalse(peer.release_body.is_set(), "The peer must still be held open")
+            path, manifest = self._manifest(cfg)
+            self.assertIn("upstream.body", manifest["streams"], "KIRO_REJECT_EVIDENCE: retain a bounded body prefix")
+            observed = manifest["streams"]["upstream.body"]["observed_bytes"]
+            self.assertGreater(observed, 0)
+            self.assertLessEqual(observed, 65537)
+            self.assertIn("kiro_rejected_body_incomplete", manifest["capture_errors"])
+            captured = (path.parent / "upstream.body").read_bytes()
+            self.assertIn(b"synthetic rejection", captured)
+            self.assertNotIn(key.encode(), captured)
+            self.assertNotIn(key, Path(cfg.log_file).read_text(encoding="utf-8"))
+            self.assertTrue(manifest["outcome"]["stream_failed"])
+
+    def test_http_401_flushed_prefix_does_not_wait_for_eof_and_closes_upstream(self):
+        key = 'http"error\\proxy-key'
+        wire = json.dumps({"error": {"type": "authentication_error", "code": "unauthorized",
+                                     "message": "Synthetic rejection " + key}}).encode()
+        for capture in (False, True):
+            with self.subTest(capture=capture), self._servers(capture=capture, kiro_api_key=key, timeout=1.2) as (cfg, base, peer):
+                peer.response_status, peer.response_bytes, peer.hold_body_open = 401, wire, True
+                peer.observe_client_close = True
+                request = urllib.request.Request(base + "/responses", data=json.dumps({
+                    "model": "kiro/auto", "input": "hello", "stream": True,
+                }).encode(), headers={"Content-Type": "application/json"})
+                started = time.monotonic()
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=3)
+                with caught.exception as error:
+                    body = json.load(error)
+                    status = error.code
+                self.assertLess(time.monotonic() - started, 0.9, "KIRO_HTTP_ERROR_LIVENESS: known errors must not await body EOF")
+                self.assertEqual(status, 401, "KIRO_HTTP_ERROR_STATUS")
+                self.assertEqual(body["error"]["type"], "kiro_upstream_error")
+                self.assertTrue(peer.body_written.is_set())
+                self.assertTrue(peer.client_closed.wait(timeout=1), "KIRO_HTTP_ERROR_CLOSE: release the upstream even while its body is open")
+                self.assertFalse(peer.release_body.is_set())
+                if capture:
+                    path, manifest = self._manifest(cfg)
+                    self.assertTrue(manifest["outcome"]["stream_failed"])
+                    self.assertEqual(manifest["outcome"]["status"], 401)
+                    self.assertIn("kiro_http_error_body_incomplete", manifest["capture_errors"])
+                    raw = (path.parent / "upstream.error.body").read_bytes()
+                    decoded = json.loads(raw)
+                    self.assertNotIn(key, decoded["error"]["message"])
+                    self.assertIn("[REDACTED]", decoded["error"]["message"])
+                    self.assertEqual(manifest["streams"]["upstream.error.body"]["observed_bytes"], len(wire))
+                    self.assertNotIn(key, Path(cfg.log_file).read_text(encoding="utf-8"))
+
+    def test_chunked_error_size_line_and_trailers_are_omitted_without_waiting(self):
+        for framing, status in (("size", 401), ("trailers", 503)):
+            for capture in (False, True):
+                with self.subTest(framing=framing, status=status, capture=capture), self._servers(
+                    capture=capture, kiro_api_key="synthetic-proxy-key", timeout=3,
+                ) as (cfg, base, peer):
+                    peer.response_status, peer.response_bytes, peer.chunked_trickle = status, b"", framing
+                    request = urllib.request.Request(base + "/responses", data=json.dumps({
+                        "model": "kiro/auto", "input": "hello", "stream": True,
+                    }).encode(), headers={"Content-Type": "application/json"})
+                    started = time.monotonic()
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(request, timeout=3)
+                    with caught.exception as error:
+                        result = json.load(error)
+                        self.assertEqual(error.code, status, "KIRO_HTTP_ERROR_STATUS")
+                        self.assertEqual(result["error"]["type"], "kiro_upstream_error")
+                    self.assertLess(time.monotonic() - started, 0.9,
+                                    "KIRO_CHUNKED_ERROR_LIVENESS: inactivity timeout is not an absolute framing deadline")
+                    self.assertFalse(peer.chunked_framing_finished.is_set(),
+                                     "Known HTTP status must arrive while the peer's framing is unfinished")
+                    self.assertTrue(peer.client_closed.wait(timeout=1), "KIRO_HTTP_ERROR_CLOSE")
+                    self.assertFalse(peer.release_body.is_set())
+                    if capture:
+                        path, manifest = self._manifest(cfg)
+                        self.assertEqual(manifest["outcome"]["status"], status)
+                        self.assertTrue(manifest["outcome"]["stream_failed"])
+                        headers = json.loads((path.parent / "upstream.error.headers.json").read_text(encoding="utf-8"))
+                        self.assertEqual(headers["status"], status)
+                        self.assertEqual(headers["headers"]["Transfer-Encoding"], "chunked")
+                        self.assertIn("kiro_http_error_body_incomplete", manifest["capture_errors"])
+                        self.assertNotIn("upstream.error.body", manifest["streams"])
+                        timeline = [json.loads(line) for line in (path.parent / "timeline.jsonl").read_text(encoding="utf-8").splitlines()]
+                        omitted = next(row for row in timeline if row["event"] == "upstream.error.body.omitted")
+                        self.assertEqual(omitted["reason"], "chunked_framing_has_no_absolute_read_bound")
+                        self.assertFalse(omitted["complete"])
+
+    def test_http_error_silent_body_timeout_preserves_status_and_missing_evidence(self):
+        for status in (401, 429, 503):
+            with self.subTest(status=status), self._servers(capture=True, kiro_api_key="synthetic-proxy-key", timeout=0.05) as (cfg, base, peer):
+                peer.response_status, peer.response_bytes, peer.hold_body_open = status, b"", True
+                peer.observe_client_close = True
+                request = urllib.request.Request(base + "/responses", data=json.dumps({
+                    "model": "kiro/auto", "input": "hello", "stream": True,
+                }).encode(), headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request, timeout=3)
+                with caught.exception as error:
+                    self.assertEqual(error.code, status, "KIRO_HTTP_ERROR_STATUS: body-read failure cannot replace known HTTP status")
+                    self.assertEqual(json.load(error)["error"]["type"], "kiro_upstream_error")
+                self.assertTrue(peer.client_closed.wait(timeout=1), "KIRO_HTTP_ERROR_CLOSE")
+                path, manifest = self._manifest(cfg)
+                self.assertTrue(manifest["outcome"]["stream_failed"])
+                self.assertIn("kiro_http_error_body_incomplete", manifest["capture_errors"])
+                timeline = [json.loads(line) for line in (path.parent / "timeline.jsonl").read_text(encoding="utf-8").splitlines()]
+                omitted = next(row for row in timeline if row["event"] == "upstream.error.body.omitted")
+                self.assertFalse(omitted["complete"])
+                self.assertEqual(omitted["reason"], "TimeoutError")
+
+    def test_error_capture_trusts_only_a_fulfilled_content_length(self):
+        wire = b'{"error":{"code":"unauthorized"}}'
+        for extra in (0, 17):
+            with self.subTest(declared_extra=extra), self._servers(capture=True, kiro_api_key="synthetic-proxy-key") as (cfg, base, peer):
+                peer.response_status, peer.response_bytes, peer.declared_extra = 401, wire, extra
+                req = urllib.request.Request(base + "/responses", data=json.dumps({"model": "kiro/auto", "input": "hi", "stream": True}).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(req, timeout=3)
+                with caught.exception as error:
+                    self.assertEqual(error.code, 401)
+                    json.load(error)
+                path, manifest = self._manifest(cfg)
+                timeline = [json.loads(line) for line in (path.parent / "timeline.jsonl").read_text().splitlines()]
+                evidence = next(row for row in timeline if row["event"] == "upstream.error.body.rejected")
+                self.assertEqual(evidence["complete"], not extra, "Socket EOF alone cannot fulfill Content-Length")
+                self.assertEqual("kiro_http_error_body_incomplete" in manifest["capture_errors"], bool(extra))
+                self.assertEqual((path.parent / "upstream.error.body").read_bytes(), wire)
+
+    def test_nonstandard_json_constants_never_become_completed_responses(self):
+        with self._servers(kiro_api_key="synthetic-proxy-key") as (_, base, peer):
+            for constant in ("NaN", "Infinity", "-Infinity"):
+                peer.response_bytes = (
+                    '{"type":"message","id":"msg_constant","role":"assistant",'
+                    '"content":[{"type":"text","text":"apparently valid"}],'
+                    '"stop_reason":"end_turn","unrecognized":' + constant + "}"
+                ).encode()
+                with self.subTest(constant=constant):
+                    req = urllib.request.Request(base + "/responses", data=json.dumps({
+                        "model": "kiro/auto", "input": "hello", "stream": False,
+                    }).encode(), headers={"Content-Type": "application/json"})
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(req, timeout=5)
+                    with caught.exception as error:
+                        self.assertEqual(error.code, 502)
+                        self.assertEqual(json.load(error)["error"]["type"], "kiro_invalid_response")
+
+    def test_missing_kiro_key_never_discovers_or_falls_back_to_muse_or_generic_key(self):
+        with self._servers(kiro_models="auto") as (cfg, base, peer):
+            cfg.model_discovery = True
+            self.assertEqual(provider_model_catalog(cfg, "kiro"), [])
+            req = urllib.request.Request(base + "/responses", data=json.dumps({
+                "model": "kiro/auto", "input": "hello", "stream": False,
+            }).encode(), headers={"Authorization": "Bearer incoming-Muse-key", "Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=5)
+            with caught.exception as error:
+                result = json.load(error)
+                self.assertEqual(error.code, 400)
+            self.assertEqual(result["error"]["type"], "kiro_not_configured")
+            self.assertEqual(peer.observed, [])
+
+    def test_json_errors_overflow_and_http_truncation_are_readable_failures_with_honest_capture(self):
+        complete_json = json.dumps({
+            "type": "message", "id": "msg_truncated", "role": "assistant",
+            "content": [{"type": "text", "text": "apparently valid"}], "stop_reason": "end_turn",
+        }).encode()
+        for label, raw, limit, extra in (
+            ("invalid JSON", b"not-json", 1024, 0),
+            ("invalid Messages shape", b"{}", 1024, 0),
+            ("oversized JSON", b"x" * 2048, 1024, 0),
+            ("truncated HTTP", complete_json, 1024, 17),
+        ):
+            with self.subTest(case=label), self._servers(capture=True, kiro_api_key="synthetic-proxy-key") as (cfg, base, peer):
+                peer.response_bytes, peer.declared_extra = raw, extra
+                req = urllib.request.Request(base + "/responses", data=json.dumps({
+                    "model": "kiro/auto", "input": "hello", "stream": False,
+                }).encode(), headers={"Content-Type": "application/json"})
+                with patch("muse_gateway.KIRO_JSON_RESPONSE_LIMIT", limit):
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(req, timeout=5)
+                    with caught.exception as error:
+                        result = json.load(error)
+                        self.assertEqual(error.code, 502)
+                self.assertEqual(result["error"]["type"], "kiro_invalid_response")
+                deadline = time.monotonic() + 2
+                manifests = []
+                manifest = None
+                while time.monotonic() < deadline and manifest is None:
+                    manifests = list(Path(cfg.capture_dir).glob("gateway-*/*/manifest.json"))
+                    if manifests:
+                        try:
+                            manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+                        except (OSError, ValueError):
+                            pass  # The handler may still be closing the manifest.
+                    if manifest is None:
+                        time.sleep(0.01)
+                self.assertEqual(len(manifests), 1)
+                self.assertIsNotNone(manifest)
+                self.assertTrue(manifest["outcome"]["stream_failed"])
+                self.assertEqual(manifest["outcome"]["status"], 502)
+                if label == "oversized JSON":
+                    self.assertEqual(manifest["streams"]["upstream.body"]["observed_bytes"], limit + 1)
+                    self.assertIn("kiro_response_body_limit", manifest["capture_errors"])
+                if label == "truncated HTTP":
+                    self.assertIn("kiro_response_body_incomplete", manifest["capture_errors"])
+
+    def test_authenticated_catalog_curates_names_and_never_invents_verified_capabilities(self):
+        with self._servers(provider="kiro", kiro_api_key="synthetic-proxy-key", kiro_models="auto",
+                           model="kiro/auto", max_output_tokens=123) as (cfg, base, peer):
+            cfg.model_discovery = True
+            rows = provider_model_catalog(cfg, "kiro")
+            self.assertEqual([row["model_id"] for row in rows], ["kiro/auto"])
+            self.assertEqual([(path, auth) for path, auth, _ in peer.observed], [
+                ("/v1/models", "Bearer synthetic-proxy-key"),
+            ])
+            self.assertEqual((rows[0]["context_limit"], rows[0]["output_limit"]), (65536, 123))
+            with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as response:
+                row = json.load(response)["data"][0]
+            self.assertEqual(row["metadata"]["muse-code"]["limit"], {"context": 65536, "output": 123})
+            self.assertIn("unverified", row["metadata"]["muse-code"]["description"])
+            self.assertFalse(rows[0]["limits_verified"])
+            self.assertFalse(rows[0]["supports_images"])
+            self.assertFalse(rows[0].get("reasoning_efforts"))
+            out = io.StringIO()
+            cfg.doctor_provider = "kiro"
+            self.assertEqual(run_doctor(cfg, output=out), 0)
+            self.assertIn("authenticated catalog reachable", out.getvalue())
+            self.assertIn("inference not validated", out.getvalue())
+            self.assertNotIn("synthetic-proxy-key", out.getvalue())
+            self.assertEqual(len(peer.observed), 1, "doctor must use cached catalog, not inference")
 
 
 if __name__ == "__main__":

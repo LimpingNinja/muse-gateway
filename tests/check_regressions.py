@@ -18,6 +18,7 @@ import unittest
 
 
 PREFIX = "tests.test_gateway_contracts.GatewayContracts."
+KIRO_PREFIX = "test_kiro.KiroContracts."
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,11 @@ class Fault:
     edits: tuple
     test: str
     diagnostic: str
+    prefix: str = PREFIX
+
+    @property
+    def test_name(self):
+        return self.prefix + self.test
 
 
 FAULTS = (
@@ -70,6 +76,42 @@ FAULTS = (
     Fault("replay dangling reasoning references", "muse_providers.py", ((
         'and item["id"] in demoted_ids', 'and False'),),
         "test_cross_provider_history_survives_routes_and_bounded_codex_recovery", "CODEX_RECOVERY"),
+    Fault("Kiro borrows the generic credential", "muse_gateway.py", ((
+        'key = muse_kiro.validate_proxy_key(self.config.kiro_api_key)',
+        'key = muse_kiro.validate_proxy_key(self.config.api_key or self.config.kiro_api_key)'),),
+        "test_route_uses_only_proxy_key_and_shared_conversion", "KIRO_AUTH", KIRO_PREFIX),
+    Fault("Kiro missing sequence numbers", "muse_kiro.py", ((
+        'yield name, {**data, "sequence_number": sequence}', 'yield name, dict(data)'),),
+        "test_route_uses_only_proxy_key_and_shared_conversion", "STREAM_SEQUENCE", KIRO_PREFIX),
+    Fault("Kiro loses replayed tool output", "muse_kiro.py", ((
+        'elif item.get("type") == "function_call_output":\n            item["call_id"] = call_ids[item["call_id"]]',
+        'elif item.get("type") == "function_call_output":\n            item["call_id"] = call_ids[item["call_id"]]\n            item["output"] = ""'),),
+        "test_inline_tool_replay_keeps_history_and_drops_only_redundant_state", "KIRO_REPLAY", KIRO_PREFIX),
+    Fault("Kiro strips literal line prefixes from tool output", "muse_kiro.py", ((
+        'elif item.get("type") == "function_call_output":\n            item["call_id"] = call_ids[item["call_id"]]',
+        'elif item.get("type") == "function_call_output":\n            item["call_id"] = call_ids[item["call_id"]]\n            item["output"] = re.sub(r"(?m)^\\d+\\|", "", item["output"])'),),
+        "test_inline_tool_replay_keeps_history_and_drops_only_redundant_state", "KIRO_REPLAY", KIRO_PREFIX),
+    Fault("Kiro waits for EOF after semantic completion", "muse_kiro.py", ((
+        '            yield from convert("message_stop", payload)',
+        '            upstream.read()\n            yield from convert("message_stop", payload)'),),
+        "test_completion_does_not_wait_for_http_eof", "KIRO_COMPLETION", KIRO_PREFIX),
+    Fault("Kiro accepts a stream without message_stop", "muse_kiro.py", ((
+        'raise _invalid_response("Kiro Gateway stream ended before message_stop.")',
+        'yield from convert("message_stop", {"type": "message_stop"})'),),
+        "test_partial_malformed_and_error_streams_never_complete", "KIRO_FAILURE", KIRO_PREFIX),
+    Fault("Kiro silently reuses an occupied gateway", "muse_gateway.py", ((
+        'self.kiro_requested = bool(', 'self.kiro_requested = False and bool('),),
+        "test_kiro_configured_launch_and_run_refuse_occupied_gateway", "0 != 1",
+        "test_launchers.ModelsAndReuseTests."),
+    Fault("Kiro flattens typed SSE and JSON error codes", "muse_kiro.py", ((
+        '"code": upstream.get("code") or upstream.get("type") or error.code', '"code": error.code'),),
+        "test_sse_and_json_typed_errors_preserve_category_and_observed_status", "kiro_upstream_error", KIRO_PREFIX),
+    Fault("Kiro flattens evidence categories", "muse_kiro.py", ((
+        '"category": category, "transient": transient', '"category": "unknown", "transient": transient'),),
+        "test_http_error_evidence_survives_the_public_boundary_without_retry", "'unknown'", KIRO_PREFIX),
+    Fault("Kiro omits the downstream Retry-After header", "muse_gateway.py", ((
+        'headers={"Retry-After": retry["value"]} if retry else None,', 'headers=None,'),),
+        "test_retry_after_dates_and_rejected_metadata_are_passive", "AssertionError: None !=", KIRO_PREFIX),
 )
 
 
@@ -102,11 +144,12 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--run":
         return run_selected(sys.argv[2:])
     source = Path(__file__).resolve().parents[1]
-    names = sorted({PREFIX + fault.test for fault in FAULTS})
+    names = sorted({fault.test_name for fault in FAULTS})
     with tempfile.TemporaryDirectory(prefix="gateway-faults-") as directory:
         copy = Path(directory)
         for name in ("muse_gateway.py", "muse_providers.py", "muse_devin.py", "muse_devin_wire.py",
-                     "muse_capture.py", "devin_pb2.py", "muse_shim.py"):
+                     "muse_capture.py", "devin_pb2.py", "muse_shim.py", "muse_kiro.py", "test_kiro.py",
+                     "test_launchers.py", "muse-gateway.ps1", "muse-gateway"):
             shutil.copy2(source / name, copy / name)
         shutil.copytree(source / "tests", copy / "tests", ignore=shutil.ignore_patterns("__pycache__"))
         originals = {fault.module: (copy / fault.module).read_text(encoding="utf-8") for fault in FAULTS}
@@ -123,7 +166,7 @@ def main():
             target = copy / fault.module
             try:
                 target.write_text(modified, encoding="utf-8")
-                report = invoke(copy, [PREFIX + fault.test])
+                report = invoke(copy, [fault.test_name])
                 if not usable(report) or report["run"] != 1 or not report["failures"]:
                     raise RuntimeError(f"SURVIVED or harness error: {fault.name}\n" + json.dumps(report))
                 if not all(fault.diagnostic in failure for failure in report["failures"]):

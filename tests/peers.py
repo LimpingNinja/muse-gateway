@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+import time
 import urllib.request
 
 import devin_pb2
@@ -84,12 +85,34 @@ def responses_text(text, response_id="resp_peer"):
 
 def anthropic_text(text="CLAUDE_ACCEPTED"):
     events = [
-        ("message_start", {"message": {"id": "msg_anthropic_peer", "model": "claude-test", "role": "assistant", "content": [],
+        ("message_start", {"message": {"id": "msg_anthropic_peer", "type": "message", "model": "claude-test", "role": "assistant", "content": [],
                                          "usage": {"input_tokens": 4, "output_tokens": 0}}}),
         ("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}),
         ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": text}}),
         ("content_block_stop", {"index": 0}),
         ("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+        ("message_stop", {}),
+    ]
+    return b"".join(("event: " + kind + "\ndata: " + json.dumps({"type": kind, **payload}) + "\n\n").encode()
+                    for kind, payload in events)
+
+
+def anthropic_tool(name="read_file", arguments='{"path":"sentinel.txt"}'):
+    """Independently authored Messages tool fixture, split inside its JSON.
+
+    Muse must execute this call itself. The next request, not a log message
+    or response substring, establishes that the tool result was replayed.
+    """
+    middle = max(1, len(arguments) // 2)
+    events = [
+        ("message_start", {"message": {"id": "msg_tool_peer", "type": "message", "role": "assistant",
+                                         "content": [], "usage": {"input_tokens": 4, "output_tokens": 0}}}),
+        ("content_block_start", {"index": 0, "content_block": {
+            "type": "tool_use", "id": "fixture-messages-call", "name": name, "input": {}}}),
+        ("content_block_delta", {"index": 0, "delta": {"type": "input_json_delta", "partial_json": arguments[:middle]}}),
+        ("content_block_delta", {"index": 0, "delta": {"type": "input_json_delta", "partial_json": arguments[middle:]}}),
+        ("content_block_stop", {"index": 0}),
+        ("message_delta", {"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
         ("message_stop", {}),
     ]
     return b"".join(("event: " + kind + "\ndata: " + json.dumps({"type": kind, **payload}) + "\n\n").encode()
@@ -103,6 +126,9 @@ class Peer:
         self.hold_after = hold_after
         self.release = threading.Event()
         self.requests = []
+        self.request_times = []
+        self.request_paths = []
+        self.request_headers = []
         self.errors = []
 
     def handler(self):
@@ -115,6 +141,7 @@ class Peer:
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers["Content-Length"]))
                 status = 200
+                headers = {}
                 if self.path.endswith("GetUserJwt"):
                     body, mime = field(1, "fixture-jwt"), "application/proto"
                 elif self.path.endswith("GetCliModelConfigs"):
@@ -132,11 +159,19 @@ class Peer:
                             request = json.loads(raw)
                             mime = "text/event-stream"
                         peer.requests.append(request)
+                        peer.request_times.append(time.monotonic())
+                        peer.request_paths.append(self.path)
+                        peer.request_headers.append(dict(self.headers))
                         if not peer.turns:
                             raise ValueError("unexpected extra inference request")
                         turn = peer.turns.pop(0)
                         if isinstance(turn, tuple):
-                            status, body = turn
+                            # Existing (status, body) fixtures remain valid;
+                            # optional headers exercise HTTP retry advice.
+                            if len(turn) not in (2, 3):
+                                raise ValueError("fixture turn must be (status, body[, headers])")
+                            status, body, *extra = turn
+                            headers = extra[0] if extra else {}
                             mime = "application/json"
                         else:
                             body = turn
@@ -146,6 +181,8 @@ class Peer:
                 self.send_response(status)
                 self.send_header("Content-Type", mime)
                 self.send_header("Content-Length", str(len(body)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 try:
                     if peer.hold_after is not None and self.path.endswith(("GetChatMessage", "/responses")):
@@ -187,6 +224,10 @@ def gateway(directory, peer, **settings):
         options.update(settings)
         if options["provider"] in {"devin", "claude"}:
             options["upstream"] = upstream
+        elif options["provider"] == "kiro":
+            options.setdefault("kiro_upstream", upstream + "/v1")
+            options.setdefault("kiro_api_key", "fixture-kiro-proxy-token")
+            options["upstream"] = options["kiro_upstream"]
         config = Config(argparse.Namespace(**options))
         # Config's auto route has no codex_upstream constructor override.
         config.codex_upstream = upstream

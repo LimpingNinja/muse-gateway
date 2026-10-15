@@ -3,11 +3,12 @@
 #
 # Thin wrapper around `python muse_gateway.py launch` (same as the installed
 # `muse-gateway launch` command). All arguments forward unchanged: launcher
-# options (--port, --check-only, --local-*) come first, then Muse subcommands
+# options (--port, --check-only, --local-*, --kiro-*) come first, then Muse subcommands
 # (resume, exec), flags (--model, --yolo), and --help, which passes through
 # to `muse`. Your working directory is preserved for the Muse process.
 # If the port already serves a compatible gateway (e.g. from another
-# terminal), Muse attaches to it instead of starting a new one.
+# terminal), Muse attaches to it instead of starting a new one. A Kiro-configured
+# launch requires a free port so this terminal's proxy settings are not ignored.
 #
 # Meta models ride your `muse login` subscription (OAuth) via header
 # forwarding, so no Meta API key is configured. Codex uses your existing

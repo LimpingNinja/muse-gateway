@@ -104,6 +104,12 @@ class GatewayContracts(unittest.TestCase):
             with self.subTest(label=label):
                 _, wire = post(base, {"model": "claude/claude-test", "input": "hello", "stream": True})
                 self.assertEqual(consume(wire)["status"], "failed", "FAILURE_SURFACE: Claude failure reported success")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            post(base, {"model": "claude/claude-test", "input": "continue", "previous_response_id": "resp_missing"})
+        with caught.exception as response:
+            self.assertEqual(response.code, 400)
+            self.assertIn("durable response-state", json.load(response)["error"]["message"])
+        self.assertEqual(len(peer.requests), 3, "Unsupported native state must fail before opening the upstream")
 
     def test_small_frame_is_visible_while_upstream_is_still_blocked(self):
         first = chat("READY")
@@ -142,6 +148,7 @@ class GatewayContracts(unittest.TestCase):
             "incomplete stop": chat("partial", stop=1) + TRAILER,
             "partial stop": chat("partial", stop=9) + TRAILER,
             "error trailer": chat("partial") + envelope(b'{"error":{"code":"internal","message":"fixture failure"}}', 2),
+            "max tokens": chat("partial", stop=3) + TRAILER,
         }
         peer = Peer(list(scenarios.values()))
         base = self.start(peer)
@@ -149,8 +156,12 @@ class GatewayContracts(unittest.TestCase):
             with self.subTest(label=label):
                 _, wire = post(base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
                 final = consume(wire)
-                self.assertEqual(final["status"], "failed", "FAILURE_SURFACE: partial stream reported success")
-                self.assertTrue(final["error"]["message"])
+                self.assertEqual(final["status"], "incomplete" if label == "max tokens" else "failed",
+                                 "FAILURE_SURFACE: partial stream reported success")
+                if label == "max tokens":
+                    self.assertEqual(final["incomplete_details"], {"reason": "max_output_tokens"})
+                else:
+                    self.assertTrue(final["error"]["message"])
 
     def test_empty_and_http_error_are_json_errors_before_stream_headers(self):
         peer = Peer([b"", (503, b'{"error":{"message":"unavailable"}}')])
@@ -209,13 +220,20 @@ class GatewayContracts(unittest.TestCase):
                     {"type": "function_call_output", "call_id": tool["call_id"], "output": "RESULT_SENTINEL"},
                     {"role": "user", "content": "Continue"}]
         original = json.loads(json.dumps(history))
-        _, wire = post(base, {"model": "codex/gpt-5.4", "input": history, "stream": True})
+        controls = {"reasoning": {"effort": "xhigh"}, "include": ["reasoning.encrypted_content"],
+                    "prompt_cache_key": "cache-sentinel", "max_output_tokens": 1234,
+                    "previous_response_id": "resp_foreign"}
+        _, wire = post(base, {"model": "codex/gpt-5.4", "input": history, "stream": True, **controls})
         self.assertEqual(wire, codex)
         self.assertEqual(consume(wire)["status"], "completed")
         self.assertEqual(len(peer.requests), 4, "CODEX_RECOVERY: expected exactly one retry")
         first, recovered = peer.requests[-2:]
         for outgoing in (first, recovered):
             self.assertFalse(outgoing["store"])
+            self.assertNotIn("max_output_tokens", outgoing)
+            self.assertNotIn("previous_response_id", outgoing)
+            for key in ("reasoning", "include", "prompt_cache_key"):
+                self.assertEqual(outgoing[key], controls[key])
             ids = [item["id"] for item in outgoing["input"] if "id" in item]
             self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9_-]+", value) for value in ids), "CODEX_ID: invalid replay ID")
             replayed = next(item for item in outgoing["input"] if item.get("type") == "function_call")

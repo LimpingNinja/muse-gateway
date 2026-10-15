@@ -15,6 +15,7 @@ generated ``devin_pb2`` bindings.
 """
 
 import gzip
+import hashlib
 import io
 import json
 import re
@@ -565,14 +566,23 @@ def iter_chat_frames(response, chunk_bytes=65536):
                 try:
                     raw = decompress_frame(payload) if flags & CONNECT_COMPRESSED_FLAG else payload
                     if flags & CONNECT_END_STREAM_FLAG:
-                        safe = capture.redact(raw)
-                        capture.bytes(label + ".trailer", raw)
-                        capture.event("devin.chat.trailer")
+                        # ADDITIVE: scrub semantic JSON strings as well as
+                        # full credentials. Malformed opaque trailers follow
+                        # the capture-only omission path below, not raw fallback.
+                        trailer = json.loads(raw)
+                        capture.json(label + ".trailer", trailer)
+                        safe = json.dumps(capture.sanitize(trailer), ensure_ascii=True,
+                                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+                        capture.bytes(label + ".trailer", safe)
+                        capture.event("devin.chat.trailer", original_bytes=len(raw),
+                                      original_sha256=hashlib.sha256(raw).hexdigest(),
+                                      representation="credentials_scrubbed_json")
                     else:
                         message = devin_pb2.GetChatMessageResponse()
                         message.ParseFromString(raw)
-                        scrubbed = capture.protobuf(label, message, raw)
-                        safe = raw if capture.redact(raw) == raw else scrubbed
+                        # ADDITIVE: raw byte matching cannot see a truncated
+                        # credential at a protobuf string's semantic EOF.
+                        safe = capture.protobuf(label, message, raw)
                     kept_payload = payload if safe == raw else (gzip.compress(safe, mtime=0) if flags & CONNECT_COMPRESSED_FLAG else safe)
                     capture._append("devin.chat.response.connect", frame_message(kept_payload, flags))
                 except Exception as error:

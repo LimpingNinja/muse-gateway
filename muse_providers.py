@@ -161,10 +161,12 @@ def validate_claude_token_url(url: str, *, allow_host_override: bool = False) ->
 class ProviderError(Exception):
     """An error safe to expose to the local Muse client."""
 
-    def __init__(self, message: str, *, status: int = 400, code: str = "provider_error"):
+    def __init__(self, message: str, *, status: int = 400, code: str = "provider_error",
+                 metadata: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.metadata = metadata
 
 
 class AuthError(ProviderError):
@@ -1441,6 +1443,13 @@ class ToolNameMap:
     def decode(self, name: str) -> str:
         return self.wire_to_original.get(name, _decode_wire_tool_name(name, self.oauth))
 
+    def decode_call_id(self, call_id: str) -> str:
+        # Retain native Claude's legacy OAuth mapping. Non-OAuth aliases
+        # describe tool names only; Kiro call IDs are a separate namespace.
+        if self.oauth:
+            return self.wire_to_original.get(call_id, call_id)
+        return call_id
+
 
 def _responses_tool_parts(tool: Mapping[str, Any]) -> tuple[str, str, Any] | None:
     if tool.get("type") != "function":
@@ -1848,11 +1857,33 @@ def _responses_function_id(raw_id: str, call_id: str) -> str:
     return "fc_" + digest
 
 
+def _anthropic_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
+    # Keep the caller's input total: Kiro may already have estimated it.
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens")) or 0
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens")) or 0
+    result = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    details = {}
+    for source, target in (
+        ("cache_read_input_tokens", "cached_tokens"),
+        ("cache_creation_input_tokens", "anthropic_cache_creation_input_tokens"),
+    ):
+        if source in usage:
+            details[target] = usage[source]
+    if details:
+        result["input_tokens_details"] = details
+    return result
+
+
 def anthropic_json_to_responses(
     payload: Mapping[str, Any],
     *,
     model: str | None = None,
     tool_names: ToolNameMap | None = None,
+    coalesce_text: bool = False,
 ) -> dict[str, Any]:
     tool_names = tool_names or ToolNameMap(oauth=False)
     if payload.get("type") == "error":
@@ -1866,6 +1897,7 @@ def anthropic_json_to_responses(
             "error": {
                 "message": str(error.get("message") or "Claude returned an error."),
                 "type": str(error.get("type") or "upstream_error"),
+                "code": str(error.get("type") or "upstream_error"),
             },
         }
     raw_response_id = str(payload.get("id") or "")
@@ -1884,7 +1916,7 @@ def anthropic_json_to_responses(
             continue
         block_type = block.get("type")
         if block_type == "text":
-            if text_message is None or not output or output[-1] is not text_message:
+            if text_message is None or (not coalesce_text and output[-1] is not text_message):
                 text_message = {
                     "type": "message",
                     "id": "msg_" + hashlib.sha256(response_id.encode("utf-8")).hexdigest()[:20],
@@ -1893,6 +1925,9 @@ def anthropic_json_to_responses(
                     "content": [],
                 }
                 output.append(text_message)
+            if coalesce_text and text_message["content"]:
+                text_message["content"][0]["text"] += str(block.get("text") or "")
+                continue
             text_message["content"].append(
                 {
                     "type": "output_text",
@@ -1902,7 +1937,7 @@ def anthropic_json_to_responses(
             )
         elif block_type == "tool_use":
             raw_id = str(block.get("id") or "tool_" + str(index))
-            call_id = tool_names.wire_to_original.get(raw_id, raw_id)
+            call_id = tool_names.decode_call_id(raw_id)
             name = tool_names.decode(str(block.get("name") or ""))
             arguments = block.get("input", {})
             if not isinstance(arguments, str):
@@ -1927,13 +1962,7 @@ def anthropic_json_to_responses(
         "output": output,
     }
     if usage:
-        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
-        output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
-        result["usage"] = {
-            "input_tokens": input_tokens or 0,
-            "output_tokens": output_tokens or 0,
-            "total_tokens": (input_tokens or 0) + (output_tokens or 0),
-        }
+        result["usage"] = _anthropic_usage(usage)
     if status == "incomplete":
         result["incomplete_details"] = {"reason": "max_output_tokens"}
     return result
@@ -1952,6 +1981,8 @@ class StreamState:
     error_type: str | None = None
     started: bool = False
     finished: bool = False
+    coalesce_text: bool = False
+    _coalesced_text: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def ensure_id(self, value: Any = None) -> None:
         if self.response_id:
@@ -1972,17 +2003,14 @@ class StreamState:
             "output": copy.deepcopy(self.output),
         }
         if self.usage:
-            result["usage"] = {
-                "input_tokens": self.usage.get("input_tokens", 0),
-                "output_tokens": self.usage.get("output_tokens", 0),
-                "total_tokens": self.usage.get("input_tokens", 0) + self.usage.get("output_tokens", 0),
-            }
+            result["usage"] = _anthropic_usage(self.usage)
         if status == "incomplete":
             result["incomplete_details"] = {"reason": "max_output_tokens"}
         if status == "failed" and self.error_message:
             result["error"] = {
                 "message": self.error_message,
                 "type": self.error_type or "upstream_error",
+                "code": self.error_type or "upstream_error",
             }
         return result
 
@@ -2009,8 +2037,9 @@ def convert_anthropic_event(
         if not state.model:
             state.model = message.get("model")
         usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-        if isinstance(usage.get("input_tokens"), int):
-            state.usage["input_tokens"] = usage["input_tokens"]
+        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            if isinstance(usage.get(key), int):
+                state.usage[key] = usage[key]
         if not state.started:
             state.started = True
             events.append(
@@ -2051,6 +2080,9 @@ def convert_anthropic_event(
         block = data.get("content_block") if isinstance(data.get("content_block"), dict) else {}
         block_type = block.get("type")
         if block_type == "text":
+            if state.coalesce_text and state._coalesced_text is not None:
+                state.blocks[index] = state._coalesced_text
+                return events
             item_id = "msg_" + hashlib.sha256(f"{state.response_id}:{index}".encode()).hexdigest()[:20]
             item = {
                 "type": "message",
@@ -2060,12 +2092,14 @@ def convert_anthropic_event(
                 "content": [],
             }
             state.blocks[index] = {"kind": "text", "item": item, "text": "", "content_index": 0}
+            if state.coalesce_text:
+                state._coalesced_text = state.blocks[index]
             state.output.append(item)
             events.append(("response.output_item.added", _event_payload("response.output_item.added", {"output_index": len(state.output) - 1, "item": copy.deepcopy(item)})))
             events.append(("response.content_part.added", _event_payload("response.content_part.added", {"item_id": item_id, "output_index": len(state.output) - 1, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})))
         elif block_type == "tool_use":
             raw_id = str(block.get("id") or f"tool_{index}")
-            call_id = state.tool_names.wire_to_original.get(raw_id, raw_id)
+            call_id = state.tool_names.decode_call_id(raw_id)
             name = state.tool_names.decode(str(block.get("name") or ""))
             item_id = _responses_function_id(raw_id, call_id)
             item = {
@@ -2108,6 +2142,8 @@ def convert_anthropic_event(
         block = state.blocks.get(index)
         if not block:
             return events
+        if state.coalesce_text and block.get("kind") == "text":
+            return events  # This assistant message stays open until message_stop.
         item = block["item"]
         output_index = state.output.index(item)
         if block.get("kind") == "text":
@@ -2126,7 +2162,7 @@ def convert_anthropic_event(
         if delta.get("stop_reason") is not None:
             state.stop_reason = str(delta.get("stop_reason"))
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        for key in ("input_tokens", "output_tokens"):
+        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
             if isinstance(usage.get(key), int):
                 state.usage[key] = usage[key]
         return events
@@ -2141,6 +2177,18 @@ def convert_anthropic_event(
         return events
 
     if event_type == "message_stop":
+        if state.coalesce_text and state._coalesced_text is not None:
+            block = state._coalesced_text
+            item = block["item"]
+            output_index = state.output.index(item)
+            part = {"type": "output_text", "text": block["text"], "annotations": []}
+            item["content"] = [part]
+            item["status"] = "completed"
+            events.extend([
+                ("response.output_text.done", _event_payload("response.output_text.done", {"item_id": item["id"], "output_index": output_index, "content_index": 0, "text": block["text"]})),
+                ("response.content_part.done", _event_payload("response.content_part.done", {"item_id": item["id"], "output_index": output_index, "content_index": 0, "part": copy.deepcopy(part)})),
+                ("response.output_item.done", _event_payload("response.output_item.done", {"output_index": output_index, "item": copy.deepcopy(item)})),
+            ])
         status = (
             "incomplete"
             if state.stop_reason == "max_tokens"

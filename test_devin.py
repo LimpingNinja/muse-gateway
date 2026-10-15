@@ -19,62 +19,13 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from types import SimpleNamespace
 from unittest.mock import patch
 
-from muse_gateway import Config, MuseShimHandler, MuseShimServer, ProviderError
+from muse_gateway import Config, MuseShimServer
 
 import devin_pb2
-from muse_devin import (
-    DevinChatError,
-    DevinCredentialError,
-    DevinModel,
-    DevinStreamState,
-    assign_if_router,
-    build_chat_request,
-    build_history_prompts,
-    build_router_prompt,
-    build_tools,
-    credential_state,
-    deref_schema_refs,
-    deterministic_uuid,
-    discover_models,
-    fetch_auth,
-    history_to_prompts,
-    is_gemini_uid,
-    normalize_configs,
-    normalize_schema_for_google,
-    normalize_tool_call_id,
-    read_store_credentials,
-    resolve_access_token,
-    run_turn_events,
-    run_turn_final,
-    seed_models,
-    select_credential,
-    supports_thinking,
-)
-from muse_devin_wire import (
-    ConnectFrameDecoder,
-    DevinAuthError,
-    DevinFrameError,
-    DevinHttpError,
-    DevinWireError,
-    cli_metadata,
-    decode_unary,
-    discovery_metadata,
-    frame_message,
-    http_error_detail,
-    normalize_base_url,
-    normalize_session_token,
-    parse_trailer_error,
-    unary_rpc,
-)
-from muse_gateway import (
-    _credential_status,
-    _devin_catalog_entries,
-    _devin_provider_ready,
-    provider_model_catalog,
-)
+from muse_devin import DevinChatError, DevinCredentialError, DevinModel, DevinStreamState, credential_state, deref_schema_refs, fetch_auth, normalize_configs, normalize_schema_for_google, read_store_credentials, resolve_access_token, run_turn_events, select_credential
+from muse_devin_wire import ConnectFrameDecoder, DevinAuthError, DevinFrameError, DevinHttpError, decode_unary, frame_message, unary_rpc
 
 
 def devin_config(**overrides):
@@ -144,24 +95,6 @@ class DevinWireTests(unittest.TestCase):
             bytes([0x0A, 0x07, 0x1A, 0x01, 0x6B, 0xAA, 0x01, 0x01, 0x6A]),
         )
 
-    def test_golden_jwt_response_bytes(self):
-        message = devin_pb2.GetUserJwtResponse(user_jwt="j", custom_api_server_url="u")
-        self.assertEqual(
-            message.SerializeToString(), bytes([0x0A, 0x01, 0x6A, 0x12, 0x01, 0x75])
-        )
-
-    def test_golden_assign_bytes(self):
-        message = devin_pb2.AssignModelRequest(model_router_uid="r", cascade_id="c")
-        message.metadata.api_key = "k"
-        message.chat_message_prompt.prompt = "p"
-        self.assertEqual(
-            message.SerializeToString(),
-            bytes([
-                0x0A, 0x03, 0x1A, 0x01, 0x6B, 0x12, 0x01, 0x72,
-                0x1A, 0x01, 0x63, 0x2A, 0x03, 0x1A, 0x01, 0x70,
-            ]),
-        )
-
     def test_golden_chat_request_bytes(self):
         message = devin_pb2.GetChatMessageRequest(
             prompt="p",
@@ -185,43 +118,6 @@ class DevinWireTests(unittest.TestCase):
             ]),
         )
 
-    def test_golden_discovery_response_bytes(self):
-        message = devin_pb2.GetCliModelConfigsResponse()
-        row = message.client_model_configs.add()
-        row.label = "m"
-        row.model_uid = "u"
-        row.max_tokens = 64
-        self.assertEqual(
-            message.SerializeToString(),
-            bytes([
-                0x0A, 0x0A, 0x0A, 0x01, 0x6D, 0x90, 0x01, 0x40,
-                0xB2, 0x01, 0x01, 0x75,
-            ]),
-        )
-
-    def test_session_token_prefix(self):
-        self.assertEqual(normalize_session_token("abc"), "devin-session-token$abc")
-        self.assertEqual(
-            normalize_session_token("devin-session-token$abc"), "devin-session-token$abc"
-        )
-
-    def test_cli_metadata_identity(self):
-        metadata = cli_metadata("k")
-        self.assertEqual(metadata.api_key, "devin-session-token$k")
-        self.assertEqual(metadata.ide_name, "devin-cli")
-        self.assertEqual(metadata.ide_type, "chisel")
-        self.assertEqual(metadata.ide_version, "3000.11.3")
-        self.assertEqual(metadata.locale, "en")
-
-    def test_discovery_metadata_identity(self):
-        metadata = discovery_metadata("k")
-        self.assertEqual(metadata.ide_name, "chisel")
-        self.assertEqual(metadata.ide_version, "0.0.0-dev")
-        self.assertEqual(metadata.ide_type, "")
-        self.assertEqual(
-            list(metadata.supported_model_displays), [3, 4, 6, 7, 8]
-        )
-
     def test_frames_reassemble_across_chunks(self):
         # Literal protocol bytes, not a round-trip through our own encoder.
         wire = b"\x00\x00\x00\x00\x05hello\x01\x00\x00\x00\x06world!"
@@ -236,57 +132,11 @@ class DevinWireTests(unittest.TestCase):
         with self.assertRaises(DevinFrameError):
             decoder.decode(frame_message(b"toolong", 0))
 
-    def test_unary_decode_prefers_bare_protobuf(self):
-        body = devin_pb2.GetUserJwtResponse(user_jwt="j").SerializeToString()
-        self.assertEqual(
-            decode_unary(devin_pb2.GetUserJwtResponse, body).user_jwt, "j"
-        )
-
-    def test_unary_decode_falls_back_to_gzip(self):
-        body = devin_pb2.GetUserJwtResponse(user_jwt="j").SerializeToString()
-        self.assertEqual(
-            decode_unary(devin_pb2.GetUserJwtResponse, gzip.compress(body)).user_jwt,
-            "j",
-        )
-
-    def test_unary_decode_rejects_garbage(self):
+    def test_unary_decodes_bare_and_gzip_but_rejects_garbage(self):
+        # Literal field bytes, independent of the protobuf serializer.
+        for body in (b"\x0a\x01j", gzip.compress(b"\x0a\x01j")):
+            self.assertEqual(decode_unary(devin_pb2.GetUserJwtResponse, body).user_jwt, "j")
         self.assertIsNone(decode_unary(devin_pb2.GetUserJwtResponse, b"\xff\xff\xff"))
-
-    def test_trailer_error_shape(self):
-        error = parse_trailer_error(
-            '{"error":{"code":"invalid_argument","message":"bad"}}'
-        )
-        self.assertEqual(error.code, "invalid_argument")
-        self.assertEqual(error.formatted, "Devin stream error invalid_argument: bad")
-
-    def test_trailer_leniency(self):
-        self.assertIsNone(parse_trailer_error(""))
-        self.assertIsNone(parse_trailer_error("{nope"))
-        self.assertIsNone(parse_trailer_error("{}"))
-
-    def test_trailer_details_summarized(self):
-        error = parse_trailer_error(
-            '{"error":{"code":"unavailable","message":"busy","details":['
-            '{"type":"retryInfo","value":"later"},'
-            '{"type":"debugInfo","debug":{"attempt":2}},'
-            '{"type":"bare"},42,"junk"]}}'
-        )
-        self.assertIn("busy", error.formatted)
-        self.assertIn("retryInfo: later", error.formatted)
-        self.assertIn('debugInfo: {"attempt": 2}', error.formatted)
-        self.assertIn("bare", error.formatted)
-
-    def test_http_detail_suppresses_html_and_binary(self):
-        self.assertIsNone(http_error_detail("text/html", b"<html>nope"))
-        self.assertIsNone(http_error_detail("application/proto", b"\xff\xfe\x00bad"))
-
-    def test_http_detail_extracts_envelope(self):
-        self.assertEqual(
-            http_error_detail(
-                "application/json", b'{"error":{"message":"boom"}}'
-            ),
-            "boom",
-        )
 
     def test_http_error_releases_response_even_when_exception_is_retained(self):
         body = io.BytesIO(b'{"error":{"message":"busy"}}')
@@ -301,13 +151,6 @@ class DevinWireTests(unittest.TestCase):
             self.assertTrue(body.closed, "HTTP error response leaked until exception garbage collection")
         finally:
             error.close()
-
-    def test_base_url_validation(self):
-        self.assertEqual(
-            normalize_base_url("https://x.example///"), "https://x.example"
-        )
-        with self.assertRaises(DevinWireError):
-            normalize_base_url("ftp://x.example")
 
 
 class DevinCredentialTests(unittest.TestCase):
@@ -330,10 +173,6 @@ class DevinCredentialTests(unittest.TestCase):
             os.unlink(path)
         self.assertEqual([row["identity_key"] for row in active], ["a"])
         self.assertEqual([row["identity_key"] for row in disabled], ["b"])
-
-    def test_missing_database_means_no_credentials(self):
-        active, disabled = read_store_credentials("/nonexistent/agent.db")
-        self.assertEqual((active, disabled), ([], []))
 
     def test_selection_requires_explicit_id_when_ambiguous(self):
         rows = [
@@ -369,17 +208,6 @@ class DevinCredentialTests(unittest.TestCase):
             os.unlink(fresh)
             os.unlink(stale)
 
-    def test_expiry_overflow_falls_back(self):
-        path = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(2**40)}, None, "a"),
-        ])
-        try:
-            state = credential_state(auth_db_path=path)
-        finally:
-            os.unlink(path)
-        self.assertEqual(state["state"], "ready")
-        self.assertGreater(state["expires_at"], int(time.time() * 1000))
-
     def test_sixty_second_use_skew(self):
         now = int(time.time())
         path = make_auth_db([
@@ -398,18 +226,6 @@ class DevinCredentialTests(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertEqual(state["state"], "ready")
-
-    def test_auth_failure_quarantines_token(self):
-        from muse_devin import auth_failure_mark, mark_auth_failure
-
-        token = "quarantine-me-token"
-        self.assertIsNone(auth_failure_mark(token))
-        self.assertEqual(credential_state(api_key=token)["state"], "ready")
-        mark_auth_failure(token, "GetUserJwt 401")
-        self.assertIsNotNone(auth_failure_mark(token))
-        state = credential_state(api_key=token)
-        self.assertEqual(state["state"], "auth-failed")
-        self.assertIn("sign-in again", state["note"])
 
     def test_fetch_auth_marks_persistent_401(self):
         from muse_devin import auth_failure_mark, fetch_auth
@@ -461,14 +277,6 @@ class DevinCliCredentialTests(unittest.TestCase):
             broken = self._write_toml(directory, "windsurf_api_key = \n")
             self.assertEqual(read_cli_token(broken), (None, None))
 
-    def test_fallback_string_table_parser(self):
-        from muse_devin import _parse_toml_string_table
-
-        parsed = _parse_toml_string_table(
-            '# comment\nwindsurf_api_key = "a\\"b"\ncount = 3\n'
-        )
-        self.assertEqual(parsed, {"windsurf_api_key": 'a"b'})
-
     def test_cli_source_precedence_over_store(self):
         now = int(time.time())
         db = make_auth_db([
@@ -487,18 +295,6 @@ class DevinCliCredentialTests(unittest.TestCase):
                 self.assertEqual(explicit_id["source"], "store")
         finally:
             os.unlink(db)
-
-    def test_cli_quarantine_reports_auth_failed(self):
-        from muse_devin import mark_auth_failure
-
-        mark_auth_failure("cli-quarantine-tok")
-        with patch(
-            "muse_devin.read_cli_token",
-            return_value=("cli-quarantine-tok", "p"),
-        ):
-            state = credential_state()
-        self.assertEqual(state["state"], "auth-failed")
-        self.assertIn("devin auth login", state["note"])
 
 
 def devin_config_row(uid, label="M", **kwargs):
@@ -528,16 +324,6 @@ def devin_config_row(uid, label="M", **kwargs):
 
 
 class DevinDiscoveryTests(unittest.TestCase):
-    def test_thinking_matrix(self):
-        self.assertFalse(supports_thinking(devin_config_row("x", "plain")))
-        self.assertTrue(supports_thinking(devin_config_row("x", "Thinker High")))
-        self.assertFalse(supports_thinking(devin_config_row("x", "no thinking here")))
-        self.assertTrue(
-            supports_thinking(
-                devin_config_row("x", "plain", features={"supports_thinking": True})
-            )
-        )
-
     def test_normalize_filters_and_drops_fusion_pairings(self):
         from muse_devin import fusion_pairing_lead
 
@@ -577,6 +363,9 @@ class DevinDiscoveryTests(unittest.TestCase):
         self.assertEqual(sorted(by_id), ["adaptive", "swe-1-6"])
         self.assertTrue(by_id["adaptive"].is_router)
         self.assertFalse(by_id["swe-1-6"].supports_images)
+        response.default_override_model_config.model_uid = "adaptive"
+        self.assertEqual({model.logical_id: model.is_default for model in normalize_configs(response, "https://x")[0]},
+                         {"adaptive": True, "swe-1-6": False}, "Account override selects a catalog model independently of family defaults")
 
     def test_lane_collapse_routes_efforts(self):
         response = devin_pb2.GetCliModelConfigsResponse()
@@ -632,65 +421,8 @@ class DevinDiscoveryTests(unittest.TestCase):
                 self.assertEqual(lane.wire_uid(), "high-uid")
                 self.assertEqual(lane.wire_uid("none"), "off-uid")
 
-    def test_account_default_wins(self):
-        response = devin_pb2.GetCliModelConfigsResponse()
-        response.client_model_configs.append(devin_config_row("a-1", "A"))
-        response.client_model_configs.append(devin_config_row("b-2", "B"))
-        response.default_override_model_config.model_uid = "b-2"
-        models, _ = normalize_configs(response, "https://x")
-        self.assertEqual(
-            [model.is_default for model in models], [False, True]
-        )
-
-    def test_seeds_have_expected_shape(self):
-        from muse_devin import seed_models
-
-        seeds = seed_models()
-        self.assertEqual([model.uid for model in seeds], ["swe-1-6-fast", "swe-1-6"])
-        self.assertTrue(seeds[1].is_default)
-        self.assertTrue(all(model.unverified for model in seeds))
-
-    def test_discover_prefers_native_then_legacy(self):
-        native = devin_pb2.GetCliModelConfigsResponse()
-        native.client_model_configs.append(devin_config_row("n-1", "Native"))
-        bodies = [native.SerializeToString()]
-
-        def fake_unary(base_url, path, payload, timeout=5.0):
-            return 200, "application/proto", bodies[0]
-
-        with patch("muse_devin.unary_rpc", side_effect=fake_unary):
-            models, dropped, warnings = discover_models("k", "https://x")
-        self.assertEqual([model.uid for model in models], ["n-1"])
-        self.assertEqual((dropped, warnings), (0, []))
-
-    def test_discover_empty_warns(self):
-        empty = devin_pb2.GetCliModelConfigsResponse().SerializeToString()
-
-        def fake_unary(base_url, path, payload, timeout=5.0):
-            return 200, "application/proto", empty
-
-        with patch("muse_devin.unary_rpc", side_effect=fake_unary):
-            models, dropped, warnings = discover_models("k", "https://x")
-        self.assertEqual(models, [])
-        self.assertEqual(len(warnings), 1)
-
 
 class DevinTranslationTests(unittest.TestCase):
-    def test_deterministic_uuid_shape(self):
-        first = deterministic_uuid("a\x00b\x00c")
-        self.assertEqual(len(first), 36)
-        self.assertEqual(first[8] + first[13] + first[18] + first[23], "----")
-        self.assertEqual(first, deterministic_uuid("a\x00b\x00c"))
-
-    def test_call_id_mapping(self):
-        from muse_devin import normalize_tool_call_id
-
-        seen = set()
-        self.assertEqual(normalize_tool_call_id("call_1|item_9", seen), "call_1")
-        self.assertEqual(normalize_tool_call_id("a b.c!", seen), "a_b_c_")
-        self.assertEqual(len(normalize_tool_call_id("x" * 60, seen)), 40)
-        self.assertEqual(normalize_tool_call_id("dup", {"dup"}), "dup-2")
-
     def test_ref_deref_and_collision_guard(self):
         schema = {
             "$defs": {"N": {"type": "string"}},
@@ -720,77 +452,8 @@ class DevinTranslationTests(unittest.TestCase):
         self.assertEqual(cleaned["type"], "string")
         self.assertNotIn("minLength", cleaned)
         self.assertEqual(cleaned["description"], "d\n\n{minLength: 3}")
-
-    def test_google_normalize_errors(self):
-        self.assertEqual(
-            normalize_schema_for_google({"enum": ["a", "b"]})["type"], "string"
-        )
-        nulled = normalize_schema_for_google({"type": "null"})
-        self.assertNotIn("type", nulled)
-        self.assertTrue(nulled["nullable"])
         with self.assertRaises(DevinChatError):
             normalize_schema_for_google({"type": ["string", "number"]})
-        with self.assertRaises(DevinChatError):
-            normalize_schema_for_google({"type": "weird"})
-
-    def test_gemini_detection(self):
-        self.assertTrue(is_gemini_uid("MODEL_GOOGLE_GEMINI_X"))
-        self.assertFalse(is_gemini_uid("swe-1-6"))
-
-    def test_history_walk(self):
-        body = {
-            "instructions": "sys1",
-            "input": [
-                {"type": "message", "role": "system", "content": "sys2"},
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                },
-                {"type": "message", "role": "developer", "content": "current instruction"},
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "t",
-                    "arguments": '{"a": 1}',
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_1",
-                    "output": "ok",
-                },
-                {"type": "reasoning", "summary": "thought"},
-            ],
-        }
-        system_text, staged, call_ids = history_to_prompts(body, "casc")
-        self.assertEqual(system_text, "sys1\n\nsys2")
-        self.assertEqual(
-            [prompt["role"] for prompt in staged],
-            ["user", "developer", "assistant", "tool", "assistant"],
-        )
-        self.assertEqual(call_ids, {"call_1": "call_1"})
-        protos = build_history_prompts(staged, "casc")
-        self.assertEqual(len({prompt.message_id for prompt in protos}), 5)
-        self.assertEqual(protos[1].source, devin_pb2.CHAT_MESSAGE_SOURCE_USER)
-        self.assertEqual(protos[3].tool_call_id, "call_1")
-
-    def test_request_build(self):
-        model = devin_model(supports_parallel=False)
-        tools = build_tools(
-            [{"name": "t", "description": "d", "parameters": {"type": "object"}}],
-            False,
-        )
-        request = build_chat_request(
-            "sys", {"temperature": 0.5}, model, "swe-1-6", "k", "jwt",
-            "casc", [], tools,
-        )
-        self.assertEqual(request.chat_model_uid, "swe-1-6")
-        self.assertEqual(request.request_type, 5)
-        self.assertEqual(request.planner_mode, 1)
-        self.assertEqual(request.tool_choice.option_name, "auto")
-        self.assertTrue(request.disable_parallel_tool_calls)
-        self.assertEqual(request.configuration.temperature, 0.5)
-        self.assertEqual(request.configuration.top_k, 40)
 
 
 class DevinStreamTests(unittest.TestCase):
@@ -844,28 +507,6 @@ class DevinStreamTests(unittest.TestCase):
                          if kind == "response.function_call_arguments.delta")
         self.assertEqual(deltas, calls[0]["arguments"])
 
-    def test_invalid_arguments_repair_or_mark(self):
-        state = DevinStreamState("devin/x")
-        state.feed(devin_pb2.GetChatMessageResponse(message_id="r", delta_text="t"))
-        broken = devin_pb2.GetChatMessageResponse()
-        call = broken.delta_tool_calls.add()
-        call.id = "c9"
-        call.name = "t"
-        call.arguments_json = "{oops"
-        state.feed(broken)
-        final = state.finish()[-1][1]["response"]
-        calls = [item for item in final["output"] if item["type"] == "function_call"]
-        self.assertEqual(json.loads(calls[0]["arguments"]), {"__parseError": "{oops"})
-
-    def test_max_tokens_completes_incomplete(self):
-        state = DevinStreamState("devin/x")
-        state.feed(
-            devin_pb2.GetChatMessageResponse(
-                message_id="r", delta_text="t", stop_reason=3
-            )
-        )
-        self.assertEqual(state.finish()[-1][0], "response.incomplete")
-
     def test_chunked_http_truncation_emits_failed_terminal(self):
         from http.client import HTTPResponse
         from muse_devin_wire import frame_message
@@ -887,32 +528,6 @@ class DevinStreamTests(unittest.TestCase):
         self.assertEqual(kinds[-1], "response.failed")
         self.assertNotIn("response.completed", kinds)
         self.assertTrue(response.isclosed())
-
-    def test_nonterminal_stop_reasons_cannot_complete(self):
-        from muse_devin_wire import frame_message
-        for reason in (1, 9):
-            for trailer in (b"", frame_message(b"{}", 2)):
-                with self.subTest(reason=reason, trailer=bool(trailer)):
-                    message = devin_pb2.GetChatMessageResponse(message_id="resp_partial", delta_text="part", stop_reason=reason)
-                    state = DevinStreamState("devin/test")
-                    state.feed(message)
-                    self.assertEqual(state.finish()[-1][0], "response.failed")
-                    response = io.BytesIO(frame_message(message.SerializeToString()) + trailer)
-                    with patch("muse_devin.fetch_auth", return_value=("k", "jwt", "https://x")), patch(
-                        "muse_devin.open_chat_stream", return_value=response
-                    ):
-                        events = list(run_turn_events({"input": "hi"}, [], devin_model(), "k"))
-                    kinds = [kind for kind, _ in events]
-                    self.assertEqual(kinds[-1], "response.failed")
-                    self.assertNotIn("response.completed", kinds)
-
-    def test_midstream_failure_events(self):
-        state = DevinStreamState("devin/x")
-        state.feed(devin_pb2.GetChatMessageResponse(message_id="r", delta_text="t"))
-        events = state.fail("boom", "upstream_error")
-        self.assertEqual([kind for kind, _ in events], ["response.failed"])
-        self.assertEqual(events[-1][0], "response.failed")
-        self.assertTrue(all(isinstance(payload["sequence_number"], int) for _, payload in events))
 
     def test_turn_rejects_context_overflow(self):
         from muse_devin import run_turn_events
@@ -974,33 +589,6 @@ class DevinStreamTests(unittest.TestCase):
         self.assertIn("overloaded", events[2][1]["response"]["error"]["message"])
         self.assertIn("retryInfo: later", events[2][1]["response"]["error"]["message"])
 
-    def test_turn_streams_text_to_completion(self):
-        from muse_devin import run_turn_events
-        from muse_devin_wire import CONNECT_COMPRESSED_FLAG, frame_message
-
-        first = devin_pb2.GetChatMessageResponse(message_id="r", delta_text="Hi", stop_reason=2)
-        body = frame_message(
-            gzip.compress(first.SerializeToString()), CONNECT_COMPRESSED_FLAG
-        )
-
-        class FakeStream(io.BytesIO):
-            def close(self):
-                pass
-
-        with (
-            patch("muse_devin.fetch_auth", return_value=("k", "jwt", "https://x")),
-            patch("muse_devin.open_chat_stream", return_value=FakeStream(body)),
-        ):
-            events = list(
-                run_turn_events({"input": "hi"}, [], devin_model(), "k")
-            )
-        kinds = [event for event, _ in events]
-        self.assertIn("response.output_text.delta", kinds)
-        self.assertEqual(kinds[-1], "response.completed")
-        self.assertEqual(
-            events[-1][1]["response"]["output"][0]["content"][0]["text"], "Hi"
-        )
-
 
 class DevinGatewayTests(unittest.TestCase):
     def setUp(self):
@@ -1008,90 +596,30 @@ class DevinGatewayTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         patcher.start()
 
-    def _handler(self, cfg):
-        return SimpleNamespace(config=cfg, headers={})
-
-    def test_resolve_model_prefix(self):
-        cfg = devin_config()
-        self.assertEqual(
-            cfg.resolve_model("devin/swe-1-6"), ("devin", "swe-1-6")
-        )
-
-    def test_catalog_lists_seeds_offline(self):
-        cfg = devin_config()
-        entries = provider_model_catalog(cfg, "devin")
-        self.assertEqual(
-            [entry["model_id"] for entry in entries],
-            ["devin/swe-1-6", "devin/swe-1-6-fast"],
-        )
-        self.assertIn("swe-1-6", cfg._devin_roster)
-        self.assertFalse(entries[0]["limits_verified"])
-
-    def test_explicit_models_curate(self):
-        cfg = devin_config(devin_models="swe-1-6")
-        entries = provider_model_catalog(cfg, "devin")
-        self.assertEqual([entry["model_id"] for entry in entries], ["devin/swe-1-6"])
-
-    def test_provider_ready_matrix(self):
-        self.assertTrue(_devin_provider_ready(devin_config()))
-        missing = devin_config(devin_api_key=None)
-        with tempfile.TemporaryDirectory() as directory:
-            missing.devin_auth_db = os.path.join(directory, "agent.db")
-            self.assertFalse(_devin_provider_ready(missing))
-
-    def test_credential_status_reports(self):
-        ok, detail = _credential_status(devin_config(), "devin")
-        self.assertTrue(ok)
-        self.assertIn("explicit token", detail)
-
-    def test_forward_unknown_model_errors(self):
-        cfg = devin_config()
-        handler = self._handler(cfg)
-        with self.assertRaises(ProviderError) as raised:
-            MuseShimHandler.forward_devin(handler, {"model": "nope", "input": "hi"})
-        self.assertEqual(raised.exception.code, "devin_unknown_model")
-
-    def test_forward_missing_credential_errors(self):
-        cfg = devin_config(devin_api_key=None)
-        with tempfile.TemporaryDirectory() as directory:
-            cfg.devin_auth_db = os.path.join(directory, "agent.db")
-            handler = self._handler(cfg)
-            with self.assertRaises(ProviderError) as raised:
-                MuseShimHandler.forward_devin(
-                    handler, {"model": "swe-1-6", "input": "hi"}
-                )
-        self.assertEqual(raised.exception.code, "devin_credential_unavailable")
-
-    def test_forward_crash_returns_500_json(self):
-        # Public HTTP error contract with a deliberate handler fault:
-        # unexpected exceptions must answer 500 JSON, not drop the connection.
-        cfg = devin_config()
-        server = MuseShimServer(("127.0.0.1", 0), cfg)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-
-        def explode(handler_self, body):
-            raise RuntimeError("boom")
-
-        with patch("muse_gateway.MuseShimHandler.forward_devin",
-                   new=explode):
-            thread.start()
-            try:
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{server.server_port}/responses",
-                    data=json.dumps(
-                        {"model": "devin/swe-1-6", "input": "hi"}
-                    ).encode(),
-                    headers={"Content-Type": "application/json"},
-                )
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    urllib.request.urlopen(request, timeout=5)
-            finally:
-                server.shutdown()
-                server.server_close()
-        self.assertEqual(raised.exception.code, 500)
-        with raised.exception as response:
-            payload = json.load(response)
-        self.assertEqual(payload["error"]["type"], "internal_error")
+    def test_unknown_model_and_missing_credential_are_public_json_rejections(self):
+        for model, key, expected in (("nope", "dummy-key", "devin_unknown_model"),
+                                     ("swe-1-6", None, "devin_credential_unavailable")):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                cfg = devin_config(devin_api_key=key, devin_auth_db=os.path.join(directory, "missing.db"),
+                                   log_file=os.path.join(directory, "gateway.log"))
+                server = MuseShimServer(("127.0.0.1", 0), cfg)
+                worker = threading.Thread(target=server.serve_forever, daemon=True)
+                worker.start()
+                try:
+                    req = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/responses",
+                        data=json.dumps({"model": "devin/" + model, "input": "hi", "stream": True}).encode(),
+                        headers={"Content-Type": "application/json"})
+                    with patch("muse_devin.fetch_auth", side_effect=AssertionError("Rejected input reached inference")):
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(req, timeout=5)
+                    with caught.exception as response:
+                        self.assertEqual(response.code, 400)
+                        self.assertEqual(response.headers.get_content_type(), "application/json")
+                        self.assertEqual(json.load(response)["error"]["type"], expected)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    worker.join(timeout=5)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 
 Modes:
 
-* ``auto`` advertises Meta, Codex, Claude, Devin, and configured local models to Muse
+* ``auto`` advertises Meta, Codex, Claude, Devin, Kiro, and configured local models to Muse
   and routes requests according to the selection in Muse's ``/model`` menu.
 * ``generic`` / ``http`` (the historical mode) forwards Responses requests
   to any Responses-compatible endpoint.
@@ -20,6 +20,8 @@ Modes:
   ``auto`` advertises ``local/`` aliases only when explicitly configured.
 * ``devin`` uses the Connect/protobuf API with a session token, Devin CLI login,
   or OMP credential store; the CLI is not used for inference.
+* ``kiro`` translates Responses through a separately configured Kiro Gateway
+  Messages service, using only that service's proxy key.
 
 The implementation needs a single runtime dependency (protobuf, for the
 Devin provider's generated bindings). Codex uses its ordinary
@@ -53,7 +55,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.client import HTTPException
+from http.client import HTTPException, IncompleteRead
 from typing import Any, Iterable
 
 from muse_providers import (
@@ -90,13 +92,18 @@ from muse_providers import (
     validate_codex_token_url,
 )
 import muse_devin
-from muse_capture import CaptureSession, CapturingWriter, current_capture
+import muse_kiro
+from muse_capture import CaptureSession, CapturingWriter, current_capture, encoded_secret_forms
 
 
 DEFAULT_UPSTREAM = "https://openrouter.ai/api/v1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
+# Kiro's max_tokens is only a hint upstream, not a response-size guarantee.
+KIRO_JSON_RESPONSE_LIMIT = 16 * 1024 * 1024
+KIRO_REJECTED_BODY_LIMIT = 64 * 1024
+KIRO_REJECTED_BODY_TIMEOUT = 0.2
 DEFAULT_CODEX_MODELS = (
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -373,6 +380,8 @@ class Config:
         raw_upstream = getattr(args, "upstream", None)
         if raw_upstream:
             upstream = str(raw_upstream)
+        elif provider == "kiro" and getattr(args, "kiro_upstream", None):
+            upstream = str(args.kiro_upstream)
         else:
             upstream = _default_upstream_for(provider)
         self.upstream: str = upstream.rstrip("/")
@@ -414,6 +423,34 @@ class Config:
         self.devin_credential_id: str | None = getattr(
             args, "devin_credential_id", None
         )
+        self.kiro_api_key: str | None = getattr(args, "kiro_api_key", None)
+        self.kiro_models: list[str] = _parse_model_list(
+            getattr(args, "kiro_models", None), ()
+        )
+        self.kiro_context_limit = int(getattr(
+            args, "kiro_context_limit", muse_kiro.DEFAULT_CONTEXT_LIMIT
+        ))
+        self.kiro_output_limit = int(getattr(
+            args, "kiro_output_limit", muse_kiro.DEFAULT_OUTPUT_LIMIT
+        ))
+        if self.kiro_context_limit <= 0 or self.kiro_output_limit <= 0:
+            raise ValueError("Kiro context and output budgets must be positive integers")
+        self.kiro_requested = bool(
+            provider == "kiro" or self.kiro_api_key
+            or getattr(args, "kiro_upstream", None) or self.kiro_models
+            or self.kiro_context_limit != muse_kiro.DEFAULT_CONTEXT_LIMIT
+            or self.kiro_output_limit != muse_kiro.DEFAULT_OUTPUT_LIMIT
+        )
+        if self.kiro_requested and getattr(args, "max_output_tokens", None) is not None:
+            if int(args.max_output_tokens) <= 0:
+                raise ValueError("Kiro max output budget must be a positive integer")
+        self.kiro_upstream = muse_kiro.normalize_upstream(
+            self.upstream if provider == "kiro" else (
+                getattr(args, "kiro_upstream", None) or _default_upstream_for("kiro")
+            )
+        )
+        if self.kiro_api_key:
+            self.kiro_api_key = muse_kiro.validate_proxy_key(self.kiro_api_key)
         # Gateway fork: model discovery runs only when the local upstream was
         # explicitly configured (flag or env), so an unconfigured install
         # advertises no local/ entries and makes no discovery calls.
@@ -482,6 +519,7 @@ class Config:
         self.devin_models_explicit: bool = bool(getattr(args, "devin_models", None))
         self.model_discovery: bool = bool(getattr(args, "model_discovery", True))
         self._model_catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._kiro_catalog_status = "not checked; inference not validated"
         # Devin roster stash: logical_id -> DevinModel, refreshed with the
         # catalog so requests reuse discovery without extra RPCs.
         self._devin_roster: dict[str, Any] = {}
@@ -526,6 +564,8 @@ class Config:
             return f"{self.local_upstream}/responses"
         if selected == "devin":
             return self.devin_upstream
+        if selected == "kiro":
+            return self.kiro_upstream + "/messages"
         return self.upstream_url("responses")
 
     def resolve_model(self, model: Any) -> tuple[str, str]:
@@ -577,7 +617,19 @@ class Config:
                     )
                 return "devin", value[len(prefix) :]
 
-        if self.provider in {"generic", "codex", "claude", "meta", "local", "devin"}:
+        for prefix in ("kiro/", "kiro:"):
+            if value.startswith(prefix):
+                if self.provider not in {"auto", "kiro"}:
+                    raise ProviderError(
+                        "selected model belongs to Kiro.",
+                        code="model_provider_mismatch",
+                    )
+                model = value[len(prefix) :].strip()
+                if not model:
+                    raise ProviderError("Kiro model name is empty.", code="model_missing")
+                return "kiro", model
+
+        if self.provider in {"generic", "codex", "claude", "meta", "local", "devin", "kiro"}:
             return self.provider, value
         # Gateway fork: explicit membership wins over the name heuristics
         # below, so a user-configured local alias is never misrouted.
@@ -620,10 +672,15 @@ class Config:
             self.meta_api_key,
             self.local_api_key,
             self.devin_api_key,
+            self.kiro_api_key,
         ):
             if isinstance(value, str) and value:
                 values.append(value)
         return values
+
+    def kiro_effective_output_limit(self) -> int:
+        """The same unverified operational budget for catalog and requests."""
+        return min(self.kiro_output_limit, self.max_output_tokens) if self.max_output_tokens is not None else self.kiro_output_limit
 
 
 _PROVIDER_BLURB = {
@@ -631,6 +688,7 @@ _PROVIDER_BLURB = {
     "claude": "Claude model via Claude Code",
     "meta": "Muse Spark model",
     "local": "Local model through muse-gateway",
+    "kiro": "Kiro model through Kiro Gateway",
 }
 
 
@@ -1096,6 +1154,8 @@ def _provider_is_available(config: Config, provider: str) -> bool:
             return discover_claude_credentials(config) is not None
         if provider == "devin":
             return _devin_provider_ready(config)
+        if provider == "kiro":
+            return bool(config.kiro_api_key)
     except Exception:
         return False
     return True
@@ -1192,9 +1252,56 @@ def _devin_catalog_entries(config: Config, access_token=None) -> list[dict[str, 
     return entries
 
 
+def _kiro_catalog_entries(config: Config) -> list[dict[str, Any]]:
+    """Names from Kiro Gateway, never account entitlement or capacity evidence."""
+    if not config.kiro_api_key:
+        return []
+    cached = config._model_catalog_cache.get("kiro")
+    if cached and time.time() - cached[0] < MODEL_CATALOG_TTL_SECONDS:
+        return cached[1]
+    names: list[str] = []
+    discovery_ok = False
+    if config.model_discovery:
+        try:
+            names = muse_kiro.discover_models(
+                config.kiro_upstream, config.kiro_api_key,
+                timeout=min(config.timeout, 8.0),
+            )
+            discovery_ok = True
+            config._kiro_catalog_status = (
+                f"authenticated catalog reachable ({len(names)} names); inference not validated"
+            )
+        except (ProviderError, OSError, HTTPException, ValueError, TypeError, RecursionError) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            # Kiro is optional: its unavailable catalog cannot hide other routes.
+            config._kiro_catalog_status = "authenticated catalog unavailable; inference not validated"
+    else:
+        config._kiro_catalog_status = "catalog discovery disabled; inference not validated"
+    names = config.kiro_models or names
+    entries = [
+        _catalog_entry(
+            "kiro", name,
+            context_limit=config.kiro_context_limit,
+            output_limit=config.kiro_effective_output_limit(),
+            is_default=index == 0,
+            limits_verified=False,
+            supports_images=False,
+        )
+        for index, name in enumerate(names)
+    ]
+    stamped = time.time()
+    if config.model_discovery and not discovery_ok:
+        stamped -= MODEL_CATALOG_TTL_SECONDS - MODEL_CATALOG_RETRY_SECONDS
+    config._model_catalog_cache["kiro"] = (stamped, entries)
+    return entries
+
+
 def provider_model_catalog(
     config: Config, provider: str, *, authorization: str | None = None
 ) -> list[dict[str, Any]]:
+    if provider == "kiro":
+        return _kiro_catalog_entries(config)
     if provider == "devin":
         if not _provider_is_available(config, provider):
             return []
@@ -1642,9 +1749,9 @@ def _redact_bytes(payload: bytes, secrets: Iterable[str]) -> bytes:
             values.add(secret)
             if secret.lower().startswith("bearer "):
                 values.add(secret[7:].strip())
-    for secret in sorted(values, key=len, reverse=True):
-        if secret:
-            result = result.replace(secret.encode("utf-8"), b"[REDACTED]")
+    forms = {form for secret in values for form in encoded_secret_forms(secret)}
+    for form in sorted(forms, key=len, reverse=True):
+        result = result.replace(form, b"[REDACTED]")
     return result
 
 
@@ -1688,6 +1795,97 @@ def _upstream_diagnostic(payload: bytes) -> dict[str, Any]:
                     if word in _REASONING_EFFORTS
                 ]
     return result or {"reason": "upstream_rejected_request"}
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-JSON numeric constant")
+
+
+def _capture_rejected_kiro_body(upstream: Any) -> None:
+    _read_kiro_error_prefix(upstream, capture_only=True)
+
+
+def _read_kiro_error_prefix(
+    upstream: Any, *, label: str = "upstream", capture_only: bool = False,
+) -> bytes:
+    """One bounded, short read; body evidence cannot replace a known error.
+
+    Chunked read1 can loop over framing/trailers despite a socket timeout, so
+    omit it. For other bodies, short reads are not EOF: require a completed
+    Content-Length or observed close-delimited EOF to claim completeness.
+    """
+    capture = current_capture()
+    if capture is None and capture_only:
+        return b""
+    incomplete_marker = "kiro_http_error_body_incomplete" if label == "upstream.error" else "kiro_rejected_body_incomplete"
+
+    def mark(marker):
+        if capture is not None and marker not in capture.errors:
+            capture.errors.append(marker)
+
+    def record(method, *args, **kwargs):
+        if capture is not None:
+            try:
+                getattr(capture, method)(*args, **kwargs)
+            except Exception:
+                mark("kiro_error_capture_failed")
+                mark(incomplete_marker)
+                return False
+        return True
+
+    sock = None
+    previous_timeout = None
+    restore_timeout = False
+    prefix = b""
+    body_complete = False
+    body_label = label + ".body"
+    try:
+        if label == "upstream.error":
+            record("json", label + ".headers", {
+                "status": getattr(upstream, "status", None),
+                "headers": dict(getattr(upstream, "headers", None) or {}),
+            })
+        if getattr(upstream, "chunked", False):
+            record("event", body_label + ".omitted",
+                   reason="chunked_framing_has_no_absolute_read_bound", complete=False)
+            mark(incomplete_marker)
+            return prefix
+        reader = getattr(upstream, "read1", None)
+        sock = getattr(getattr(getattr(upstream, "fp", None), "raw", None), "_sock", None)
+        if not callable(reader) or sock is None:
+            record("event", body_label + ".omitted", reason="bounded_reader_unavailable", complete=False)
+            mark(incomplete_marker)
+            return prefix
+        previous_timeout = sock.gettimeout()
+        sock.settimeout(min(previous_timeout, KIRO_REJECTED_BODY_TIMEOUT)
+                        if previous_timeout is not None else KIRO_REJECTED_BODY_TIMEOUT)
+        restore_timeout = True
+        prefix = reader(KIRO_REJECTED_BODY_LIMIT + 1)
+        stored = record("bytes", body_label, prefix)
+        remaining = getattr(upstream, "length", None)
+        framed_end = remaining == 0 if remaining is not None else upstream.isclosed()
+        body_complete = len(prefix) <= KIRO_REJECTED_BODY_LIMIT and framed_end
+        capture_complete = stored and body_complete
+        record("event", body_label + ".rejected", bytes=len(prefix), limit=KIRO_REJECTED_BODY_LIMIT,
+               complete=capture_complete, representation="credentials_scrubbed_prefix")
+        if not capture_complete:
+            mark(incomplete_marker)
+    except Exception as error:
+        partial = getattr(error, "partial", b"")
+        if isinstance(partial, bytes) and partial:
+            prefix = partial[:KIRO_REJECTED_BODY_LIMIT + 1]
+            record("bytes", body_label, prefix)
+        record("event", body_label + ".omitted", reason=type(error).__name__, bytes=len(prefix), complete=False)
+        mark(incomplete_marker)
+    finally:
+        if restore_timeout:
+            try:
+                sock.settimeout(previous_timeout)
+            except OSError:
+                pass
+    # A parseable prefix need not be the complete HTTP entity. Keep it in the
+    # private evidence capture, but never classify an incomplete representation.
+    return prefix if body_complete else b""
 
 
 def _capture_http_error(error) -> bytes:
@@ -1912,6 +2110,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     def send_response(self, code: int, message: str | None = None) -> None:
         self._response_started = True
         self._response_status = code
+        if code >= 400:
+            self._stream_failed = True
         super().send_response(code, message)
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -1919,19 +2119,25 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             # BaseHTTPRequestHandler includes raw request paths in its log.
             self._log_event("http_access", status=getattr(self, "_response_status", None))
 
-    def send_json(self, status: int, value: Any) -> None:
+    def send_json(self, status: int, value: Any, *, headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Connection", "close")
+        for name, field in (headers or {}).items():
+            self.send_header(name, field)
         self.end_headers()
         self.wfile.write(payload)
         self.close_connection = True
 
     def send_provider_error(self, error: ProviderError | ShimError, *, status: int | None = None) -> None:
+        # Rejections before forwarding are failures too. In particular, a
+        # transform error must not leave a successful-looking capture outcome.
+        self._stream_failed = True
         error_status = status or getattr(error, "status", 400)
         code = getattr(error, "code", "shim_error")
+        kiro_fields = muse_kiro.error_fields(error) if isinstance(error, ProviderError) else {}
         extra = dict(getattr(self, "_upstream_diagnostic", {}))
         if "code" in extra:
             # The upstream error code must not collide with our own `code=`
@@ -1939,7 +2145,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             # a dropped connection as "malformed response data").
             extra["upstream_code"] = extra.pop("code")
         self._log_event("provider_error", status=error_status, code=code,
-                        **extra)
+                        **extra, **({"metadata": kiro_fields["metadata"]} if kiro_fields else {}))
         if getattr(self, "_response_started", False):
             # A partial response cannot be replaced by a second HTTP response.
             self.close_connection = True
@@ -1949,10 +2155,12 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             [*self.config.secret_values(), self.headers.get("Authorization", "")],
         ).decode("utf-8")
         try:
+            retry = kiro_fields.get("metadata", {}).get("retry_after")
             self.send_json(
                 int(error_status),
                 {"error": {"message": message, "type": code,
-                           "request_id": getattr(self, "_request_id", None)}},
+                           "request_id": getattr(self, "_request_id", None), **kiro_fields}},
+                headers={"Retry-After": retry["value"]} if retry else None,
             )
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             # Muse went away (ESC/cancel) while we answered. Stay quiet.
@@ -1968,6 +2176,10 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     "service": "muse-gateway",
                     "provider": self.config.provider,
                     "claude_transport": self.config.claude_transport,
+                    "supported_routes": {
+                        "version": 1,
+                        "providers": ["generic", "codex", "claude", "meta", "devin", "kiro", "local"],
+                    },
                     **(self.server.capture_session.health() if self.server.capture_session is not None else {}),
                 },
             )
@@ -1982,7 +2194,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             inbound_auth = self.headers.get("Authorization")
             if self.config.provider == "auto":
                 models: list[dict[str, Any]] = []
-                for route in ("codex", "claude", "meta", "devin", "local"):
+                for route in ("codex", "claude", "meta", "devin", "kiro", "local"):
                     models.extend(
                         dict(item)
                         for item in provider_model_catalog(
@@ -1990,6 +2202,18 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                         )
                     )
                 self.send_json(200, muse_catalog_response(models))
+                return
+            if self.config.provider == "kiro":
+                entries = provider_model_catalog(self.config, "kiro")
+                if self.config.model and self.config.kiro_api_key:
+                    _, model = self.config.resolve_model(self.config.model)
+                    entries = [_catalog_entry(
+                        "kiro", model,
+                        context_limit=self.config.kiro_context_limit,
+                        output_limit=self.config.kiro_effective_output_limit(),
+                        is_default=True, limits_verified=False, supports_images=False,
+                    )]
+                self.send_json(200, muse_catalog_response(entries))
                 return
             if self.config.provider in {"codex", "claude", "meta", "devin", "local"} and not self.config.model:
                 entries = provider_model_catalog(
@@ -2119,6 +2343,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 self.forward_local(transformed)
             elif provider == "devin":
                 self.forward_devin(transformed)
+            elif provider == "kiro":
+                self.forward_kiro(transformed)
             else:
                 self.forward_generic(transformed)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
@@ -2229,6 +2455,171 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 "local", local_url, custom=not _is_loopback_host(host)
             )
         self._post_responses(local_url, body, authorization)
+
+    def forward_kiro(self, body: dict[str, Any]) -> None:
+        """Translate through the external Messages service, never native OAuth."""
+        self._stream_failed = True
+        key = muse_kiro.validate_proxy_key(self.config.kiro_api_key)
+        budget = self.config.kiro_effective_output_limit()
+        payload, tool_names = muse_kiro.prepare_request(
+            body, max_output_tokens=budget,
+        )
+        if body.get("previous_response_id") and "previous_response_id" not in payload:
+            self._log_event("previous_response_id_dropped")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        endpoint = self.config.provider_url("kiro")
+        capture = current_capture()
+        if capture is not None:
+            capture.add_secret(key)
+            capture.json("outgoing", payload)
+            capture.bytes("outgoing.body", encoded)
+            capture.event("upstream.open", url=endpoint)
+        stream = body.get("stream") is True
+        upstream_status = None
+        upstream_headers = None
+        secrets = tuple([*self.config.secret_values(), self.headers.get("Authorization", "")])
+        try:
+            with muse_kiro.open_request(
+                endpoint, key, body=encoded, timeout=self.config.timeout,
+            ) as upstream:
+                upstream_status = getattr(upstream, "status", None)
+                upstream_headers = upstream.headers
+                content_type = upstream.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                expected = "text/event-stream" if stream else "application/json"
+                if capture is not None:
+                    capture.json("upstream.headers", {
+                        "status": int(getattr(upstream, "status", 200)),
+                        "headers": dict(upstream.headers),
+                    })
+                if content_type != expected:
+                    _capture_rejected_kiro_body(upstream)
+                    raise ProviderError(
+                        f"Kiro Gateway returned an unexpected media type; expected {expected}.",
+                        status=502, code="kiro_invalid_response",
+                    )
+                if not stream:
+                    try:
+                        raw = upstream.read(KIRO_JSON_RESPONSE_LIMIT + 1)
+                    except IncompleteRead as error:
+                        if capture is not None:
+                            capture.bytes("upstream.body", error.partial[:KIRO_JSON_RESPONSE_LIMIT + 1])
+                            capture.event("upstream.body.incomplete", complete=False)
+                            capture.errors.append("kiro_response_body_incomplete")
+                        raise ProviderError(
+                            "Kiro Gateway JSON response was interrupted before its HTTP body ended.",
+                            status=502, code="kiro_invalid_response",
+                        ) from error
+                    if capture is not None:
+                        capture.bytes("upstream.body", raw)
+                    if len(raw) > KIRO_JSON_RESPONSE_LIMIT:
+                        if capture is not None:
+                            capture.event("upstream.body.limit", bytes=len(raw), limit=KIRO_JSON_RESPONSE_LIMIT, complete=False)
+                            capture.errors.append("kiro_response_body_limit")
+                        raise ProviderError(
+                            "Kiro Gateway JSON response exceeded the safety size limit.",
+                            status=502, code="kiro_invalid_response",
+                        )
+                    if getattr(upstream, "length", None) not in {None, 0}:
+                        if capture is not None:
+                            capture.event("upstream.body.incomplete", complete=False)
+                            capture.errors.append("kiro_response_body_incomplete")
+                        raise ProviderError(
+                            "Kiro Gateway JSON response ended before its declared HTTP body length.",
+                            status=502, code="kiro_invalid_response",
+                        )
+                    if capture is not None:
+                        capture.event("upstream.eof")
+                    try:
+                        result = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+                    except (UnicodeError, ValueError, RecursionError) as error:
+                        raise ProviderError(
+                            "Kiro Gateway returned invalid JSON.",
+                            status=502, code="kiro_invalid_response",
+                        ) from error
+                    if isinstance(result, dict) and result.get("type") == "error":
+                        raise muse_kiro.upstream_error(
+                            source="json", upstream_status=upstream_status, headers=upstream_headers,
+                            payload=muse_kiro.load_error_payload(raw), secrets=secrets,
+                        )
+                    converted = muse_kiro.convert_json(
+                        result, model=str(payload["model"]), tool_names=tool_names,
+                        headers=upstream_headers, upstream_status=upstream_status, secrets=secrets,
+                    )
+                    self.send_json(200, converted)
+                    self._stream_failed = converted.get("status") != "completed"
+                    return
+                pending = muse_kiro.stream_events(
+                    upstream, model=str(payload["model"]), tool_names=tool_names,
+                    secrets=secrets,
+                )
+                terminal = False
+                try:
+                    try:
+                        first = next(pending)
+                    except StopIteration as error:
+                        raise ProviderError(
+                            "Kiro Gateway returned an empty stream.",
+                            status=502, code="kiro_invalid_response",
+                        ) from error
+                    if first[0] in {"response.failed", "response.incomplete", "error"}:
+                        raise ProviderError(
+                            "Kiro Gateway could not complete the response.",
+                            status=502, code="kiro_failed_response",
+                        )
+                    self._send_upstream_headers(
+                        upstream, content_type="text/event-stream", stream=True,
+                    )
+                    event_type, value = first
+                    while True:
+                        self.wfile.write(response_sse_line(event_type, value))
+                        self.wfile.flush()
+                        if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                            terminal = True
+                            self._stream_failed = event_type != "response.completed"
+                            if event_type == "response.failed":
+                                self._log_event("kiro_upstream_error", metadata=value["response"]["error"]["metadata"])
+                            break
+                        try:
+                            event_type, value = next(pending)
+                        except StopIteration:
+                            break
+                    if not terminal:
+                        raise ProviderError(
+                            "Kiro Gateway stream ended without a terminal response.",
+                            status=502, code="kiro_stream_truncated",
+                        )
+                finally:
+                    pending.close()
+        except urllib.error.HTTPError as error:
+            self._stream_failed = True
+            try:
+                prefix = _read_kiro_error_prefix(error.fp, label="upstream.error")
+                failure = muse_kiro.upstream_error(
+                    source="http", upstream_status=error.code, headers=error.headers,
+                    payload=muse_kiro.load_error_payload(prefix), secrets=secrets,
+                )
+                muse_kiro._capture("event", "kiro.upstream.failed", **muse_kiro.error_fields(failure))
+            finally:
+                error.close()
+            raise failure from error
+        except (urllib.error.URLError, TimeoutError, OSError, HTTPException) as error:
+            self._stream_failed = True
+            raise ProviderError(
+                "Kiro Gateway connection failed or its response was interrupted.",
+                status=502, code="kiro_upstream_unreachable",
+                metadata=muse_kiro.error_metadata(source="transport", upstream_status=upstream_status,
+                                                   headers=upstream_headers, secrets=secrets),
+            ) from error
+        except ProviderError as error:
+            if error.metadata is None:
+                error.metadata = muse_kiro.error_metadata(source="protocol", upstream_status=upstream_status,
+                                                         headers=upstream_headers, secrets=secrets)
+            raise
+        except BaseException:
+            self._stream_failed = True
+            raise
+        finally:
+            self._log_event("kiro_response_finished", stream=stream, stream_failed=self._stream_failed)
 
     def forward_devin(self, body: dict[str, Any]) -> None:
         """Translate one Responses request onto Devin's Connect RPCs."""
@@ -2655,43 +3046,63 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
 class MuseShimServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def server_bind(self) -> None:
+        if self.config.kiro_requested and os.name == "nt":
+            # Unlike a connection probe, this excludes simultaneous binds and
+            # sockets whose owners have bound but have not started listening.
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
     def __init__(self, address: tuple[str, int], config: Config) -> None:
+        if config.kiro_requested and _port_is_busy(*address):
+            raise OSError("Kiro settings require a new gateway port; refusing occupied-port reuse")
         self.config = config
-        self.capture_session = CaptureSession(config.capture_dir) if config.capture_dir else None
+        self.capture_session = None
+        if config.kiro_requested:
+            # These are instance settings: native/non-Kiro reuse is unchanged.
+            # Never combine SO_EXCLUSIVEADDRUSE with the base's SO_REUSEADDR.
+            self.allow_reuse_address = False
+            self.allow_reuse_port = False
         super().__init__(address, MuseShimHandler)
         # Credentialed upstreams must never follow a redirect onto another
         # origin. Installed here so every server path is covered; tests that
         # patch urllib.request.urlopen are unaffected (they bypass the opener).
-        urllib.request.install_opener(
-            urllib.request.build_opener(_SameOriginRedirectHandler)
-        )
         try:
+            self.capture_session = CaptureSession(config.capture_dir) if config.capture_dir else None
+            urllib.request.install_opener(
+                urllib.request.build_opener(_SameOriginRedirectHandler)
+            )
             self._log_handler = _PrivateRotatingFileHandler(
                 config.log_file, maxBytes=5 * 1024 * 1024, backupCount=2,
                 encoding="utf-8",
             )
-        except OSError:
-            super().server_close()
+            self._log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            self.diagnostics = logging.Logger(f"muse-gateway.{self.server_port}", logging.INFO)
+            self.diagnostics.propagate = False
+            self.diagnostics.addHandler(self._log_handler)
+            self.diagnostics.info(json.dumps({"event": "gateway_started", "port": self.server_port}))
+            if self.capture_session is not None:
+                self.diagnostics.info(json.dumps({"event": "private_capture_enabled",
+                                                 **self.capture_session.health(),
+                                                 "directory": str(self.capture_session.directory)}))
+        except BaseException:
+            self.server_close()
             raise
-        self._log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        self.diagnostics = logging.Logger(f"muse-gateway.{self.server_port}", logging.INFO)
-        self.diagnostics.propagate = False
-        self.diagnostics.addHandler(self._log_handler)
-        self.diagnostics.info(json.dumps({"event": "gateway_started", "port": self.server_port}))
-        if self.capture_session is not None:
-            self.diagnostics.info(json.dumps({"event": "private_capture_enabled",
-                                             **self.capture_session.health(),
-                                             "directory": str(self.capture_session.directory)}))
 
     def server_close(self) -> None:
         super().server_close()
         handler = getattr(self, "_log_handler", None)
         if handler is not None:
-            self.diagnostics.removeHandler(handler)
+            diagnostics = getattr(self, "diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.removeHandler(handler)
             handler.close()
+            self._log_handler = None
 
 
 def _default_upstream_for(provider: str) -> str:
+    if provider == "kiro":
+        return env_value("MUSE_GATEWAY_KIRO_UPSTREAM") or muse_kiro.DEFAULT_UPSTREAM
     if provider == "codex":
         return env_value(
             "MUSE_GATEWAY_CODEX_UPSTREAM",
@@ -2727,7 +3138,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "muse-gateway: loopback Muse proxy with a unified Meta, Codex, "
-            "Claude, Devin, and local model catalog (forked from muse-shim)"
+            "Claude, Devin, Kiro, and local model catalog (forked from muse-shim)"
         ),
         epilog=(
             "For Muse subscription auth use `muse-gateway launch [MUSE_ARGS...]` "
@@ -2739,13 +3150,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("auto", "generic", "http", "codex", "claude", "meta", "devin", "local", "doctor"),
+        choices=("auto", "generic", "http", "codex", "claude", "meta", "devin", "kiro", "local", "doctor"),
         default=env_value("MUSE_GATEWAY_PROVIDER", "auto"),
         help="provider mode or doctor",
     )
     parser.add_argument(
         "--provider",
-        choices=("auto", "generic", "http", "codex", "claude", "meta", "devin", "local"),
+        choices=("auto", "generic", "http", "codex", "claude", "meta", "devin", "kiro", "local"),
     )
     parser.add_argument("--host", default=env_value("MUSE_GATEWAY_HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(env_value("MUSE_GATEWAY_PORT", str(DEFAULT_PORT))))
@@ -2821,6 +3232,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated devin/ ids to list (curates discovery, default: all)",
     )
     parser.add_argument(
+        "--kiro-upstream", default=env_value("MUSE_GATEWAY_KIRO_UPSTREAM"),
+        help="Kiro Gateway Messages base URL (default: http://127.0.0.1:8000/v1; loopback HTTP or verified HTTPS)",
+    )
+    parser.add_argument(
+        "--kiro-api-key", default=env_value("MUSE_GATEWAY_KIRO_API_KEY"),
+        help="Kiro Gateway proxy key only (prefer MUSE_GATEWAY_KIRO_API_KEY; never native Kiro or Claude credentials)",
+    )
+    parser.add_argument(
+        "--kiro-models", default=env_value("MUSE_GATEWAY_KIRO_MODELS"),
+        help="comma-separated Kiro Gateway model IDs to curate kiro/ entries; discovery is not account entitlement evidence",
+    )
+    parser.add_argument(
+        "--kiro-context-limit", type=int,
+        default=env_value("MUSE_GATEWAY_KIRO_CONTEXT_LIMIT", str(muse_kiro.DEFAULT_CONTEXT_LIMIT)),
+        help="positive unverified Kiro context budget (default: 65536)",
+    )
+    parser.add_argument(
+        "--kiro-output-limit", type=int,
+        default=env_value("MUSE_GATEWAY_KIRO_OUTPUT_LIMIT", str(muse_kiro.DEFAULT_OUTPUT_LIMIT)),
+        help="positive unverified Kiro output budget, not a guaranteed upstream cap (default: 8192)",
+    )
+    parser.add_argument(
         "--no-model-discovery",
         action="store_false",
         dest="model_discovery",
@@ -2890,7 +3323,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--doctor-provider",
-        choices=("generic", "codex", "claude", "meta", "devin", "local"),
+        choices=("generic", "codex", "claude", "meta", "devin", "kiro", "local"),
         default=None,
     )
     parser.add_argument(
@@ -2902,7 +3335,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--models-provider",
-        choices=("codex", "claude", "meta", "devin", "local"),
+        choices=("codex", "claude", "meta", "devin", "kiro", "local"),
         default=None,
         help="with --models, list only this provider's catalog",
     )
@@ -2924,8 +3357,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         provider = "generic"
     args.provider = provider
     if not args.upstream:
-        args.upstream = _default_upstream_for(provider)
+        args.upstream = (args.kiro_upstream if provider == "kiro" else None) or _default_upstream_for(provider)
     try:
+        if args.kiro_context_limit <= 0 or args.kiro_output_limit <= 0:
+            raise ProviderError("Kiro context and output budgets must be positive integers.", code="invalid_kiro_budget")
+        if provider == "kiro" or args.kiro_upstream or args.kiro_api_key or args.kiro_models:
+            muse_kiro.normalize_upstream(args.upstream if provider == "kiro" else (args.kiro_upstream or muse_kiro.DEFAULT_UPSTREAM))
+            if args.kiro_api_key:
+                muse_kiro.validate_proxy_key(args.kiro_api_key)
         if provider == "auto" and args.model:
             raise ProviderError(
                 "--model / MUSE_GATEWAY_MODEL cannot pin auto mode; choose a model "
@@ -2963,6 +3402,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _credential_status(config: Config, provider: str) -> tuple[bool, str]:
+    if provider == "kiro":
+        if not config.kiro_api_key:
+            return False, "proxy key not configured; set MUSE_GATEWAY_KIRO_API_KEY (no native credential fallback)"
+        entries = provider_model_catalog(config, "kiro")
+        ok = not (config.model_discovery and "unavailable" in config._kiro_catalog_status)
+        return ok, f"proxy key configured; {config._kiro_catalog_status}; {len(entries)} menu entries, budgets unverified"
     if provider == "generic":
         if config.api_key:
             return True, "API key configured"
@@ -3041,13 +3486,15 @@ def run_doctor(config: Config, *, output: Any = None) -> int:
     print(f"listen: {config.host}:{config.port}", file=output)
     print(f"generic endpoint configured: {'yes' if bool(config.upstream) else 'no'}", file=output)
     selected = getattr(config, "doctor_provider", None)
-    if selected is None and config.provider in {"codex", "claude", "meta", "local", "devin"}:
+    if selected is None and config.provider in {"codex", "claude", "meta", "local", "devin", "kiro"}:
         selected = config.provider
     if selected:
         providers = (selected,)
     elif config.provider in {"auto", "doctor"}:
         # Include local routes configured through discovery or explicit IDs.
         providers = ("codex", "claude", "meta", "devin")
+        if config.kiro_requested:
+            providers = (*providers, "kiro")
         if config.local_models or config.local_upstream_explicit:
             providers = (*providers, "local")
     else:
@@ -3070,6 +3517,12 @@ def run_doctor(config: Config, *, output: Any = None) -> int:
                     "is not sent as Anthropic thinking",
                     file=output,
                 )
+        if provider == "kiro":
+            print(
+                "kiro capability: separate Kiro Gateway Messages service; text/tools, "
+                "thinking disabled; no hard output-cap or forced-tool guarantee; inference not validated by doctor",
+                file=output,
+            )
     print("secrets: not displayed", file=output)
     return 0 if ready else 1
 
@@ -3085,10 +3538,10 @@ def run_models(config: Config, provider: str | None = None, *, output: Any = Non
     output = output or sys.stdout
     if provider:
         providers = (provider,)
-    elif config.provider in {"codex", "claude", "meta", "local", "devin"}:
+    elif config.provider in {"codex", "claude", "meta", "local", "devin", "kiro"}:
         providers = (config.provider,)
     else:
-        providers = ("codex", "claude", "meta", "devin")
+        providers = ("codex", "claude", "meta", "devin", "kiro")
         if config.local_models or config.local_upstream_explicit:
             providers = (*providers, "local")
     for name in providers:
@@ -3106,7 +3559,7 @@ def run_models(config: Config, provider: str | None = None, *, output: Any = Non
 
 def _server_destination(config: Config) -> str:
     if config.provider == "auto":
-        return "Codex + Claude + Meta + Devin + Local (select with Muse /model)"
+        return "Codex + Claude + Meta + Devin + Kiro + Local (select with Muse /model)"
     if config.provider == "claude" and config.claude_transport == "cli":
         return f"Claude CLI ({config.claude_cli} -p)"
     return config.provider_url()
@@ -3192,10 +3645,17 @@ def run_muse(config: Config, muse_args: list[str], *, output: Any = None) -> int
     previous_signal_handlers: dict[int, Any] = {}
     base_url = f"http://{config.host}:{config.port}"
 
+    if config.kiro_requested and _port_is_busy(config.host, config.port):
+        print(
+            f"muse-gateway Kiro settings require a new gateway on {base_url}; "
+            "the port is occupied. Choose --port; existing servers are not reused or stopped.",
+            file=output, flush=True,
+        )
+        return 1
     try:
         server = MuseShimServer((config.host, config.port), config)
     except OSError as error:
-        if not _existing_shim_is_compatible(
+        if config.kiro_requested or not _existing_shim_is_compatible(
             base_url, config.provider, config.claude_transport
         ):
             print(
@@ -3284,6 +3744,11 @@ ends option parsing and everything from there goes to `muse`.
   --devin-auth-db PATH       OMP agent.db path for Devin credentials
   --devin-credential-id ID   Devin credential row when several are active
   --devin-models A,B         restrict devin/ entries to these IDs
+  --kiro-upstream URL        separate Kiro Gateway Messages base URL
+  --kiro-api-key KEY         Kiro Gateway proxy key (prefer environment)
+  --kiro-models A,B          restrict kiro/ entries to these upstream IDs
+  --kiro-context-limit N     unverified positive operational context budget
+  --kiro-output-limit N      unverified positive operational output budget
   --check-only               preflight + catalog check, then exit (no Muse)
   --env-file PATH            config file (default: muse_gateway.py dir, else ./)
   --muse-bin PATH            Muse executable (default: auto-detect)
@@ -3304,6 +3769,11 @@ _LAUNCH_VALUE_OPTIONS = {
     "--devin-auth-db": "devin_auth_db",
     "--devin-credential-id": "devin_credential_id",
     "--devin-models": "devin_models",
+    "--kiro-upstream": "kiro_upstream",
+    "--kiro-api-key": "kiro_api_key",
+    "--kiro-models": "kiro_models",
+    "--kiro-context-limit": "kiro_context_limit",
+    "--kiro-output-limit": "kiro_output_limit",
     "--env-file": "env_file",
     "--muse-bin": "muse_bin",
     "--log-file": "log_file",
@@ -3366,7 +3836,10 @@ def _split_launch_args(
                     f"launch option {token} needs a value.",
                     code="launch_option_value_missing",
                 )
-            setattr(opts, _LAUNCH_VALUE_OPTIONS[token], argv[index])
+            value = argv[index]
+            if token in {"--kiro-context-limit", "--kiro-output-limit"}:
+                value = _launch_positive_budget(token, value)
+            setattr(opts, _LAUNCH_VALUE_OPTIONS[token], value)
         elif token.startswith("--") and "=" in token:
             name, _, value = token.partition("=")
             if name == "--port":
@@ -3378,6 +3851,8 @@ def _split_launch_args(
                         code="launch_option_value_invalid",
                     ) from error
             elif name in _LAUNCH_VALUE_OPTIONS:
+                if name in {"--kiro-context-limit", "--kiro-output-limit"}:
+                    value = _launch_positive_budget(name, value)
                 setattr(opts, _LAUNCH_VALUE_OPTIONS[name], value)
             else:
                 muse_args.extend(argv[index:])
@@ -3387,6 +3862,19 @@ def _split_launch_args(
             break
         index += 1
     return opts, muse_args
+
+
+def _launch_positive_budget(option: str, value: str) -> int:
+    try:
+        parsed = int(value)
+        if parsed > 0:
+            return parsed
+    except ValueError:
+        pass
+    raise ProviderError(
+        f"launch option {option} needs a positive integer.",
+        code="launch_option_value_invalid",
+    )
 
 
 def load_env_file(path: str) -> int:
@@ -3479,33 +3967,23 @@ def launch_main(
     env_file = launch_opts.env_file or _default_env_file()
     if env_file is not None:
         load_env_file(env_file)
+    # Post-launch flags are explicit CLI values, not post-validation patches.
+    # Supplying them to argparse avoids validating an overridden env default
+    # (e.g. KIRO_OUTPUT_LIMIT=bad with --kiro-output-limit 4096).
+    parser_argv = list(pre_argv) if pre_argv else ["auto"]
+    for flag, attribute in _LAUNCH_VALUE_OPTIONS.items():
+        if flag in {"--env-file", "--muse-bin"}:
+            continue
+        value = getattr(launch_opts, attribute, None)
+        if value is not None:
+            parser_argv.append(f"{flag}={value}")
     try:
-        server_args = parse_args(list(pre_argv) if pre_argv else ["auto"])
+        server_args = parse_args(parser_argv)
     except SystemExit as exited:
         return int(exited.code or 2)
     # Launch always serves the unified catalog, like the source wrappers.
     server_args.provider = "auto"
     server_args.mode = "auto"
-    if launch_opts.port is not None:
-        server_args.port = launch_opts.port
-    if launch_opts.local_upstream is not None:
-        server_args.local_upstream = launch_opts.local_upstream
-    if launch_opts.local_api_key is not None:
-        server_args.local_api_key = launch_opts.local_api_key
-    if launch_opts.local_models is not None:
-        server_args.local_models = launch_opts.local_models
-    for option in (
-        "devin_upstream",
-        "devin_api_key",
-        "devin_auth_db",
-        "devin_credential_id",
-        "devin_models",
-    ):
-        value = getattr(launch_opts, option, None)
-        if value is not None:
-            setattr(server_args, option, value)
-    if launch_opts.log_file is not None:
-        server_args.log_file = launch_opts.log_file
     # Subscription launch must not retain a static key captured by argparse.
     server_args.meta_api_key = None
     try:
@@ -3513,6 +3991,14 @@ def launch_main(
     except (ProviderError, ValueError) as error:
         print(f"muse-gateway launch: {error}", file=sys.stderr)
         return 2
+
+    if config.kiro_requested and _port_is_busy(config.host, config.port):
+        print(
+            f"error: port {config.port} is occupied. Kiro settings require a new "
+            "gateway; choose --port. Existing servers are not reused or stopped.",
+            file=sys.stderr,
+        )
+        return 1
 
     default_local_upstream = "http://127.0.0.1:4000/v1"
     gateway_upstream = (
@@ -3597,7 +4083,7 @@ def launch_main(
         # one of ours instead of failing. (The explicit probe matters: the
         # server sets SO_REUSEADDR, which lets a second bind succeed on
         # Windows, so try-bind alone cannot detect the collision there.)
-        if not _existing_shim_is_compatible(
+        if config.kiro_requested or not _existing_shim_is_compatible(
             base_url, "auto", config.claude_transport
         ):
             print(
@@ -3726,6 +4212,9 @@ def main(argv: list[str] | None = None) -> int:
         env_file = args.env_file or _default_env_file()
         if env_file is not None:
             load_env_file(env_file)
+            # Parse again after loading defaults. Explicit flags still win;
+            # otherwise --models would ignore its own --env-file settings.
+            args = parse_args(raw_argv)
         return run_models(Config(args), provider=args.models_provider)
     if args.mode == "doctor":
         config = Config(args)

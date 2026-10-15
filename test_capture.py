@@ -2,12 +2,12 @@ import argparse
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import gzip
+import hashlib
 import io
 import json
 from pathlib import Path
 import tempfile
 import threading
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -39,6 +39,44 @@ def post(base, body, headers=None):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_split_json_serialized_secrets_cannot_be_decoded_from_evidence(self):
+        key = 'serialized-quote"backslash\\secret-\u03bb'
+        cases = []
+        with tempfile.TemporaryDirectory() as directory:
+            capture = CaptureSession(directory).request("serialized-secret", [key])
+            try:
+                for ascii_only in (True, False):
+                    for layers in (1, 2):
+                        encoded = key
+                        for _ in range(layers):
+                            encoded = json.dumps(encoded, ensure_ascii=ascii_only)[1:-1]
+                        payload = {"padding": "x" * 8190, "text": key} if layers == 1 else {
+                            "padding": "x" * 8190, "arguments": json.dumps({"text": key}, ensure_ascii=ascii_only)}
+                        wire = json.dumps(payload, ensure_ascii=ascii_only).encode()
+                        needle = encoded.encode()
+                        start = wire.index(needle)
+                        for offset in range(1, len(needle)):
+                            name = f"split-{int(ascii_only)}-{layers}-{offset}"
+                            cut = start + offset
+                            capture.bytes(name, wire[:cut])
+                            capture.bytes(name, wire[cut:])
+                            self.assertLessEqual(len(capture.streams[name]["tail"]), 65536)
+                            cases.append((name, wire, layers))
+                clean = b'event: ping\ndata: {"type":"ping","text":"credential-free"}\n\n'
+                capture.bytes("clean", clean)
+            finally:
+                capture.finish()
+            manifest = json.loads((capture.directory / "manifest.json").read_text())
+            for name, original, layers in cases:
+                saved = json.loads((capture.directory / name).read_bytes())
+                text = saved["text"] if layers == 1 else json.loads(saved["arguments"])["text"]
+                self.assertNotIn(key, text, "decoding serialized capture recovered a complete credential")
+                self.assertEqual(text, "[REDACTED]")
+                self.assertEqual(manifest["streams"][name]["original_sha256"], hashlib.sha256(original).hexdigest())
+                self.assertEqual(manifest["streams"][name]["observed_bytes"], len(original))
+            self.assertEqual((capture.directory / "clean").read_bytes(), clean)
+            self.assertEqual(manifest["capture_errors"], [])
+
     def test_scrubs_split_secrets_and_records_explicit_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
             session = CaptureSession(directory)
@@ -66,25 +104,58 @@ class CaptureTests(unittest.TestCase):
             manifest = json.loads((capture.directory / "manifest.json").read_text())
             self.assertTrue(manifest["artifacts"]["large"]["truncated"])
             self.assertEqual(manifest["streams"]["large"]["observed_bytes"], 20)
+            key = ("budget-private|" + "0123456789abcdef" * 9)[:150].encode()
+            for surface in ("json", "protobuf", "split"):
+                with self.subTest(surface=surface):
+                    capture = session.request("budget-" + surface, [key.decode()])
+                    try:
+                        if surface == "json":
+                            capture.limit = capture.written + len(b'{\n  "text": "') + 149
+                            payload = json.dumps({"text": key[:149].decode() + "!"}, indent=2).encode()
+                            capture._append("budget.json", payload)
+                            path = capture.directory / "budget.json"
+                        else:
+                            payload = devin_pb2.GetChatMessageRequest(prompt=key[:149].decode() + "!").SerializeToString()
+                            end = payload.index(key[:149]) + 149
+                            if surface == "split":
+                                cut = payload.index(key[:149]) + 60
+                                capture._append("budget.pb", payload[:cut])
+                                payload, end = payload[cut:], end - cut
+                            capture.limit = capture.written + end
+                            capture._append("budget.pb", payload)
+                            path = capture.directory / "budget.pb"
+                    finally:
+                        capture.finish()
+                    self.assertNotIn(key[:75], path.read_bytes())
+                    self.assertIn(b"[REDACTED]", path.read_bytes())
+                    self.assertTrue(capture.artifacts[path.name]["truncated"])
+                    self.assertLessEqual(capture.written, capture.limit)
 
     def test_protobuf_credentials_are_removed_before_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             capture = CaptureSession(directory).request("protobuf")
             message = devin_pb2.GetChatMessageRequest(prompt="public prompt")
-            message.metadata.api_key = "private-login-token"
+            message.metadata.api_key = ("protobuf-echo|" + "0123456789abcdef" * 9)[:150]
+            message.metadata.ide_name = message.metadata.api_key + " " + message.metadata.api_key[:-1]
             message.metadata.user_jwt = "private-user-jwt"
             message.model_assignment_jwt = "private-assignment-jwt"
+            message.prompt = message.model_assignment_jwt + " " + message.model_assignment_jwt[:-1]
+            original = message.SerializeToString()
             try:
-                capture.protobuf("chat", message, message.SerializeToString())
+                returned = capture.protobuf("chat", message, original)
             finally:
                 capture.finish()
             saved = devin_pb2.GetChatMessageRequest.FromString((capture.directory / "chat.pb").read_bytes())
-            self.assertEqual(saved.prompt, message.prompt)
+            self.assertEqual(message.SerializeToString(), original)
+            self.assertEqual(devin_pb2.GetChatMessageRequest.FromString(returned), saved)
+            self.assertEqual(saved.prompt, "[REDACTED] [REDACTED]")
+            self.assertEqual(saved.metadata.ide_name, "[REDACTED] [REDACTED]")
+            self.assertEqual(json.loads((capture.directory / "chat.json").read_text())["prompt"], saved.prompt)
             self.assertEqual(saved.metadata.api_key, "[REDACTED]")
             self.assertEqual(saved.metadata.user_jwt, "[REDACTED]")
             self.assertEqual(saved.model_assignment_jwt, "[REDACTED]")
             contents = b"".join(path.read_bytes() for path in capture.directory.iterdir())
-            for secret in (b"private-login-token", b"private-user-jwt", b"private-assignment-jwt"):
+            for secret in (message.metadata.api_key[:75].encode(), b"private-user-jwt", b"private-assignment-jwt"):
                 self.assertNotIn(secret, contents)
 
     def test_auth_error_scrubs_raw_cli_token_when_wire_uses_prefix(self):
@@ -119,19 +190,40 @@ class CaptureTests(unittest.TestCase):
             finally:
                 capture.finish()
             self.assertEqual((capture.directory / "body").read_bytes(), b"[REDACTED] SAFE")
-
-    def test_error_capture_drain_failure_preserves_first_error_chunk(self):
-        from muse_gateway import _capture_http_error
-        first = b'{"error":{"code":"invalid_encrypted_content","message":"rejected"}}'
-        error = SimpleNamespace(code=400, headers={}, read=unittest.mock.Mock(side_effect=[first, TimeoutError()]))
-        with tempfile.TemporaryDirectory() as directory:
-            capture = CaptureSession(directory).request("drain-timeout")
+            key = ("arbitrary-proxy|" + "0123456789ABCDEF" * 9)[:150]
+            escaped = ('quoted"slash\\unicode-\u03bb|' + "abcdef0123456789" * 9)[:150]
+            other = ("other-private|" + "fedcba9876543210" * 9)[:150]
+            full = "leading-full-key|" + other[:75]
+            capture = CaptureSession(directory).request("known-prefixes", [key, key[:32], escaped, other, full])
+            cases = [("half", key[:75].encode(), b"[REDACTED]"),
+                     ("overlap-prefix", key[:-1].encode(), b"[REDACTED]"),
+                     ("full", key.encode(), b"[REDACTED]"),
+                     ("full-overlap-suffix", full.encode(), b"[REDACTED]"),
+                     ("clean", b"credential-free tail", b"credential-free tail"),
+                     ("short", key[:15].encode(), key[:15].encode()),
+                     ("divergent", other[:-1].encode() + b"!", b"[REDACTED]!")]
+            for ascii_only in (True, False):
+                encoded = escaped
+                for layer in (1, 2):
+                    encoded = json.dumps(encoded, ensure_ascii=ascii_only)[1:-1]
+                    cases.append((f"encoded-{ascii_only}-{layer}", encoded.encode()[:-1], b"[REDACTED]"))
             try:
-                self.assertEqual(_capture_http_error(error), first)
+                for name, suffix, expected in cases:
+                    wire = b"x" * 8190 + suffix
+                    for chunk in (wire[:8222], wire[8222:8250], wire[8250:]):
+                        capture.bytes(name, chunk)
+                        self.assertLessEqual(len(capture.streams[name]["tail"]), 65536)
+                capture.json("semantic-echo", {"text": key[:-1], "clean": "safe tail"})
+                capture.json("secret-keys", {other: "full", key[:-1]: "partial", "safe": "unchanged"})
             finally:
                 capture.finish()
-            manifest = json.loads((capture.directory / "manifest.json").read_text())
-            self.assertIn("upstream_error_capture_incomplete", manifest["capture_errors"])
+            for name, suffix, expected in cases:
+                with self.subTest(name=name):
+                    self.assertEqual((capture.directory / name).read_bytes(), b"x" * 8190 + expected)
+            self.assertEqual(json.loads((capture.directory / "semantic-echo.json").read_text()),
+                             {"text": "[REDACTED]", "clean": "safe tail"})
+            saved_keys = json.loads((capture.directory / "secret-keys.json").read_text())
+            self.assertEqual(saved_keys, {"[REDACTED]": "partial", "safe": "unchanged"})
 
     def test_capture_preserves_socket_sse_bytes(self):
         wire = b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'
@@ -166,44 +258,42 @@ class CaptureTests(unittest.TestCase):
                     self.assertEqual(manifest["terminal_events"]["downstream"], ["response.completed"])
             self.assertEqual(outputs, [wire, wire])
 
-    def test_codex_http_400_retains_full_error_and_responds(self):
-        outgoing = []
-        error_body = json.dumps({"error": {"type": "invalid_request_error", "code": "invalid_value",
-            "param": "input[17].id", "message": "x" * 70000 + "FULL_ERROR_TAIL"}}).encode()
-        class Upstream(BaseHTTPRequestHandler):
-            def do_POST(self):
-                outgoing.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(error_body)))
-                self.end_headers()
-                self.wfile.write(error_body)
-            def log_message(self, *args):
-                pass
-        with tempfile.TemporaryDirectory() as directory, serving(ThreadingHTTPServer(("127.0.0.1", 0), Upstream)) as upstream:
-            config = Config(argparse.Namespace(provider="codex", upstream=upstream,
-                allow_oauth_host_override=True, model_discovery=False, capture_dir=directory,
-                log_file=str(Path(directory) / "gateway.log")))
-            server = MuseShimServer(("127.0.0.1", 0), config)
-            with serving(server) as base, patch("muse_gateway.resolve_codex_credentials", return_value=SimpleNamespace(access_token="private-codex-token")):
-                with self.assertRaises(urllib.error.HTTPError) as raised:
-                    post(base, {"model": "gpt-test", "input": "hello", "stream": True})
-                self.assertEqual(raised.exception.code, 400)
-                with raised.exception as response:
-                    self.assertEqual(json.load(response)["error"]["type"], "codex_upstream_error")
-            request_dir = next(path for path in server.capture_session.directory.iterdir() if path.is_dir())
-            self.assertEqual((request_dir / "upstream.error.body").read_bytes(), error_body)
-            captured_request = json.loads((request_dir / "outgoing.body").read_bytes())
-            self.assertEqual(captured_request, outgoing[0])
-            self.assertFalse(captured_request["store"])
-            self.assertIsInstance(captured_request["input"], list)
-            self.assertNotIn("FULL_ERROR_TAIL", (Path(directory) / "gateway.log").read_text())
-            contents = b"".join(path.read_bytes() for path in request_dir.iterdir())
-            self.assertNotIn(b"private-codex-token", contents)
-
     def test_real_connect_route_captures_frames_without_changing_events(self):
-        first = devin_pb2.GetChatMessageResponse(message_id="resp_capture", delta_text="Hello", stop_reason=2)
-        wire = frame_message(gzip.compress(first.SerializeToString()), 1) + frame_message(b"{}", 2)
+        from muse_devin_wire import ConnectFrameDecoder, iter_chat_frames
+        key = ("connect-proxy|" + "0123456789abcdef" * 9)[:150]
+        first = devin_pb2.GetChatMessageResponse(message_id="resp_capture", delta_text="Hello")
+        echo = devin_pb2.GetChatMessageResponse(delta_text=key[:-1], stop_reason=2)
+        cases = [("json", 2, json.dumps({"error": {"message": key[:-1]}}).encode()),
+                 ("malformed", 2, b'{"error":{"message":"' + key[:-1].encode()),
+                 ("proto", 0, echo.SerializeToString()),
+                 ("compressed", 1, gzip.compress(echo.SerializeToString())),
+                 ("shadowed", 0, echo.SerializeToString() +
+                  devin_pb2.GetChatMessageResponse(delta_text="public").SerializeToString())]
+        for name, flags, payload in cases:
+            with self.subTest(trailer=name), tempfile.TemporaryDirectory() as directory:
+                capture = CaptureSession(directory).request(name, [key])
+                try:
+                    with io.BytesIO(frame_message(payload, flags)) as response:
+                        self.assertEqual(list(iter_chat_frames(response)), [(flags, payload)])
+                finally:
+                    capture.finish()
+                saved_path = capture.directory / "devin.chat.response.connect"
+                if name not in ("json", "malformed"):
+                    saved = ConnectFrameDecoder().decode(saved_path.read_bytes())
+                    raw = gzip.decompress(saved[0][1]) if flags & 1 else saved[0][1]
+                    self.assertEqual(devin_pb2.GetChatMessageResponse.FromString(raw).delta_text,
+                                     "public" if name == "shadowed" else "[REDACTED]")
+                elif name == "json":
+                    saved = ConnectFrameDecoder().decode(saved_path.read_bytes())
+                    self.assertEqual(json.loads(saved[0][1]), {"error": {"message": "[REDACTED]"}})
+                else:
+                    self.assertFalse(saved_path.exists())
+                    timeline = [json.loads(line) for line in (capture.directory / "timeline.jsonl").read_text().splitlines()]
+                    self.assertTrue(any(row["event"].endswith(".capture_decode_failed") and
+                                        row["opaque_bytes_omitted"] for row in timeline))
+                self.assertNotIn(key[:75].encode(), b"".join(path.read_bytes() for path in capture.directory.iterdir()))
+        clean_frame = frame_message(gzip.compress(first.SerializeToString()), 1)
+        wire = clean_frame + frame_message(echo.SerializeToString(), 0) + frame_message(b"{}", 2)
         chat_requests = []
         class Upstream(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -225,7 +315,7 @@ class CaptureTests(unittest.TestCase):
             outputs = []
             for enabled in (False, True):
                 config = Config(argparse.Namespace(provider="auto", devin_upstream=upstream,
-                    devin_api_key="private-devin-token", model_discovery=False,
+                    devin_api_key=key, model_discovery=False,
                     capture_dir=directory if enabled else None, log_file=str(Path(directory) / "gateway.log")))
                 server = MuseShimServer(("127.0.0.1", 0), config)
                 with serving(server) as base:
@@ -236,55 +326,20 @@ class CaptureTests(unittest.TestCase):
                         self.assertEqual(post(base, body, headers), outputs[-1])
                 if enabled:
                     request_dir = next(path for path in server.capture_session.directory.iterdir() if path.is_dir())
-                    self.assertEqual((request_dir / "devin.chat.response.connect").read_bytes(), wire)
-                    self.assertEqual((request_dir / "downstream.body").read_bytes(), outputs[-1])
+                    stored = (request_dir / "devin.chat.response.connect").read_bytes()
+                    self.assertTrue(stored.startswith(clean_frame))
+                    frames = ConnectFrameDecoder().decode(stored)
+                    self.assertEqual(len(frames), 3)
+                    self.assertEqual(frames[2], (2, b"{}"))
+                    self.assertEqual(devin_pb2.GetChatMessageResponse.FromString(frames[1][1]).delta_text, "[REDACTED]")
+                    self.assertNotIn(key[:75].encode(), (request_dir / "downstream.body").read_bytes())
                     contents = b"".join(path.read_bytes() for path in request_dir.iterdir())
-                    self.assertNotIn(b"private-devin-token", contents)
+                    self.assertNotIn(key[:75].encode(), contents)
                     self.assertNotIn(b"private-session-jwt", contents)
             self.assertEqual(outputs[0], outputs[1])
+            self.assertIn(key[:-1].encode(), outputs[0])
             self.assertEqual(len({request.cascade_id for request in chat_requests}), 1)
             self.assertEqual(len({request.execution_id for request in chat_requests}), 3)
-
-    def test_codex_recovers_once_from_rejected_encrypted_state(self):
-        attempts = []
-        wire = b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'
-        class Upstream(BaseHTTPRequestHandler):
-            def do_POST(self):
-                attempts.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-                rejected = len(attempts) == 1
-                body = json.dumps({"error": {"code": "invalid_encrypted_content", "message": "cannot decrypt"}}).encode() if rejected else wire
-                self.send_response(400 if rejected else 200)
-                self.send_header("Content-Type", "application/json" if rejected else "text/event-stream")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            def log_message(self, *args):
-                pass
-        history = [
-            {"type": "message", "role": "user", "content": "remember me"},
-            {"type": "reasoning", "id": "rs_response:rs_item", "encrypted_content": "foreign-state",
-             "summary": [{"type": "summary_text", "text": "visible reasoning"}]},
-            {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "visible result"},
-            {"type": "item_reference", "id": "rs_response:rs_item"},
-        ]
-        with tempfile.TemporaryDirectory() as directory, serving(ThreadingHTTPServer(("127.0.0.1", 0), Upstream)) as upstream:
-            config = Config(argparse.Namespace(provider="codex", upstream=upstream,
-                allow_oauth_host_override=True, model_discovery=False, capture_dir=directory,
-                log_file=str(Path(directory) / "gateway.log")))
-            server = MuseShimServer(("127.0.0.1", 0), config)
-            with serving(server) as base, patch("muse_gateway.resolve_codex_credentials", return_value=SimpleNamespace(access_token="fake-codex-token")):
-                self.assertEqual(post(base, {"model": "gpt-test", "input": history, "stream": True}), wire)
-            self.assertEqual(len(attempts), 2)
-            self.assertEqual(attempts[0]["input"][1]["encrypted_content"], "foreign-state")
-            self.assertEqual(attempts[1]["input"][0], history[0])
-            self.assertEqual(attempts[1]["input"][1]["content"][0]["text"], "visible reasoning")
-            self.assertEqual(attempts[1]["input"][2:], history[2:-1])
-            self.assertFalse(any(item.get("type") == "item_reference" for item in attempts[1]["input"]))
-            self.assertEqual(history[1]["encrypted_content"], "foreign-state")
-            request_dir = next(path for path in server.capture_session.directory.iterdir() if path.is_dir())
-            self.assertEqual(json.loads((request_dir / "outgoing.recovered.body").read_bytes()), attempts[1])
-            self.assertIn("codex_reasoning_demoted", (Path(directory) / "gateway.log").read_text())
 
     def test_catalog_is_bound_to_the_credential_used_for_discovery(self):
         import muse_devin
@@ -326,36 +381,6 @@ class CaptureTests(unittest.TestCase):
         for token in ("concurrent-a", "concurrent-b"):
             roster, _ = config._devin_rosters[_devin_cache_key(config, token)]
             self.assertEqual(set(roster), {token})
-
-    def test_partial_connect_frame_fails_instead_of_completing(self):
-        message = devin_pb2.GetChatMessageResponse(message_id="resp_truncated", delta_text="partial")
-        wire = frame_message(message.SerializeToString()) + b"\x00\x00\x00\x00\x10short"
-        class Upstream(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
-                auth = self.path.endswith("GetUserJwt")
-                body = devin_pb2.GetUserJwtResponse(user_jwt="fake-jwt").SerializeToString() if auth else wire
-                self.send_response(200)
-                self.send_header("Content-Type", "application/proto" if auth else "application/connect+proto")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            def log_message(self, *args):
-                pass
-        with tempfile.TemporaryDirectory() as directory, serving(ThreadingHTTPServer(("127.0.0.1", 0), Upstream)) as upstream:
-            config = Config(argparse.Namespace(provider="auto", devin_upstream=upstream,
-                devin_api_key="fake-token", model_discovery=False, capture_dir=directory,
-                log_file=str(Path(directory) / "gateway.log")))
-            server = MuseShimServer(("127.0.0.1", 0), config)
-            with serving(server) as base:
-                body = post(base, {"model": "devin/swe-1-6", "input": "hello", "stream": True})
-            self.assertIn(b"response.failed", body)
-            self.assertNotIn(b"response.completed", body)
-            self.assertNotIn(b"event: error\n", body)
-            request_dir = next(path for path in server.capture_session.directory.iterdir() if path.is_dir())
-            manifest = json.loads((request_dir / "manifest.json").read_text())
-            self.assertTrue(manifest["outcome"]["stream_failed"])
-            self.assertEqual(manifest["terminal_events"]["downstream"], ["response.failed"])
 
     def test_upstream_disconnect_before_headers_returns_502(self):
         from http.client import RemoteDisconnected

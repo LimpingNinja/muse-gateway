@@ -1875,6 +1875,7 @@ class DevinStreamState:
             result["error"] = {
                 "message": self.error_message,
                 "type": self.error_type or "upstream_error",
+                "code": self.error_type or "upstream_error",
             }
         return result
 

@@ -10,7 +10,8 @@
   flags (--model, --yolo), and --help all work. Your working directory is
   preserved for the Muse process. If the port already serves a compatible
   gateway (e.g. from another terminal), Muse attaches to it instead of
-  starting a new one.
+  starting a new one. A Kiro-configured launch instead requires a free port,
+  so this terminal's proxy settings cannot be silently ignored.
 
   Meta models ride your `muse login` subscription (OAuth) via header
   forwarding, so no Meta API key is configured. Codex uses your existing
@@ -25,6 +26,10 @@
   wins over the file. Without a key the launcher warns and continues.
   -LogFile and -MuseBin map to --log-file and --muse-bin; -Port is only
   forwarded when explicitly supplied.
+
+  Kiro Gateway is a separate service. -KiroUpstream, -KiroApiKey, -KiroModels,
+  -KiroContextLimit and -KiroOutputLimit map to the corresponding --kiro-*
+  launcher options. Prefer a private env file for the proxy key.
 
 .EXAMPLE
   .\muse-gateway.ps1
@@ -58,6 +63,11 @@ param(
     [string]$LocalUpstream = "",
     [string]$LocalApiKey = "",
     [string]$LocalModels = "",
+    [string]$KiroUpstream = "",
+    [string]$KiroApiKey = "",
+    [string]$KiroModels = "",
+    [int]$KiroContextLimit,
+    [int]$KiroOutputLimit,
     [string]$LogFile = "",
     [string]$MuseBin = "",
     [string]$EnvFile = "",
@@ -84,6 +94,11 @@ if ($CheckOnly) { $launchArgs += "--check-only" }
 if ($LocalUpstream) { $launchArgs += "--local-upstream", $LocalUpstream }
 if ($LocalApiKey) { $launchArgs += "--local-api-key", $LocalApiKey }
 if ($LocalModels) { $launchArgs += "--local-models", $LocalModels }
+if ($KiroUpstream) { $launchArgs += "--kiro-upstream", $KiroUpstream }
+if ($KiroApiKey) { $launchArgs += "--kiro-api-key", $KiroApiKey }
+if ($KiroModels) { $launchArgs += "--kiro-models", $KiroModels }
+if ($PSBoundParameters.ContainsKey("KiroContextLimit")) { $launchArgs += "--kiro-context-limit", "$KiroContextLimit" }
+if ($PSBoundParameters.ContainsKey("KiroOutputLimit")) { $launchArgs += "--kiro-output-limit", "$KiroOutputLimit" }
 if ($MuseBin) { $launchArgs += "--muse-bin", $MuseBin }
 if ($PythonCommand.Count -gt 1) {
     & $PythonCommand[0] $PythonCommand[1] $GatewayScript @launchArgs @MuseArgs
