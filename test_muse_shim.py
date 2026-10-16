@@ -72,11 +72,10 @@ class TransformTests(unittest.TestCase):
 
     def test_current_claude_oauth_fallback_catalog_and_limits(self):
         auto = config(provider="auto", upstream=None, model_discovery=True)
+        login = SimpleNamespace(access_token="cli-login-token", refresh_token=None,
+                                expires_at=None, auth_mode="oauth")
         with (
-            patch(
-                "muse_gateway.discover_claude_credentials",
-                side_effect=AssertionError("CLI catalog must not inspect HTTP credentials"),
-            ),
+            patch("muse_gateway.discover_claude_credentials", return_value=login),
             patch("muse_gateway.shutil.which", return_value="/bin/claude"),
         ):
             catalog = provider_model_catalog(auto, "claude")
@@ -94,6 +93,34 @@ class TransformTests(unittest.TestCase):
             self.assertEqual(item["context_limit"], 1_000_000)
             self.assertEqual(item["output_limit"], 128_000)
         self.assertEqual(catalog[-1]["output_limit"], 64_000)
+
+    def test_unusable_credentials_hide_codex_and_claude_models(self):
+        auto = config(provider="auto", upstream=None, model_discovery=False)
+        dead_oauth = SimpleNamespace(access_token="dead", refresh_token=None,
+                                     expires_at=time.time() - 3600, auth_mode="oauth")
+        with (
+            patch("muse_gateway.discover_codex_credentials", return_value=dead_oauth),
+            patch("muse_gateway.discover_claude_credentials", return_value=None),
+            patch("muse_gateway.shutil.which", return_value="/bin/claude"),
+        ):
+            self.assertEqual(provider_model_catalog(auto, "codex"), [])
+            self.assertEqual(provider_model_catalog(auto, "claude"), [])
+
+    def test_api_key_and_refreshable_oauth_still_list(self):
+        auto = config(provider="auto", upstream=None, model_discovery=False)
+        api_key = SimpleNamespace(access_token="sk-ant-api-live", refresh_token=None,
+                                  expires_at=None, auth_mode="api_key")
+        stale_but_refreshable = SimpleNamespace(
+            access_token="stale", refresh_token="refresh-live",
+            expires_at=time.time() - 10, auth_mode="oauth")
+        with (
+            patch("muse_gateway.discover_codex_credentials",
+                  return_value=stale_but_refreshable),
+            patch("muse_gateway.discover_claude_credentials", return_value=api_key),
+            patch("muse_gateway.shutil.which", return_value="/bin/claude"),
+        ):
+            self.assertTrue(provider_model_catalog(auto, "codex"))
+            self.assertTrue(provider_model_catalog(auto, "claude"))
 
 
 class FakeUpstreamHandler(BaseHTTPRequestHandler):

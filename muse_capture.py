@@ -39,6 +39,20 @@ def current_capture():
     return _ACTIVE.get()
 
 
+def _secret_field(name):
+    normalized = re.sub(r"[^a-z0-9]", "", str(name).casefold())
+    return (
+        str(name).lower().replace("-", "_") in _SECRET_FIELDS
+        or any(marker in normalized for marker in (
+            "authorization", "authentication", "credential", "password",
+            "passwd", "secret", "cookie", "apikey", "accesstoken",
+            "refreshtoken", "authtoken", "bearertoken", "sessiontoken",
+            "identitytoken", "idtoken", "userjwt", "assignmentjwt",
+        ))
+        or normalized.endswith(("token", "jwt"))
+    )
+
+
 def encoded_secret_forms(value: str) -> set[bytes]:
     """Literal UTF-8 and the JSON string forms used by our serializers.
 
@@ -258,7 +272,7 @@ class RequestCapture:
             result = {}
             for key, item in value.items():
                 safe_key = self.sanitize(key) if isinstance(key, str) else key
-                if str(key).lower().replace("-", "_") in _SECRET_FIELDS:
+                if _secret_field(key):
                     if isinstance(item, str):
                         self.add_secret(item)
                     result[safe_key] = "[REDACTED]"
@@ -325,15 +339,15 @@ class RequestCapture:
         self._append("timeline.jsonl", json.dumps(self.sanitize(record), ensure_ascii=True).encode() + b"\n")
 
     def json(self, name, value):
-        def register(node):
+        def register(node, protected=False):
             if isinstance(node, dict):
                 for key, item in node.items():
-                    if str(key).lower().replace("-", "_") in _SECRET_FIELDS:
-                        self.add_secret(item)
-                    register(item)
+                    register(item, protected or _secret_field(key))
             elif isinstance(node, (list, tuple)):
                 for item in node:
-                    register(item)
+                    register(item, protected)
+            elif protected:
+                self.add_secret(node)
         register(value)
         if name + ".json" in self.artifacts:
             name = self.label(name)
@@ -444,7 +458,7 @@ class RequestCapture:
                 if field.type == field.TYPE_MESSAGE:
                     for child in value if field.is_repeated else (value,):
                         register(child)
-                elif field.type == field.TYPE_STRING and field.name in _SECRET_FIELDS:
+                elif field.type == field.TYPE_STRING and _secret_field(field.name):
                     for item in value if field.is_repeated else (value,):
                         self.add_secret(item)
 
@@ -454,7 +468,7 @@ class RequestCapture:
                     for child in value if field.is_repeated else (value,):
                         scrub(child)
                 elif field.type == field.TYPE_STRING:
-                    if field.name in _SECRET_FIELDS:
+                    if _secret_field(field.name):
                         replacement = "[REDACTED]"
                         if not field.is_repeated:
                             setattr(node, field.name, replacement)

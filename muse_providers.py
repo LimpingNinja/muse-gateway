@@ -280,6 +280,37 @@ def token_is_expiring(
     return expiry is not None and expiry <= _now() + max(0, int(skew_seconds))
 
 
+def credentials_usable(state: Any) -> tuple[bool, str]:
+    """Static usability check: could this stored credential serve requests?
+
+    Mirrors the request-time rejection rules in ``resolve_*_credentials``
+    without touching the network: missing/malformed tokens and OAuth that
+    is already expired with no refresh grant are unusable. Unknown expiry
+    stays usable (it cannot be disproven statically, and resolve proceeds
+    the same way); API keys are always usable here since only the upstream
+    can verify them. Attribute-tolerant: duck-typed states (tests) with
+    missing fields behave like unknown expiry, never crash.
+    """
+    if state is None:
+        return False, "not found"
+    access = getattr(state, "access_token", "") or ""
+    if not isinstance(access, str) or not access.strip():
+        return False, "not found"
+    if any(character in access for character in "\r\n"):
+        return False, "malformed"
+    if getattr(state, "auth_mode", "oauth") == "api_key":
+        return True, "API key"
+    expires_at = getattr(state, "expires_at", None)
+    if (
+        isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and expires_at <= _now()
+        and not (getattr(state, "refresh_token", None) or "")
+    ):
+        return False, "expired without refresh token"
+    return True, "OAuth"
+
+
 def _credential_file_is_readable(path: Path) -> bool:
     try:
         # Credential targets are deliberately not followed through symlinks.
@@ -1307,10 +1338,9 @@ def prepare_codex_request(body: Mapping[str, Any]) -> dict[str, Any]:
     payload.pop("previous_response_id", None)
     history = payload.get("input")
     if isinstance(history, list):
-        # Muse qualifies replayed item ids as response_id:item_id. Codex
-        # accepts only alphanumerics, underscores and dashes. Keep the native
-        # component when unambiguous; hash other invalid ids without changing
-        # call_id (which pairs function calls with their results).
+        # Codex IDs need valid characters and the prefix for their item type.
+        # Muse may qualify IDs or replay messages with reasoning-prefixed IDs.
+        # Preserve native IDs; remap the rest without changing tool call_id.
         occupied = {
             item["id"] for item in history if isinstance(item, dict)
             and isinstance(item.get("id"), str)
@@ -1321,10 +1351,12 @@ def prepare_codex_request(body: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(item, dict) or item.get("type") == "item_reference":
                 continue
             item_id = item.get("id")
-            if not isinstance(item_id, str) or re.fullmatch(r"[A-Za-z0-9_-]+", item_id):
+            prefix = {"reasoning": "rs_", "function_call": "fc_"}.get(item.get("type"), "msg_")
+            if not isinstance(item_id, str) or (
+                item_id.startswith(prefix) and re.fullmatch(r"[A-Za-z0-9_-]+", item_id)
+            ):
                 continue
             if item_id not in remapped:
-                prefix = {"reasoning": "rs_", "function_call": "fc_"}.get(item.get("type"), "msg_")
                 tail = item_id.rsplit(":", 1)[-1]
                 candidate = tail if tail.startswith(prefix) and re.fullmatch(r"[A-Za-z0-9_-]+", tail) else ""
                 if not candidate or candidate in occupied:

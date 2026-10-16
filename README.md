@@ -184,7 +184,10 @@ of credentials, not the process used for inference. Credential lookup uses:
 
 Use `MUSE_GATEWAY_DEVIN_AUTH_DB` for another OMP database and
 `MUSE_GATEWAY_DEVIN_CREDENTIAL_ID` to select a particular stored credential.
-An explicit credential ID targets the store instead of the CLI login.
+Without an explicit ID the first usable stored row wins (expired and
+rejected logins are skipped); an explicit credential ID targets the store
+instead of the CLI login. `doctor --doctor-provider devin` lists every
+active row with its id, identity, and expiry so you can pick one.
 There is no refresh grant in this integration; an expired or rejected login
 means signing in again.
 

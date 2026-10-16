@@ -199,6 +199,26 @@ class ModelsAndReuseTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
+    def test_check_only_reports_per_provider_auth_status(self):
+        with patch.dict(os.environ, self._offline_environment(), clear=True):
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = launch_main([], [
+                        "--port", "0", "--check-only",
+                        "--env-file", str(work / "missing.env"),
+                        "--log-file", str(work / "launch.log"),
+                    ])
+                output = out.getvalue()
+                self.assertEqual(code, 0, output + err.getvalue())
+                self.assertIn("Checking Codex... Found Auth!", output)
+                self.assertIn("Checking Claude... No auth", output)
+                self.assertIn("Checking Meta... Subscription login", output)
+                self.assertIn("Checking Devin... Found Auth!", output)
+                self.assertIn("Checking Kiro... No auth", output)
+                self.assertIn("MUSE_GATEWAY_KIRO_API_KEY", output)
+
     def test_kiro_configured_launch_and_run_refuse_occupied_gateway(self):
         """Do not silently discard new Kiro settings or bind over a Windows server."""
         with patch.dict(os.environ, self._offline_environment(), clear=True):
@@ -277,6 +297,7 @@ class ModelsAndReuseTests(unittest.TestCase):
                 self.assertEqual(code, 0, output.getvalue() + error.getvalue())
                 self.assertIn("kiro/claude-haiku-4.5", output.getvalue())
                 self.assertIn("kiro/auto", output.getvalue())
+                self.assertIn("Checking Kiro... Found Auth!", output.getvalue())
                 self.assertNotIn("synthetic-proxy-key", output.getvalue() + error.getvalue())
 
     def test_models_reads_kiro_env_file_and_explicit_flags_still_win(self):

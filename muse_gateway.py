@@ -74,6 +74,7 @@ from muse_providers import (
     convert_anthropic_stream,
     codex_headers,
     correct_codex_effort,
+    credentials_usable,
     discover_claude_credentials,
     discover_codex_credentials,
     demote_codex_encrypted_reasoning,
@@ -1137,21 +1138,23 @@ def _discover_local_models(config: Config) -> list[dict[str, Any]]:
 def _provider_is_available(config: Config, provider: str) -> bool:
     """True when this system can actually serve the provider's route.
 
-    Codex needs stored credentials; Claude needs its CLI executable (the
-    default print transport owns auth) or HTTP credentials. Meta is always
-    listed: subscription forwarding cannot be verified statically and launch
-    mode provides it. Devin needs a ready credential.
+    Codex needs usable stored credentials; Claude needs usable credentials
+    too, plus its CLI executable when using the default print transport
+    (the CLI owns inference, but login state is still statically visible).
+    Meta is always listed: subscription forwarding cannot be verified
+    statically and launch mode provides it. Devin needs a ready credential.
     Local stays opt-in through its own configured-list and discovery rules
     below. Any lookup failure means unavailable, never an exception: the
     menu must degrade, not crash.
     """
     try:
         if provider == "codex":
-            return discover_codex_credentials(config) is not None
+            return credentials_usable(discover_codex_credentials(config))[0]
         if provider == "claude":
             if config.claude_transport == "cli":
-                return shutil.which(config.claude_cli) is not None
-            return discover_claude_credentials(config) is not None
+                if shutil.which(config.claude_cli) is None:
+                    return False
+            return credentials_usable(discover_claude_credentials(config))[0]
         if provider == "devin":
             return _devin_provider_ready(config)
         if provider == "kiro":
@@ -1895,6 +1898,13 @@ def _capture_http_error(error) -> bytes:
     if capture is not None:
         label = "upstream.error" if "upstream.error.body" not in capture.streams else capture.label("upstream.error")
         capture.json(label + ".headers", {"status": error.code, "headers": dict(error.headers or {})})
+        try:
+            error_value = json.loads(first)
+        except (ValueError, UnicodeError, RecursionError):
+            capture.event(label + ".json_unavailable", reason="non_json_or_incomplete_prefix")
+        else:
+            # Register structured credentials before saving the raw body too.
+            capture.json(label, error_value)
         capture.bytes(label + ".body", first)
         observed = len(first)
         while observed < 64 * 1024 * 1024:
@@ -2873,9 +2883,17 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                         if capture is not None:
                             capture.bytes("outgoing.recovered.body", encoded_body)
                         continue
+                capture_note = ""
+                if capture is not None:
+                    capture_note = f"; private capture: {capture.directory}"
+                else:
+                    capture_note = (
+                        "; enable --capture-dir (MUSE_GATEWAY_CAPTURE_DIR) on a new "
+                        "gateway to retain the upstream error message"
+                    )
                 raise ProviderError(
                     f"Codex upstream returned HTTP {error.code}. "
-                    f"detail={json.dumps(detail)}",
+                    f"detail={json.dumps(detail)}{capture_note}",
                     status=error.code,
                     code="codex_upstream_error",
                 ) from error
@@ -3446,9 +3464,23 @@ def _credential_status(config: Config, provider: str) -> tuple[bool, str]:
         )
     if provider == "claude" and config.claude_transport == "cli":
         executable = shutil.which(config.claude_cli)
-        if executable:
-            return True, f"Claude CLI print transport; executable={executable}"
-        return False, f"Claude CLI executable {config.claude_cli!r} not found"
+        if not executable:
+            return False, f"Claude CLI executable {config.claude_cli!r} not found"
+        try:
+            cli_state = discover_claude_credentials(config)
+        except Exception:
+            cli_state = None
+        cli_usable, cli_reason = credentials_usable(cli_state)
+        if not cli_usable:
+            return (
+                False,
+                f"Claude CLI found but no usable login ({cli_reason}); "
+                "run `claude login` or set an API key",
+            )
+        return (
+            True,
+            f"Claude CLI print transport; executable={executable}; {cli_reason} login",
+        )
     if provider == "devin":
         state = muse_devin.credential_state(
             auth_db_path=config.devin_auth_db,
@@ -3459,25 +3491,90 @@ def _credential_status(config: Config, provider: str) -> tuple[bool, str]:
         if status == "ready":
             identity = state.get("identity")
             if not identity:
-                identity = (
-                    "Devin CLI login"
-                    if state.get("source") == "devin-cli"
-                    else "explicit token"
-                )
-            return True, f"credential ready ({identity})"
+                if state.get("source") == "devin-cli":
+                    identity = "Devin CLI login"
+                elif state.get("source") == "store":
+                    identity = (
+                        f"stored credential id {state.get('credential_id')}"
+                    )
+                else:
+                    identity = "explicit token"
+            detail = f"credential ready ({identity})"
+            if state.get("source") == "store":
+                try:
+                    _store_path, store_rows = muse_devin.list_store_credentials(
+                        config.devin_auth_db
+                    )
+                except Exception:
+                    store_rows = []
+                if len(store_rows) > 1:
+                    detail += (
+                        f"; using id {state.get('credential_id')}"
+                        f" of {len(store_rows)} active"
+                    )
+            return True, detail
         return False, state.get("note") or f"credential {status}"
     try:
         state = discover_codex_credentials(config) if provider == "codex" else discover_claude_credentials(config)
     except Exception:
         state = None
     if state is None:
-        return False, "credentials not found"
+        if provider == "codex":
+            return False, "no OAuth credentials found; run `codex login`"
+        return False, "no OAuth login or API key found; run `claude login`"
+    usable, reason = credentials_usable(state)
+    if not usable:
+        hint = "codex login" if provider == "codex" else "claude login"
+        return False, f"credentials unusable ({reason}); run `{hint}` and try again"
     expiry = "expiry unknown"
     if state.expires_at is not None:
         expiry = "expired" if state.expires_at <= time.time() else "not expired"
     refresh = "refresh available" if state.refresh_token else "no refresh token"
     mode = "API key" if state.auth_mode == "api_key" else "OAuth"
     return True, f"{mode}; {refresh}; {expiry}; source={state.source}"
+
+
+def _print_devin_rows(config: Config, output: Any) -> None:
+    """List stored Devin credentials (ids and expiry, never secrets).
+
+    Gives the ``--devin-credential-id`` menu: one line per active row with
+    the selected marker, so a multi-login store stays operable.
+    """
+    try:
+        store_path, rows = muse_devin.list_store_credentials(config.devin_auth_db)
+    except Exception:
+        return
+    if not rows:
+        return
+    try:
+        selected = muse_devin.credential_state(
+            auth_db_path=config.devin_auth_db,
+            credential_id=config.devin_credential_id,
+            api_key=config.devin_api_key,
+        ).get("credential_id")
+    except Exception:
+        selected = None
+    print(f"devin store: {store_path} ({len(rows)} active)", file=output)
+    for row in rows:
+        expires_at = row.get("expires_at")
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+            expires = time.strftime("%Y-%m-%d", time.gmtime(expires_at / 1000))
+        else:
+            expires = "unknown"
+        identity = row.get("email") or row.get("identity_key") or "?"
+        flags = []
+        if row.get("id") == selected:
+            flags.append("selected")
+        if row.get("expired"):
+            flags.append("expired")
+        if row.get("auth_failed"):
+            flags.append("auth-failed")
+        suffix = f" [{', '.join(flags)}]" if flags else ""
+        print(
+            f"devin credential: id={row.get('id')} identity={identity}"
+            f" expires={expires}{suffix}",
+            file=output,
+        )
 
 
 def run_doctor(config: Config, *, output: Any = None) -> int:
@@ -3523,6 +3620,8 @@ def run_doctor(config: Config, *, output: Any = None) -> int:
                 "thinking disabled; no hard output-cap or forced-tool guarantee; inference not validated by doctor",
                 file=output,
             )
+        if provider == "devin":
+            _print_devin_rows(config, output)
     print("secrets: not displayed", file=output)
     return 0 if ready else 1
 
@@ -3938,6 +4037,36 @@ def _wait_for_health(base_url: str, timeout: float = 15.0) -> dict[str, Any] | N
     return None
 
 
+def _color_enabled() -> bool:
+    """ANSI color only on a live terminal that did not opt out."""
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _paint(text: str, code: str) -> str:
+    if not _color_enabled():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _print_provider_status(config: Config, provider: str) -> None:
+    """One startup line per provider: Checking <Name>... <status>.
+
+    Green when auth is usable, red with the reason when the route will
+    degrade to no models. Plain text when piped or NO_COLOR is set.
+    """
+    ok, detail = _credential_status(config, provider)
+    if ok:
+        status = _paint(f"Found Auth! ({detail})", "32")
+    else:
+        status = _paint(f"No auth ({detail})", "31")
+    print(f"Checking {provider.capitalize()}... {status}")
+
+
 def _port_is_busy(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=1):
@@ -4063,17 +4192,14 @@ def launch_main(
                 file=sys.stderr,
             )
             return 1
-    ok, _ = _credential_status(config, "codex")
-    if not ok:
-        print(
-            "warning: codex route not ready; Codex models will fail until "
-            "`codex login` works",
-            file=sys.stderr,
-        )
-    ok, detail = _credential_status(config, "devin")
-    if not ok:
-        print(f"warning: devin route not ready ({detail})", file=sys.stderr)
-    print("meta/ via Muse subscription login (OAuth forwarding)")
+    _print_provider_status(config, "codex")
+    _print_provider_status(config, "claude")
+    print(
+        "Checking Meta... "
+        + _paint("Subscription login (OAuth forwarding)", "32")
+    )
+    _print_provider_status(config, "devin")
+    _print_provider_status(config, "kiro")
 
     base_url = f"http://{config.host}:{config.port}"
     server: MuseShimServer | None = None

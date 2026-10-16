@@ -54,7 +54,7 @@ from muse_capture import current_capture
 
 
 class DevinCredentialError(DevinWireError):
-    """No usable Devin credential (unconfigured/ambiguous/expired)."""
+    """No usable Devin credential (unconfigured/expired/not-found)."""
 
 
 class DevinDiscoveryError(DevinWireError):
@@ -266,8 +266,14 @@ def read_store_credentials(auth_db_path):
 
 
 def select_credential(active_rows, credential_id=None):
-    """Pick one credential row. Ambiguity without an explicit selector is an
-    error (ratified: stricter than OMP's silent first-row pick)."""
+    """Pick one credential row.
+
+    An explicit id (row id or identity key) wins exactly. Without one, the
+    first usable row in store order is selected (not expired, not
+    401-quarantined); ``--devin-credential-id`` overrides the pick. When no
+    row is usable the first row is returned so diagnostics report the real
+    state (expired/auth-failed) instead of ambiguity.
+    """
     if not active_rows:
         raise DevinCredentialError(
             "no active Devin credential: log in via the Devin CLI or set a token"
@@ -281,11 +287,12 @@ def select_credential(active_rows, credential_id=None):
             f"Devin credential {credential_id!r} not found among"
             f" {len(active_rows)} active row(s)"
         )
-    if len(active_rows) > 1:
-        raise DevinCredentialError(
-            f"{len(active_rows)} active Devin credentials: pass an explicit"
-            " credential id (row id or identity key)"
-        )
+    if len(active_rows) == 1:
+        return active_rows[0]
+    now_ms = int(time.time() * 1000)
+    for row in active_rows:
+        if _row_usable(row, now_ms):
+            return row
     return active_rows[0]
 
 
@@ -317,11 +324,28 @@ def auth_failure_mark(access_token):
     return _AUTH_FAILURE_MARKS.get(_token_fingerprint(access_token))
 
 
+def _row_usable(row, now_ms):
+    """A stored row is usable when not expired and not 401-quarantined.
+
+    Rows without a numeric expiry (hand-built or legacy) count as usable:
+    absence of evidence is not evidence of expiry.
+    """
+    expires_at = row.get("expires_at")
+    if (
+        isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and int(expires_at) <= now_ms + EXPIRY_USE_SKEW_MS
+    ):
+        return False
+    return auth_failure_mark(row.get("access") or "") is None
+
+
 def credential_state(auth_db_path=None, credential_id=None, api_key=None):
     """Resolve credentials into a status dict for diagnostics.
 
-    States: ``ready`` | ``unconfigured`` | ``ambiguous`` | ``expired`` |
-    ``not-found`` | ``auth-failed``. Never raises for credential problems.
+    States: ``ready`` | ``unconfigured`` | ``expired`` | ``not-found`` |
+    ``auth-failed``. Never raises for credential problems. Multiple active
+    rows auto-select the first usable one (see ``select_credential``).
     """
     if api_key:
         mark = auth_failure_mark(api_key)
@@ -376,14 +400,6 @@ def credential_state(auth_db_path=None, credential_id=None, api_key=None):
         row = select_credential(active, credential_id)
     except DevinCredentialError as error:
         text = str(error)
-        if "explicit" in text:
-            return {
-                "state": "ambiguous",
-                "source": "store",
-                "path": resolved,
-                "count": len(active),
-                "note": text,
-            }
         if "not found" in text:
             return {
                 "state": "not-found",
@@ -450,6 +466,37 @@ def resolve_access_token(auth_db_path=None, credential_id=None, api_key=None):
         or f"id:{state.get('credential_id')}"
     )
     return state["access_token"], identity
+
+
+def list_store_credentials(auth_db_path=None):
+    """Token-free summary of active stored rows for diagnostics.
+
+    Returns ``(path, rows)`` where ``path`` is the resolved database (None
+    when none resolves) and each row carries id/identity_key/email/
+    expires_at/expired/auth_failed. Never includes token bytes.
+    """
+    resolved = resolve_auth_db(auth_db_path)
+    if resolved is None:
+        return None, []
+    active, _disabled = read_store_credentials(resolved)
+    now_ms = int(time.time() * 1000)
+    summaries = []
+    for row in active:
+        expires_at = row.get("expires_at")
+        expired = (
+            isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and int(expires_at) <= now_ms + EXPIRY_USE_SKEW_MS
+        )
+        summaries.append({
+            "id": row.get("id"),
+            "identity_key": row.get("identity_key"),
+            "email": row.get("email"),
+            "expires_at": expires_at,
+            "expired": expired,
+            "auth_failed": auth_failure_mark(row.get("access") or "") is not None,
+        })
+    return resolved, summaries
 
 
 # ---------------------------------------------------------------------------

@@ -249,6 +249,50 @@ class GatewayContracts(unittest.TestCase):
                             for part in item.get("content", []) if isinstance(part, dict)), "CODEX_RECOVERY: visible summary lost")
         self.assertEqual(history, original)
 
+    def test_codex_replay_ids_match_item_types_and_keep_references(self):
+        peer = Peer([responses_text("PREFIX_ACCEPTED"), responses_text("REPLAY_ACCEPTED")])
+        base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
+        history = [
+            {"type": "message", "id": "msg_native", "role": "assistant",
+             "content": [{"type": "output_text", "text": "native message"}]},
+            {"type": "message", "id": "rs_foreign_message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "portable message"}]},
+            {"type": "item_reference", "id": "rs_foreign_message"},
+            {"type": "message", "id": "resp_foreign:msg_native", "role": "assistant",
+             "content": [{"type": "output_text", "text": "distinct qualified message"}]},
+            {"type": "item_reference", "id": "resp_foreign:msg_native"},
+            {"type": "reasoning", "id": "msg_foreign_reasoning", "summary": []},
+            {"type": "item_reference", "id": "msg_foreign_reasoning"},
+            {"type": "function_call", "id": "msg_foreign_call", "call_id": "keep-call-id",
+             "name": "echo", "arguments": '{"text":"OK"}'},
+            {"type": "item_reference", "id": "msg_foreign_call"},
+            {"type": "function_call_output", "call_id": "keep-call-id", "output": "RESULT"},
+            {"type": "message", "id": "unqualified", "role": "assistant", "content": []},
+            {"type": "message", "id": "resp_foreign:rs_message", "role": "assistant", "content": []},
+            {"type": "message", "role": "user", "content": "Testing."},
+        ]
+        original = json.loads(json.dumps(history))
+        _, wire = post(base, {"model": "codex/gpt-6.1-sol", "input": history,
+                              "reasoning": {"effort": "low"}, "stream": True})
+        self.assertEqual(consume(wire)["output"][0]["content"][0]["text"], "PREFIX_ACCEPTED")
+        outgoing = peer.requests[0]["input"]
+        self.assertEqual(len(outgoing), len(history))
+        for before, after in zip(history, outgoing):
+            self.assertEqual({key: value for key, value in before.items() if key != "id"},
+                             {key: value for key, value in after.items() if key != "id"})
+            if "id" in after and after["type"] != "item_reference":
+                prefix = {"message": "msg_", "reasoning": "rs_", "function_call": "fc_"}[after["type"]]
+                self.assertRegex(after["id"], "^" + prefix + r"[A-Za-z0-9_-]+$", "CODEX_ID_PREFIX")
+        self.assertEqual(outgoing[0]["id"], "msg_native", "Native IDs must remain unchanged")
+        self.assertNotEqual(outgoing[0]["id"], outgoing[3]["id"], "ID normalization must not merge messages")
+        for item, reference in ((1, 2), (3, 4), (5, 6), (7, 8)):
+            self.assertEqual(outgoing[item]["id"], outgoing[reference]["id"])
+        self.assertEqual(outgoing[7]["call_id"], outgoing[9]["call_id"])
+        self.assertEqual(history, original, "Caller history must not be mutated")
+        _, wire = post(base, {"model": "codex/gpt-6.1-sol", "input": outgoing, "stream": True})
+        self.assertEqual(consume(wire)["status"], "completed")
+        self.assertEqual(peer.requests[1]["input"], outgoing, "Replayed normalization must be idempotent")
+
     def test_codex_recovery_does_not_retry_indefinitely(self):
         rejection = (400, b'{"error":{"code":"invalid_encrypted_content","message":"still rejected"}}')
         peer = Peer([rejection, rejection])

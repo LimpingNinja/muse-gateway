@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -257,6 +258,119 @@ class CaptureTests(unittest.TestCase):
                     self.assertEqual(manifest["first_events"]["downstream"], "response.completed")
                     self.assertEqual(manifest["terminal_events"]["downstream"], ["response.completed"])
             self.assertEqual(outputs, [wire, wire])
+
+    def test_structured_error_capture_redacts_credential_field_variants(self):
+        value = {
+            "error": {
+                "message": "Rejected credential-variant-value and opaque-session-value",
+                "AuthenticationCredential": {"value": "credential-variant-value"},
+                "session_token": "opaque-session-value",
+                "AccessToken": "camel-case-token-value",
+                "param": "input[0].id",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            capture = CaptureSession(directory).request("field-variants")
+            try:
+                capture.json("upstream.error", value)
+                capture.bytes("upstream.error.body", json.dumps(value).encode())
+            finally:
+                capture.finish()
+            saved = json.loads((capture.directory / "upstream.error.json").read_text())
+            self.assertEqual(saved["error"]["message"], "Rejected [REDACTED] and [REDACTED]")
+            self.assertEqual(saved["error"]["AuthenticationCredential"], "[REDACTED]")
+            self.assertEqual(saved["error"]["AccessToken"], "[REDACTED]")
+            self.assertEqual(saved["error"]["param"], "input[0].id")
+            contents = b"".join(path.read_bytes() for path in capture.directory.iterdir())
+            for secret in ("credential-variant-value", "opaque-session-value", "camel-case-token-value"):
+                self.assertNotIn(secret.encode(), contents)
+
+    def test_http_error_capture_preserves_non_json_and_separates_attempts(self):
+        from muse_gateway import _capture_http_error
+        payloads = (b"Plain rejection: invalid input identifier", b'{"error":{"message":"broken',
+                    b'{"error":{"message":"second attempt","param":"input[1].id"}}')
+        with tempfile.TemporaryDirectory() as directory:
+            capture = CaptureSession(directory).request("error-attempts")
+            try:
+                for payload in payloads:
+                    error = urllib.error.HTTPError("https://example.test/responses", 400, "bad", {}, io.BytesIO(payload))
+                    try:
+                        self.assertEqual(_capture_http_error(error), payload)
+                    finally:
+                        error.close()
+            finally:
+                capture.finish()
+            for suffix, payload in zip(("", ".001", ".002"), payloads):
+                self.assertEqual((capture.directory / ("upstream.error" + suffix + ".body")).read_bytes(), payload)
+            self.assertFalse((capture.directory / "upstream.error.json").exists())
+            self.assertEqual(json.loads((capture.directory / "upstream.error.002.json").read_text()), json.loads(payloads[2]))
+            timeline = [json.loads(line) for line in (capture.directory / "timeline.jsonl").read_text().splitlines()]
+            self.assertEqual(sum(row["event"].endswith(".json_unavailable") for row in timeline), 2)
+
+    def test_codex_rejection_keeps_real_error_in_private_capture_only(self):
+        key = "synthetic-codex-login-for-capture"
+        message = "Invalid value at input[0].id: expected a message identifier."
+        error_body = {"error": {
+            "message": message + " credential=" + key,
+            "type": "invalid_request_error", "code": "invalid_value",
+            "param": "input[0].id", "refresh_token": "synthetic-error-refresh",
+        }}
+        wire = json.dumps(error_body).encode()
+        requests = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(wire)))
+                self.end_headers()
+                self.wfile.write(wire)
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, serving(
+            ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        ) as upstream:
+            for enabled in (False, True):
+                with self.subTest(capture=enabled):
+                    log = Path(directory) / f"gateway-{enabled}.log"
+                    config = Config(argparse.Namespace(
+                        provider="codex", upstream=upstream, access_token=key,
+                        model_discovery=False, allow_oauth_host_override=True,
+                        capture_dir=directory if enabled else None, log_file=str(log),
+                    ))
+                    server = MuseShimServer(("127.0.0.1", 0), config)
+                    with patch.dict("os.environ", {}, clear=True), serving(server) as base:
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            post(base, {"model": "gpt-6.1-sol", "input": "Testing.",
+                                        "reasoning": {"effort": "low"}, "stream": True})
+                        with caught.exception as response:
+                            self.assertEqual(response.code, 400)
+                            result = json.load(response)["error"]
+                    self.assertEqual(result["type"], "codex_upstream_error")
+                    self.assertNotIn(message, log.read_text())
+                    self.assertNotIn(message, result["message"])
+                    self.assertNotIn(key, result["message"])
+                    if enabled:
+                        request_dir = server.capture_session.directory / result["request_id"]
+                        saved = json.loads((request_dir / "upstream.error.json").read_text())
+                        self.assertEqual(saved["error"]["param"], "input[0].id")
+                        self.assertEqual(saved["error"]["message"], message + " credential=[REDACTED]")
+                        self.assertEqual(saved["error"]["refresh_token"], "[REDACTED]")
+                        self.assertIn(str(request_dir), result["message"])
+                        body = json.loads((request_dir / "upstream.error.body").read_bytes())
+                        self.assertEqual(body, saved)
+                        contents = b"".join(path.read_bytes() for path in request_dir.iterdir())
+                        for secret in (key, "synthetic-error-refresh"):
+                            self.assertNotIn(secret.encode(), contents)
+                        if os.name != "nt":
+                            self.assertEqual((request_dir / "upstream.error.json").stat().st_mode & 0o777, 0o600)
+                    else:
+                        self.assertNotIn("private capture", result["message"])
+            self.assertEqual(len(requests), 2, "Diagnostic capture must not retry an invalid request")
+            self.assertEqual(requests[0], requests[1], "Capture must not change Codex request bytes")
 
     def test_real_connect_route_captures_frames_without_changing_events(self):
         from muse_devin_wire import ConnectFrameDecoder, iter_chat_frames

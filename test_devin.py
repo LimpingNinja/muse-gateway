@@ -21,10 +21,10 @@ import urllib.error
 import urllib.request
 from unittest.mock import patch
 
-from muse_gateway import Config, MuseShimServer
+from muse_gateway import Config, MuseShimServer, run_doctor
 
 import devin_pb2
-from muse_devin import DevinChatError, DevinCredentialError, DevinModel, DevinStreamState, credential_state, deref_schema_refs, fetch_auth, normalize_configs, normalize_schema_for_google, read_store_credentials, resolve_access_token, run_turn_events, select_credential
+from muse_devin import DevinChatError, DevinCredentialError, DevinModel, DevinStreamState, credential_state, deref_schema_refs, fetch_auth, list_store_credentials, mark_auth_failure, normalize_configs, normalize_schema_for_google, read_store_credentials, resolve_access_token, run_turn_events, select_credential
 from muse_devin_wire import ConnectFrameDecoder, DevinAuthError, DevinFrameError, DevinHttpError, decode_unary, frame_message, unary_rpc
 
 
@@ -174,17 +174,99 @@ class DevinCredentialTests(unittest.TestCase):
         self.assertEqual([row["identity_key"] for row in active], ["a"])
         self.assertEqual([row["identity_key"] for row in disabled], ["b"])
 
-    def test_selection_requires_explicit_id_when_ambiguous(self):
+    def test_selection_auto_picks_first_usable_row(self):
+        now_ms = int(time.time() * 1000)
         rows = [
             {"id": 1, "identity_key": "a", "access": "x"},
             {"id": 2, "identity_key": "b", "access": "y"},
         ]
-        with self.assertRaises(DevinCredentialError):
-            select_credential(rows)
+        self.assertEqual(select_credential(rows)["id"], 1)
         self.assertEqual(select_credential(rows, "b")["id"], 2)
         self.assertEqual(select_credential([rows[0]])["id"], 1)
+        expired_first = [
+            {"id": 1, "identity_key": "a", "access": "x",
+             "expires_at": now_ms - 60000},
+            {"id": 2, "identity_key": "b", "access": "y",
+             "expires_at": now_ms + 3600000},
+        ]
+        self.assertEqual(select_credential(expired_first)["id"], 2)
         with self.assertRaises(DevinCredentialError):
             select_credential([])
+        with self.assertRaises(DevinCredentialError):
+            select_credential(rows, "missing")
+
+    def test_selection_skips_quarantined_token(self):
+        now_ms = int(time.time() * 1000)
+        rows = [
+            {"id": 1, "identity_key": "a", "access": "quarantined-token",
+             "expires_at": now_ms + 3600000},
+            {"id": 2, "identity_key": "b", "access": "healthy-token",
+             "expires_at": now_ms + 3600000},
+        ]
+        mark_auth_failure("quarantined-token", "probe 401")
+        try:
+            self.assertEqual(select_credential(rows)["id"], 2)
+        finally:
+            from muse_devin import _AUTH_FAILURE_MARKS, _token_fingerprint
+            _AUTH_FAILURE_MARKS.pop(_token_fingerprint("quarantined-token"), None)
+
+    def test_multi_row_state_is_ready_not_ambiguous(self):
+        now = int(time.time())
+        path = make_auth_db([
+            ("devin", "oauth", {"access": make_jwt(now + 3600)}, None, "a"),
+            ("devin", "oauth", {"access": make_jwt(now + 7200)}, None, "b"),
+        ])
+        try:
+            state = credential_state(auth_db_path=path)
+            self.assertEqual(state["state"], "ready")
+            self.assertEqual(state["credential_id"], 1)
+            token, identity = resolve_access_token(auth_db_path=path)
+            self.assertEqual(identity, "a")
+            self.assertTrue(token.startswith("eyJ"))
+        finally:
+            os.unlink(path)
+
+    def test_list_store_credentials_is_token_free(self):
+        now = int(time.time())
+        secret = make_jwt(now + 3600)
+        path = make_auth_db([
+            ("devin", "oauth", {"access": secret, "email": "a@x.io"}, None, "a"),
+            ("devin", "oauth", {"access": make_jwt(now - 3600)}, None, "b"),
+        ])
+        try:
+            resolved, rows = list_store_credentials(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(resolved, path)
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        self.assertEqual(rows[0]["email"], "a@x.io")
+        self.assertFalse(rows[0]["expired"])
+        self.assertTrue(rows[1]["expired"])
+        self.assertNotIn(secret, json.dumps(rows))
+        self.assertTrue(all("access" not in row for row in rows))
+
+    def test_doctor_lists_rows_with_selection_and_expiry(self):
+        now = int(time.time())
+        first = make_jwt(now + 3600)
+        path = make_auth_db([
+            ("devin", "oauth", {"access": first, "email": "a@x.io"}, None, "a"),
+            ("devin", "oauth", {"access": make_jwt(now + 7200)}, None, "b"),
+        ])
+        try:
+            cfg = devin_config(devin_api_key=None, devin_auth_db=path,
+                               upstream="http://127.0.0.1:1")
+            cfg.doctor_provider = "devin"
+            output = io.StringIO()
+            self.assertEqual(run_doctor(cfg, output=output), 0)
+        finally:
+            os.unlink(path)
+        rendered = output.getvalue()
+        self.assertIn("using id 1 of 2 active", rendered)
+        self.assertIn("devin credential: id=1", rendered)
+        self.assertIn("devin credential: id=2", rendered)
+        self.assertIn("expires=", rendered)
+        self.assertIn("[selected]", rendered)
+        self.assertNotIn(first, rendered)
 
     def test_credential_state_matrix(self):
         now = int(time.time())
