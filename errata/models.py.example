@@ -1,0 +1,70 @@
+# Kiro Gateway FALLBACK_MODELS configuration example.
+# Captured once from the authenticated working Kiro /v1/models endpoint.
+# Captured UTC: 2026-10-16T21:31:22.314602+00:00
+# Static snapshot; not a guarantee of account entitlement.
+# Replace only the existing FALLBACK_MODELS declaration in kiro/config.py.
+FALLBACK_MODELS = [
+    {
+        "modelId": "auto-kiro"
+    },
+    {
+        "modelId": "claude-haiku-4.5"
+    },
+    {
+        "modelId": "claude-opus-4.5"
+    },
+    {
+        "modelId": "claude-opus-4.6"
+    },
+    {
+        "modelId": "claude-opus-4.7"
+    },
+    {
+        "modelId": "claude-opus-4.8"
+    },
+    {
+        "modelId": "claude-opus-5"
+    },
+    {
+        "modelId": "claude-opus-5.5"
+    },
+    {
+        "modelId": "claude-sonnet-4.5"
+    },
+    {
+        "modelId": "claude-sonnet-4.6"
+    },
+    {
+        "modelId": "claude-sonnet-5"
+    },
+    {
+        "modelId": "claude-sonnet-5.5"
+    },
+    {
+        "modelId": "deepseek-3.2"
+    },
+    {
+        "modelId": "glm-5"
+    },
+    {
+        "modelId": "gpt-5.6-luna"
+    },
+    {
+        "modelId": "gpt-5.6-sol"
+    },
+    {
+        "modelId": "gpt-5.6-terra"
+    },
+    {
+        "modelId": "kimi-k3"
+    },
+    {
+        "modelId": "minimax-m2.1"
+    },
+    {
+        "modelId": "minimax-m2.5"
+    },
+    {
+        "modelId": "qwen3-coder-next"
+    }
+]

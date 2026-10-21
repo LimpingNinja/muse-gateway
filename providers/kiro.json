@@ -1,0 +1,26 @@
+{
+  "fallbacks": [],
+  "models": {
+    "auto-kiro": {"context": 200000, "output": 64000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-haiku-4.5": {"context": 200000, "output": 64000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-opus-4.5": {"context": 200000, "output": 64000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-opus-4.6": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-opus-4.7": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-opus-4.8": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-opus-5": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-opus-5.5": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-sonnet-4.5": {"context": 200000, "output": 64000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-sonnet-4.6": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-sonnet-5": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "claude-sonnet-5.5": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "gpt-5.6-luna": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "gpt-5.6-sol": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "gpt-5.6-terra": {"context": 1000000, "output": 128000, "sources": {"context": "documented", "output": "documented"}},
+    "deepseek-3.2": {"context": 128000, "output": 4000, "sources": {"context": "documented", "output": "user-approved"}},
+    "glm-5": {"context": 204800, "output": 131072, "sources": {"context": "documented", "output": "user-approved"}},
+    "kimi-k3": {"context": 1048576, "output": 131072, "sources": {"context": "documented", "output": "user-approved"}},
+    "minimax-m2.1": {"context": 200000, "output": 8000, "sources": {"context": "documented", "output": "user-approved"}},
+    "minimax-m2.5": {"context": 200000, "output": 8000, "sources": {"context": "documented", "output": "user-approved"}},
+    "qwen3-coder-next": {"context": 256000, "output": 8000, "sources": {"context": "documented", "output": "user-approved"}}
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "fallbacks": ["swe-1-6-fast", "swe-1-6"],
+  "models": {
+    "swe-1-6-fast": {
+      "context": 200000,
+      "output": 128000,
+      "sources": {"context": "bundled-seed", "output": "bundled-seed"},
+      "label": "SWE-1.6 Fast",
+      "reasoning": true,
+      "supports_tools": true,
+      "supports_images": false,
+      "supports_parallel": true,
+      "is_default": false
+    },
+    "swe-1-6": {
+      "context": 200000,
+      "output": 128000,
+      "sources": {"context": "bundled-seed", "output": "bundled-seed"},
+      "label": "SWE-1.6",
+      "reasoning": true,
+      "supports_tools": true,
+      "supports_images": false,
+      "supports_parallel": true,
+      "is_default": true
+    }
+  }
+}

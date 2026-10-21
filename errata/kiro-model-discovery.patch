@@ -1,0 +1,430 @@
+diff --git a/kiro/account_manager.py b/kiro/account_manager.py
+index ec133d9..bfa8681 100644
+--- a/kiro/account_manager.py
++++ b/kiro/account_manager.py
+@@ -40,7 +40,8 @@ import random
+ import time
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Dict, List, Optional
++from typing import Any, Dict, List, Optional
++from urllib.parse import urlsplit
+ 
+ import httpx
+ from loguru import logger
+@@ -64,33 +65,68 @@ from kiro.account_errors import ErrorType
+ from kiro.http_client import KiroHttpClient
+ 
+ 
+-def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
+-    """
+-    Check if auth manager uses runtime endpoint that doesn't provide /ListAvailableModels.
+-    
+-    Runtime endpoint pattern: https://runtime.{region}.kiro.dev
+-    Old endpoint pattern: https://q.{region}.amazonaws.com
+-    
+-    Runtime endpoint does not provide /ListAvailableModels API (AWS limitation).
+-    
++async def _fetch_model_catalog(auth_manager: KiroAuthManager) -> List[Dict[str, Any]]:
++    """Fetch and validate a complete model catalog without changing inference hosts.
++
+     Args:
+-        auth_manager: KiroAuthManager instance
+-    
++        auth_manager: Account with an already resolved API-region Q host.
++
+     Returns:
+-        True if using runtime endpoint, False otherwise
+-    
+-    Examples:
+-        >>> auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+-        >>> _is_runtime_endpoint(auth_manager)
+-        True
+-        >>> auth_manager.api_host = "https://runtime.eu-central-1.kiro.dev"
+-        >>> _is_runtime_endpoint(auth_manager)
+-        True
+-        >>> auth_manager.api_host = "https://q.us-east-1.amazonaws.com"
+-        >>> _is_runtime_endpoint(auth_manager)
+-        False
++        Nonempty model records, retaining all upstream metadata.
++
++    Raises:
++        ValueError: Invalid, empty, duplicate, or paginated catalog.
++        RuntimeError: Non-200 response after the HTTP client's normal retries.
+     """
+-    return "://runtime." in auth_manager.api_host
++    params = {"origin": "AI_EDITOR"}
++    host = urlsplit(auth_manager.q_host).hostname or ""
++    runtime_host = host.startswith("runtime.") and host.endswith(".kiro.dev")
++    if auth_manager.profile_arn and (runtime_host or auth_manager.auth_type == AuthType.KIRO_DESKTOP):
++        params["profileArn"] = auth_manager.profile_arn
++
++    http_client = KiroHttpClient(auth_manager, shared_client=None)
++    try:
++        if runtime_host:
++            # q_host already incorporates per-account/global API-region resolution.
++            management_host = "management." + host[len("runtime."):]
++            response = await http_client.request_with_retry(
++                method="POST", url=f"https://{management_host}/",
++                json_data=params, stream=False,
++                extra_headers={
++                    "Content-Type": "application/x-amz-json-1.0",
++                    "x-amz-target": "AmazonCodeWhispererService.ListAvailableModels",
++                },
++            )
++        else:
++            response = await http_client.request_with_retry(
++                method="GET", url=f"{auth_manager.q_host}/ListAvailableModels",
++                json_data=None, params=params, stream=False,
++            )
++        if response.status_code != 200:
++            raise RuntimeError(f"Model catalog HTTP {response.status_code}")
++        data = response.json()
++        if not isinstance(data, dict):
++            raise ValueError("Model catalog must be a JSON object")
++        # The management pagination request schema is not verified. Never install
++        # only its first page or send guessed nextToken/maxResults parameters.
++        if data.get("nextToken") not in (None, ""):
++            raise ValueError("Incomplete model catalog: pagination is not supported; keeping fallback/stale models")
++        models = data.get("models")
++        if not isinstance(models, list) or not models:
++            raise ValueError("Model catalog must contain a nonempty models list")
++        seen = set()
++        for model in models:
++            if not isinstance(model, dict):
++                raise ValueError("Model catalog contains a non-object record")
++            model_id = model.get("modelId")
++            if not isinstance(model_id, str) or not model_id.strip():
++                raise ValueError("Model catalog contains an invalid modelId")
++            if model_id in seen:
++                raise ValueError("Model catalog contains duplicate modelIds")
++            seen.add(model_id)
++        return models
++    finally:
++        await http_client.close()
+ 
+ 
+ def _format_duration(seconds: float) -> str:
+@@ -497,48 +533,12 @@ class AccountManager:
+             # Get token to verify credentials
+             token = await auth_manager.get_access_token()
+             
+-            # Determine if we should fetch models or use static list
+-            if _is_runtime_endpoint(auth_manager):
+-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
+-                # Use static list without attempting request
+-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
++            try:
++                models_list = await _fetch_model_catalog(auth_manager)
++            except Exception as e:
++                logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
++                logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
+                 models_list = FALLBACK_MODELS
+-            else:
+-                # Old endpoint - attempt to fetch dynamic model list
+-                # Fetch models list with retry + fallback
+-                params = {"origin": "AI_EDITOR"}
+-                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+-                    params["profileArn"] = auth_manager.profile_arn
+-                
+-                list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
+-                
+-                # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
+-                http_client = KiroHttpClient(auth_manager, shared_client=None)
+-                
+-                try:
+-                    response = await http_client.request_with_retry(
+-                        method="GET",
+-                        url=list_models_url,
+-                        json_data=None,
+-                        params=params,
+-                        stream=False
+-                    )
+-                    
+-                    if response.status_code == 200:
+-                        data = response.json()
+-                        models_list = data.get("models", [])
+-                    else:
+-                        # Shouldn't happen (retry handles non-200), but keep for safety
+-                        raise Exception(f"HTTP {response.status_code}")
+-                
+-                except Exception as e:
+-                    # All retries exhausted - use fallback
+-                    logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
+-                    logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
+-                    models_list = FALLBACK_MODELS
+-                
+-                finally:
+-                    await http_client.close()
+             
+             # Create model cache and update
+             model_cache = ModelInfoCache()
+@@ -589,58 +589,25 @@ class AccountManager:
+         if not account or not account.auth_manager:
+             return
+         
+-        # Check if using runtime endpoint (no dynamic model list available)
+-        if _is_runtime_endpoint(account.auth_manager):
+-            # Runtime endpoint does not provide /ListAvailableModels
+-            # Use static list and update cache timestamp
+-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
+-            await account.model_cache.update(FALLBACK_MODELS)
++        try:
++            models_list = await _fetch_model_catalog(account.auth_manager)
++            await account.model_cache.update(models_list)
+             account.models_cached_at = time.time()
++
++            # Update model_to_accounts mapping (new models may have appeared)
++            available_models = account.model_resolver.get_available_models()
++            for model in available_models:
++                if model not in self._model_to_accounts:
++                    self._model_to_accounts[model] = ModelAccountList()
++                if account_id not in self._model_to_accounts[model].accounts:
++                    self._model_to_accounts[model].accounts.append(account_id)
++
++            logger.debug(f"Refreshed models for {account_id}")
+             self._dirty = True
+-            return
+-        
+-        # Old endpoint - attempt to fetch dynamic model list
+-        # Use KiroHttpClient for retry logic
+-        http_client = KiroHttpClient(account.auth_manager, shared_client=None)
+-        
+-        try:
+-            params = {"origin": "AI_EDITOR"}
+-            if account.auth_manager.auth_type == AuthType.KIRO_DESKTOP and account.auth_manager.profile_arn:
+-                params["profileArn"] = account.auth_manager.profile_arn
+-            
+-            list_models_url = f"{account.auth_manager.q_host}/ListAvailableModels"
+-            
+-            response = await http_client.request_with_retry(
+-                method="GET",
+-                url=list_models_url,
+-                json_data=None,
+-                params=params,
+-                stream=False
+-            )
+-            
+-            if response.status_code == 200:
+-                data = response.json()
+-                models_list = data.get("models", [])
+-                await account.model_cache.update(models_list)
+-                account.models_cached_at = time.time()
+-                
+-                # Update model_to_accounts mapping (new models may have appeared)
+-                available_models = account.model_resolver.get_available_models()
+-                for model in available_models:
+-                    if model not in self._model_to_accounts:
+-                        self._model_to_accounts[model] = ModelAccountList()
+-                    if account_id not in self._model_to_accounts[model].accounts:
+-                        self._model_to_accounts[model].accounts.append(account_id)
+-                
+-                logger.debug(f"Refreshed models for {account_id}")
+-                self._dirty = True
+-        
++
+         except Exception as e:
+             # All retries exhausted - keep using stale cache
+             logger.warning(f"Failed to refresh models for {account_id} after retries: {e}")
+-        
+-        finally:
+-            await http_client.close()
+     
+     async def get_next_account(self, model: str, exclude_accounts: Optional[set] = None) -> Optional[Account]:
+         """
+diff --git a/kiro/http_client.py b/kiro/http_client.py
+index 798233f..8fe8a80 100644
+--- a/kiro/http_client.py
++++ b/kiro/http_client.py
+@@ -173,7 +173,8 @@ class KiroHttpClient:
+         url: str,
+         json_data: Optional[dict] = None,
+         params: Optional[dict] = None,
+-        stream: bool = False
++        stream: bool = False,
++        extra_headers: Optional[dict[str, str]] = None,
+     ) -> httpx.Response:
+         """
+         Executes an HTTP request with retry logic.
+@@ -193,6 +194,7 @@ class KiroHttpClient:
+             json_data: Optional JSON body (for POST/PUT/PATCH)
+             params: Optional query parameters (for GET)
+             stream: Use streaming (default False)
++            extra_headers: Per-request protocol headers; defaults remain unchanged.
+         
+         Returns:
+             httpx.Response with successful response
+@@ -214,6 +216,8 @@ class KiroHttpClient:
+                 # Get current token
+                 token = await self.auth_manager.get_access_token()
+                 headers = get_kiro_headers(self.auth_manager, token)
++                if extra_headers:
++                    headers.update(extra_headers)
+                 
+                 # Build request kwargs based on parameters
+                 request_kwargs = {"headers": headers}
+diff --git a/tests/unit/test_account_manager.py b/tests/unit/test_account_manager.py
+index 926d78b..e1491b7 100644
+--- a/tests/unit/test_account_manager.py
++++ b/tests/unit/test_account_manager.py
+@@ -28,6 +28,9 @@ from kiro.account_manager import (
+ from kiro.account_errors import ErrorType
+ from kiro.auth import KiroAuthManager, AuthType
+ from kiro.cache import ModelInfoCache
++from kiro.config import FALLBACK_MODELS
++
++import httpx
+ from kiro.model_resolver import ModelResolver
+ 
+ 
+@@ -1300,3 +1303,92 @@ class TestFormatDuration:
+         """Test formatting days."""
+         assert _format_duration(86400) == "1d"
+         assert _format_duration(172800) == "2d"
++
++
++class TestNativeModelDiscovery:
++    """Model discovery must populate startup and TTL caches without partial data."""
++
++    @pytest.mark.asyncio
++    async def test_runtime_initialization_and_ttl_refresh(self) -> None:
++        """The real caller discovers new models at startup and after TTL expiry."""
++        import hashlib
++        profile = "arn:aws:codewhisperer:eu-central-1:123:profile/test"
++        auth = KiroAuthManager(
++            refresh_token="test-refresh", profile_arn=profile,
++            region="us-west-2", api_region="eu-central-1",
++        )
++        original_hosts = (auth.api_host, auth.q_host)
++        account_id = "refresh_token_" + hashlib.sha256(b"test-refresh").hexdigest()[:16]
++        manager = AccountManager("unused-credentials.json", "unused-state.json")
++        manager._credentials_config = [{"type": "refresh_token", "refresh_token": "test-refresh"}]
++        manager._accounts[account_id] = Account(id=account_id)
++        first = {"modelId": "catalog-new", "tokenLimits": {"maxInputTokens": 123456},
++                 "additionalModelRequestFieldsSchema": {"type": "object"}}
++        second = {"modelId": "catalog-newer", "displayName": "Newer model"}
++        client = AsyncMock()
++        client.request_with_retry.side_effect = [
++            httpx.Response(200, json={"models": [first]}),
++            httpx.Response(200, json={"models": [second]}),
++        ]
++        with patch("kiro.account_manager.KiroAuthManager", return_value=auth), \
++             patch.object(auth, "get_access_token", new=AsyncMock(return_value="test-access")), \
++             patch("kiro.account_manager.KiroHttpClient", return_value=client):
++            account = await manager.get_next_account("catalog-new")
++            assert account is not None and account.model_cache is not None
++            assert account.model_cache.get("catalog-new") == first
++            assert "catalog-new" in manager.get_all_available_models()
++            account.models_cached_at = 1
++            assert await manager.get_next_account("catalog-newer") is account
++        assert account.model_cache.get("catalog-newer") == second
++        assert account.model_cache.get("catalog-new") is None
++        assert account.models_cached_at > 1
++        assert "catalog-newer" in manager.get_all_available_models()
++        assert (auth.api_host, auth.q_host) == original_hosts
++        body = {"origin": "AI_EDITOR"}
++        if profile:
++            body["profileArn"] = profile
++        assert client.request_with_retry.await_count == 2
++        for call in client.request_with_retry.await_args_list:
++            assert call.kwargs == {
++                "method": "POST", "url": "https://management.eu-central-1.kiro.dev/",
++                "json_data": body, "stream": False,
++                "extra_headers": {"Content-Type": "application/x-amz-json-1.0",
++                                  "x-amz-target": "AmazonCodeWhispererService.ListAvailableModels"},
++            }
++        assert client.close.await_count == 2
++
++    @pytest.mark.asyncio
++    async def test_incomplete_catalog_falls_back_then_preserves_stale_cache(self) -> None:
++        """Never install a partial catalog, even if some records look valid."""
++        import hashlib
++        auth = KiroAuthManager(refresh_token="test-refresh", api_region="eu-central-1")
++        account_id = "refresh_token_" + hashlib.sha256(b"test-refresh").hexdigest()[:16]
++        manager = AccountManager("unused-credentials.json", "unused-state.json")
++        manager._credentials_config = [{"type": "refresh_token", "refresh_token": "test-refresh"}]
++        manager._accounts[account_id] = Account(id=account_id)
++        client = AsyncMock()
++        client.request_with_retry.return_value = httpx.Response(
++            200, json={"models": [{"modelId": "partial"}], "nextToken": "page-2"},
++        )
++        with patch("kiro.account_manager.KiroAuthManager", return_value=auth), \
++             patch.object(auth, "get_access_token", new=AsyncMock(return_value="test-access")), \
++             patch("kiro.account_manager.KiroHttpClient", return_value=client), \
++             patch("kiro.account_manager.logger") as log:
++            account = await manager.get_next_account("any-model")
++            assert account is not None and account.model_cache is not None
++            assert set(m["modelId"] for m in FALLBACK_MODELS) <= set(account.model_cache.get_all_model_ids())
++            assert any("Using pre-configured fallback models" in str(c) for c in log.warning.call_args_list)
++            stale = {"modelId": "known-good", "tokenLimits": {"maxInputTokens": 654321}}
++            await account.model_cache.update([stale])
++            account.models_cached_at = 1
++            cache_time = account.model_cache.last_update_time
++            manager._dirty = False
++            assert await manager.get_next_account("known-good") is account
++            assert account.model_cache.get_all_model_ids() == ["known-good"]
++            assert account.model_cache.get("known-good") == stale
++            assert account.models_cached_at == 1
++            assert account.model_cache.last_update_time == cache_time
++            assert manager._dirty is False
++            assert any("Failed to refresh models" in str(c) for c in log.warning.call_args_list)
++        assert client.request_with_retry.await_count == 2
++        assert client.close.await_count == 2
+diff --git a/tests/unit/test_http_client.py b/tests/unit/test_http_client.py
+index 8441b08..27a8797 100644
+--- a/tests/unit/test_http_client.py
++++ b/tests/unit/test_http_client.py
+@@ -1280,4 +1280,51 @@ class TestKiroHttpClientRequestParameters:
+         assert "content" in captured_kwargs, f"content not found: {captured_kwargs}"
+         assert captured_kwargs["params"]["filter"] == "active"
+         assert json.loads(captured_kwargs["content"])["data"] == "value"
+-        assert response.status_code == 200
+\ No newline at end of file
++        assert response.status_code == 200
++
++
++class TestKiroHttpClientExtraHeaders:
++    """Management headers are local to a request, including token-refresh retries."""
++
++    @pytest.mark.asyncio
++    async def test_management_retry_retains_auth_and_does_not_change_inference(self, mock_auth_manager_for_http: Mock) -> None:
++        """Send management then inference through the real HTTP client's public API."""
++        auth = mock_auth_manager_for_http
++        auth.get_access_token.side_effect = ["expired", "refreshed", "refreshed"]
++        transport = AsyncMock()
++        transport.request.side_effect = [
++            httpx.Response(403), httpx.Response(200), httpx.Response(200),
++        ]
++        http_client = KiroHttpClient(auth, shared_client=transport)
++        headers = {
++            "Content-Type": "application/x-amz-json-1.0",
++            "x-amz-target": "AmazonCodeWhispererService.ListAvailableModels",
++        }
++        response = await http_client.request_with_retry(
++            "POST", "https://management.eu-central-1.kiro.dev/",
++            json_data={"origin": "AI_EDITOR"}, extra_headers=headers,
++        )
++        assert response.status_code == 200
++        auth.force_refresh.assert_awaited_once()
++        await http_client.request_with_retry(
++            "POST", "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse",
++            json_data={"conversationState": {}},
++        )
++        calls = transport.request.await_args_list
++        assert len(calls) == 3
++        for i, token in enumerate(["expired", "refreshed"]):
++            sent = calls[i].kwargs
++            assert calls[i].args == ("POST", "https://management.eu-central-1.kiro.dev/")
++            assert json.loads(sent["content"]) == {"origin": "AI_EDITOR"}
++            assert "params" not in sent
++            assert sent["headers"]["Authorization"] == f"Bearer {token}"
++            assert sent["headers"]["x-amz-target"] == headers["x-amz-target"]
++            assert sent["headers"]["Content-Type"] == headers["Content-Type"]
++            assert "User-Agent" in sent["headers"]
++        assert calls[2].kwargs["headers"]["x-amz-target"] == \
++            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
++        assert calls[2].kwargs["headers"]["Authorization"] == "Bearer refreshed"
++        assert headers == {
++            "Content-Type": "application/x-amz-json-1.0",
++            "x-amz-target": "AmazonCodeWhispererService.ListAvailableModels",
++        }
