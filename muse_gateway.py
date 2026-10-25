@@ -2291,27 +2291,13 @@ def _buffered_codex_response(upstream: Any, content_type: str) -> dict[str, Any]
     collapsed here back to the single Responses object the caller asked
     for. Failure terminals raise; a stream that ends without one is a
     truncation error, never silent success.
-    """
-    if "text/event-stream" not in content_type.lower():
-        try:
-            payload = _read_bounded_upstream_body(upstream)
-        except ProviderError:
-            raise
-        except OSError as error:
-            raise ProviderError("Codex turn ended without a response body.",
-                                status=502, code="codex_truncated_stream") from error
-        if isinstance(payload, bytes):
-            payload = payload.decode("utf-8", errors="replace")
-        try:
-            data = json.loads(payload)
-        except ValueError as error:
-            raise ProviderError("Codex turn ended without a response body.",
-                                status=502, code="codex_truncated_stream") from error
-        if isinstance(data, dict):
-            return data
-        raise ProviderError("Codex turn ended without a response body.",
-                            status=502, code="codex_truncated_stream")
 
+    The upstream ``Content-Type`` is only a hint for which reader to try
+    first: a proxy may label a streamed SSE body ``application/json``
+    (or omit the header entirely), so a non-SSE label whose body parses
+    as SSE is collapsed like any other stream. A body that is neither a
+    JSON object nor an SSE stream with a terminal still truncates.
+    """
     def consider(name: str, raw: str) -> dict[str, Any] | None:
         try:
             data = json.loads(raw)
@@ -2338,11 +2324,10 @@ def _buffered_codex_response(upstream: Any, content_type: str) -> dict[str, Any]
                                 status=502, code="codex_upstream_error")
         return None
 
-    event_name = ""
-    data_lines: list[str] = []
-    for chunk in _iter_upstream_chunks(upstream, content_type=content_type):
-        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
-        for line in text.splitlines():
+    def collapse_sse_lines(lines: Iterable[str]) -> dict[str, Any] | None:
+        event_name = ""
+        data_lines: list[str] = []
+        for line in lines:
             if not line.strip():
                 if data_lines:
                     name, raw = event_name, "\n".join(data_lines)
@@ -2358,10 +2343,43 @@ def _buffered_codex_response(upstream: Any, content_type: str) -> dict[str, Any]
                 if sum(len(part) for part in data_lines) > 4 * 1024 * 1024:
                     raise ProviderError("Codex SSE event exceeded the safety size limit.",
                                         status=502, code="upstream_protocol_error")
-    if data_lines:
-        final = consider(event_name, "\n".join(data_lines))
-        if final is not None:
-            return final
+        if data_lines:
+            return consider(event_name, "\n".join(data_lines))
+        return None
+
+    if "text/event-stream" not in content_type.lower():
+        try:
+            payload = _read_bounded_upstream_body(upstream)
+        except ProviderError:
+            raise
+        except OSError as error:
+            raise ProviderError("Codex turn ended without a response body.",
+                                status=502, code="codex_truncated_stream") from error
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="replace")
+        parse_error: ValueError | None = None
+        try:
+            data = json.loads(payload)
+        except ValueError as error:
+            parse_error, data = error, None
+        if isinstance(data, dict):
+            return data
+        lines = payload.splitlines()
+        if any(line.startswith(("event:", "data:")) for line in lines):
+            final = collapse_sse_lines(lines)
+            if final is not None:
+                return final
+        raise ProviderError("Codex turn ended without a response body.",
+                            status=502, code="codex_truncated_stream") from parse_error
+
+    def streamed_lines() -> Iterable[str]:
+        for chunk in _iter_upstream_chunks(upstream, content_type=content_type):
+            text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+            yield from text.splitlines()
+
+    final = collapse_sse_lines(streamed_lines())
+    if final is not None:
+        return final
     raise ProviderError("Codex stream ended without a terminal response event.",
                         status=502, code="codex_truncated_stream")
 

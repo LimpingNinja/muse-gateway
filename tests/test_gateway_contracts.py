@@ -377,6 +377,34 @@ class GatewayContracts(unittest.TestCase):
             self.assertEqual(response.code, 502)
             self.assertEqual(json.load(response)["error"]["type"], "codex_upstream_error")
 
+    def test_codex_nonstream_collapses_sse_body_mislabeled_as_json(self):
+        # Upstream Codex turns are always streamed, but a proxy may label
+        # the SSE body application/json (Peer tuple turns do exactly
+        # that). The buffered collapse must sniff the body rather than
+        # trust the label; failure terminals and a body with no terminal
+        # stay typed errors under the mislabel too.
+        failed = (b'event: response.failed\n'
+                  b'data: {"type":"response.failed","response":{"status":"failed",'
+                  b'"error":{"code":"server_error","message":"boom"}}}\n\n')
+        truncated = responses_text("cut")[:60]
+        peer = Peer([(200, responses_text("MISLABELED_OK")), (200, failed),
+                     (200, truncated), (200, responses_text("STREAMED_OK"))])
+        base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
+        mime, raw = post(base, {"model": "codex/gpt-5.4", "input": "hi", "stream": False})
+        self.assertEqual(mime, "application/json")
+        final = json.loads(raw)
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["output"][0]["content"][0]["text"], "MISLABELED_OK")
+        for expected in ("codex_upstream_error", "codex_truncated_stream"):
+            with self.subTest(expected=expected):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    post(base, {"model": "codex/gpt-5.4", "input": "hi", "stream": False})
+                with caught.exception as response:
+                    self.assertEqual(response.code, 502)
+                    self.assertEqual(json.load(response)["error"]["type"], expected)
+        _, wire = post(base, {"model": "codex/gpt-5.4", "input": "hi", "stream": True})
+        self.assertEqual(consume(wire)["output"][0]["content"][0]["text"], "STREAMED_OK")
+        self.assertEqual(len(peer.requests), 4)
 
     def test_devin_stop_reason_matrix_and_trailer_strictness(self):
         scenarios = {
