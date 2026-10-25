@@ -1,5 +1,4 @@
 import argparse
-from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import gzip
 import hashlib
@@ -18,18 +17,25 @@ import devin_pb2
 from muse_capture import CaptureSession, current_capture
 from muse_devin_wire import frame_message
 from muse_gateway import Config, MuseShimServer
+from tests.peers import serving
 
 
-@contextmanager
-def serving(server):
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=3)
+def _fixed_handler(body, *, status=200, content_type="text/event-stream", requests=None):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            if requests is not None:
+                requests.append(json.loads(raw))
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    return Handler
 
 
 def post(base, body, headers=None):
@@ -228,17 +234,9 @@ class CaptureTests(unittest.TestCase):
 
     def test_capture_preserves_socket_sse_bytes(self):
         wire = b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'
-        class Upstream(BaseHTTPRequestHandler):
-            def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Content-Length", str(len(wire)))
-                self.end_headers()
-                self.wfile.write(wire)
-            def log_message(self, *args):
-                pass
-        with tempfile.TemporaryDirectory() as directory, serving(ThreadingHTTPServer(("127.0.0.1", 0), Upstream)) as upstream:
+        with tempfile.TemporaryDirectory() as directory, serving(
+            ThreadingHTTPServer(("127.0.0.1", 0), _fixed_handler(wire))
+        ) as upstream:
             outputs = []
             for enabled in (False, True):
                 config = Config(argparse.Namespace(provider="generic", upstream=upstream,
@@ -317,22 +315,10 @@ class CaptureTests(unittest.TestCase):
         }}
         wire = json.dumps(error_body).encode()
         requests = []
-
-        class Upstream(BaseHTTPRequestHandler):
-            def do_POST(self):
-                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(wire)))
-                self.end_headers()
-                self.wfile.write(wire)
-
-            def log_message(self, *args):
-                pass
-
-        with tempfile.TemporaryDirectory() as directory, serving(
-            ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
-        ) as upstream:
+        with tempfile.TemporaryDirectory() as directory, serving(ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            _fixed_handler(wire, status=400, content_type="application/json", requests=requests),
+        )) as upstream:
             for enabled in (False, True):
                 with self.subTest(capture=enabled):
                     log = Path(directory) / f"gateway-{enabled}.log"

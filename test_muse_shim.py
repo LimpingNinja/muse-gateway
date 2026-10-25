@@ -10,12 +10,12 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from contextlib import contextmanager, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.contracts import consume
-from tests.peers import responses_text
+from tests.peers import responses_text, serving
 
 from muse_gateway import Config, MuseShimServer, ProviderError, muse_catalog_response, provider_model_catalog, parse_args, run_doctor
 
@@ -37,6 +37,14 @@ def config(**overrides):
 
 
 class TransformTests(unittest.TestCase):
+    def _codex_catalog(self, payload):
+        auto = config(provider="auto", upstream=None)
+        with patch(
+            "muse_gateway.discover_codex_credentials",
+            return_value=SimpleNamespace(access_token="test-token"),
+        ), patch("muse_gateway._credentialed_urlopen", return_value=_ModelsResponse(payload)):
+            return provider_model_catalog(auto, "codex")
+
     def test_discovery_resolves_each_capacity_field_independently(self):
         cases = (
             ("meta", {"data": [{"id": "muse-wonder-1.0"}]},
@@ -82,110 +90,29 @@ class TransformTests(unittest.TestCase):
             self.assertEqual([row["model_id"] for row in provider_model_catalog(cfg, "codex")],
                              ["codex/gpt-6.1-sol", "codex/gpt-6-luna"])
 
-    def test_mocked_codex_discovery_replaces_bundled_fallbacks(self):
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "models": [
-                            {
-                                "slug": "gpt-account-model",
-                                "context_window": 123456,
-                                "max_output_tokens": 7890,
-                            }
-                        ]
-                    }
-                ).encode()
-
-        auto = config(provider="auto", upstream=None)
-        with (
-            patch(
-                "muse_gateway.discover_codex_credentials",
-                return_value=SimpleNamespace(access_token="test-token"),
-            ),
-            patch("muse_gateway._credentialed_urlopen", return_value=Response()),
-        ):
-            catalog = provider_model_catalog(auto, "codex")
+    def test_codex_discovery_replaces_fallbacks_and_curates_rows(self):
+        catalog = self._codex_catalog({"models": [{
+            "slug": "gpt-account-model", "context_window": 123456, "max_output_tokens": 7890,
+        }]})
         self.assertEqual([item["model_id"] for item in catalog], ["codex/gpt-account-model"])
         self.assertEqual(catalog[0]["context_limit"], 123456)
 
-    def test_codex_discovery_keeps_backend_context_and_fills_approved_output(self):
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "models": [
-                            {
-                                "slug": "gpt-6.1-sol",
-                                "context_window": 500000,
-                                "supported_reasoning_levels": [
-                                    {"effort": "low"}, {"effort": "medium"},
-                                ],
-                                "default_reasoning_level": "low",
-                            }
-                        ]
-                    }
-                ).encode()
-
-        auto = config(provider="auto", upstream=None)
-        with (
-            patch(
-                "muse_gateway.discover_codex_credentials",
-                return_value=SimpleNamespace(access_token="test-token"),
-            ),
-            patch("muse_gateway._credentialed_urlopen", return_value=Response()),
-        ):
-            catalog = provider_model_catalog(auto, "codex")
-        (row,) = catalog
+        (row,) = self._codex_catalog({"models": [{
+            "slug": "gpt-6.1-sol", "context_window": 500000,
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}],
+            "default_reasoning_level": "low",
+        }]})
         self.assertEqual(row["model_id"], "codex/gpt-6.1-sol")
-        self.assertEqual(row["context_limit"], 500000)
-        self.assertEqual(row["output_limit"], 128000)
+        self.assertEqual((row["context_limit"], row["output_limit"]), (500000, 128000))
         self.assertFalse(row["limits_verified"])
         self.assertEqual((row["context_source"], row["output_source"]), ("live", "documented"))
 
-    def test_codex_menu_hides_reserve_and_auto_review_slugs(self):
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return json.dumps(
-                    {
-                        "models": [
-                            {"slug": "gpt-6.1-sol", "context_window": 500000},
-                            {"slug": "gpt-reserve", "context_window": 272000},
-                            {"slug": "codex-auto-review", "context_window": 272000},
-                        ]
-                    }
-                ).encode()
-
-        auto = config(provider="auto", upstream=None)
-        with (
-            patch(
-                "muse_gateway.discover_codex_credentials",
-                return_value=SimpleNamespace(access_token="test-token"),
-            ),
-            patch("muse_gateway._credentialed_urlopen", return_value=Response()),
-        ):
-            catalog = provider_model_catalog(auto, "codex")
-        self.assertEqual(
-            [item["model_id"] for item in catalog], ["codex/gpt-6.1-sol"]
-        )
+        catalog = self._codex_catalog({"models": [
+            {"slug": "gpt-6.1-sol", "context_window": 500000},
+            {"slug": "gpt-reserve", "context_window": 272000},
+            {"slug": "codex-auto-review", "context_window": 272000},
+        ]})
+        self.assertEqual([item["model_id"] for item in catalog], ["codex/gpt-6.1-sol"])
 
     def test_current_claude_oauth_fallback_catalog_and_limits(self):
         auto = config(provider="auto", upstream=None, model_discovery=True)
@@ -206,13 +133,8 @@ class TransformTests(unittest.TestCase):
                 "claude/claude-haiku-4-5-20251001",
             ],
         )
-        for item in catalog[:3]:
-            self.assertEqual(item["context_limit"], 1_000_000)
-            self.assertEqual(item["output_limit"], 128_000)
-        self.assertEqual(
-            (catalog[3]["context_limit"], catalog[3]["output_limit"]),
-            (1_000_000, 128_000),
-        )
+        for item in catalog[:4]:
+            self.assertEqual((item["context_limit"], item["output_limit"]), (1_000_000, 128_000))
         self.assertEqual(catalog[3]["limit_source"], "documented")
         self.assertEqual(catalog[-1]["output_limit"], 64_000)
 
@@ -271,10 +193,8 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
 class ProxyTests(unittest.TestCase):
     def test_public_routes_preserve_history_namespaces_and_key_precedence(self):
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
-        worker = threading.Thread(target=upstream.serve_forever, daemon=True)
-        worker.start()
-        try:
-            endpoint = f"http://127.0.0.1:{upstream.server_port}/v1"
+        with serving(upstream) as upstream_base:
+            endpoint = upstream_base + "/v1"
             for route in ("generic", "meta", "local"):
                 with self.subTest(route=route):
                     cfg = config(provider=route, upstream=endpoint, meta_upstream=endpoint, local_upstream=endpoint,
@@ -291,9 +211,7 @@ class ProxyTests(unittest.TestCase):
                                       {"type": "function_call_output", "call_id": "call_original", "output": '1|C:/fixture.txt\n{"exit_code":7,"is_error":true}\n' + "x" * 10000}]}
                     original = json.loads(json.dumps(body))
                     shim = MuseShimServer(("127.0.0.1", 0), cfg)
-                    thread = threading.Thread(target=shim.serve_forever, daemon=True)
-                    thread.start()
-                    try:
+                    with serving(shim):
                         keys = {"generic": ["test-key"], "meta": ["meta-key", "incoming-key"],
                                 "local": ["local-key", None]}[route]
                         for index, expected_key in enumerate(keys):
@@ -321,23 +239,12 @@ class ProxyTests(unittest.TestCase):
                                 self.assertEqual(sent["input"][2], original["input"][2])
                                 self.assertFalse(set(sent) & {"reasoning", "include", "prompt_cache_key"})
                             self.assertEqual(body, original)
-                    finally:
-                        shim.shutdown()
-                        shim.server_close()
-                        thread.join(timeout=5)
-        finally:
-            upstream.shutdown()
-            upstream.server_close()
-            worker.join(timeout=5)
 
     def test_missing_key_is_a_json_error(self):
-        shim_config = config(api_key=None)
-        shim = MuseShimServer(("127.0.0.1", 0), shim_config)
-        shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
-        shim_thread.start()
-        try:
+        shim = MuseShimServer(("127.0.0.1", 0), config(api_key=None))
+        with serving(shim) as base:
             request = urllib.request.Request(
-                f"http://127.0.0.1:{shim.server_port}/responses",
+                base + "/responses",
                 data=b'{"model":"test","input":"hello"}',
                 headers={"Content-Type": "application/json"},
             )
@@ -347,15 +254,12 @@ class ProxyTests(unittest.TestCase):
             with raised.exception as response:
                 error = json.load(response)
             self.assertIn("no upstream API key", error["error"]["message"])
-        finally:
-            shim.shutdown()
-            shim.server_close()
 
 
 class GatewayRoutingTests(unittest.TestCase):
     """Gateway fork: meta/ + local/ routes with native Meta passthrough."""
 
-    def test_kiro_prefixes_do_not_steal_native_bare_model_names(self):
+    def test_model_prefix_routing_is_provider_scoped(self):
         auto = config(
             provider="auto", upstream=None, model_discovery=False,
             kiro_api_key="synthetic-proxy-key", kiro_models="claude-haiku-4.5,auto",
@@ -375,17 +279,15 @@ class GatewayRoutingTests(unittest.TestCase):
         single = config(provider="kiro", upstream=None)
         self.assertEqual(single.resolve_model("auto"), ("kiro", "auto"))
         self.assertEqual(single.resolve_model("claude-haiku-4.5"), ("kiro", "claude-haiku-4.5"))
-
-    def test_single_modes_reject_foreign_prefixes(self):
-        codex_only = config(provider="codex", upstream=None, model_discovery=False)
-        with self.assertRaisesRegex(ProviderError, "belongs to Meta"):
-            codex_only.resolve_model("meta/muse-spark-1.3")
-        generic = config(model_discovery=False)
-        with self.assertRaisesRegex(ProviderError, "belongs to the local upstream"):
-            generic.resolve_model("local/my-alias")
-        meta_only = config(provider="meta", upstream=None, model_discovery=False)
-        with self.assertRaisesRegex(ProviderError, "belongs to Codex"):
-            meta_only.resolve_model("codex/gpt-x")
+        for provider, model, owner in (
+            ("codex", "meta/muse-spark-1.3", "Meta"),
+            ("generic", "local/my-alias", "the local upstream"),
+            ("meta", "codex/gpt-x", "Codex"),
+        ):
+            with self.subTest(provider=provider, model=model), self.assertRaisesRegex(
+                ProviderError, "belongs to " + owner
+            ):
+                config(provider=provider, upstream=None, model_discovery=False).resolve_model(model)
 
 
 class GatewayMetaDiscoveryTests(unittest.TestCase):
@@ -457,7 +359,7 @@ class KiroMetadataTests(unittest.TestCase):
         with patch("muse_gateway.muse_kiro.discover_models", return_value=models.split(",")):
             return provider_model_catalog(cfg, "kiro")
 
-    def test_approved_map_budgets_and_sources(self):
+    def test_approved_map_budgets_sources_and_exact_ids_only(self):
         catalog = self._catalog("gpt-5.6-luna,deepseek-3.2,auto-kiro")
         self.assertEqual(
             {row["model_id"]: (row["context_limit"], row["output_limit"]) for row in catalog},
@@ -469,15 +371,12 @@ class KiroMetadataTests(unittest.TestCase):
         )
         self.assertEqual([row["output_source"] for row in catalog], ["documented", "user-approved", "documented"])
         self.assertTrue(all(not row["limits_verified"] for row in catalog))
-
-    def test_unmapped_and_similar_ids_are_omitted_not_inherited(self):
         with redirect_stderr(io.StringIO()) as output:
             rows = self._catalog("future-model,gpt-5.6-luna-custom,glm-5")
         self.assertEqual([row["model_id"] for row in rows], ["kiro/glm-5"])
         self.assertEqual((rows[0]["context_limit"], rows[0]["output_limit"]), (204800, 131072))
         self.assertIn("missing capacity metadata", output.getvalue())
         self.assertIn("kiro/gpt-5.6-luna-custom", output.getvalue())
-
 
 class _ModelsResponse:
     """Minimal urlopen stand-in serving one JSON payload."""
@@ -533,22 +432,21 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
         self.assertTrue(ready, detail)
         self.assertEqual(cfg.resolve_model("x"), ("local", "x"))
 
-    def test_allowlist_never_fabricates_rows_when_discovery_down(self):
-        def fail_urlopen(request, timeout=None):
-            raise urllib.error.URLError("down")
-
+    def test_local_discovery_down_or_disabled_never_fabricates_rows(self):
         with patch.dict(os.environ, {"MUSE_GATEWAY_MODELS": "local/x"}):
             cfg = self._local_config()
-        with patch("muse_gateway._credentialed_urlopen", new=fail_urlopen), redirect_stderr(io.StringIO()) as output:
+        with patch(
+            "muse_gateway._credentialed_urlopen",
+            side_effect=urllib.error.URLError("down"),
+        ), redirect_stderr(io.StringIO()) as output:
             self.assertEqual(provider_model_catalog(cfg, "local"), [])
         self.assertIn("unresolved MUSE_GATEWAY_MODELS", output.getvalue())
 
-    def test_no_model_discovery_flag_disables(self):
-        def fail_urlopen(request, timeout=None):
-            raise AssertionError("discovery must honor the flag")
-
         cfg = self._local_config(model_discovery=False)
-        with patch("muse_gateway._credentialed_urlopen", new=fail_urlopen):
+        with patch(
+            "muse_gateway._credentialed_urlopen",
+            side_effect=AssertionError("discovery must honor the flag"),
+        ):
             self.assertEqual(provider_model_catalog(cfg, "local"), [])
 
     def test_ollama_tags_answer_when_models_is_empty(self):
@@ -705,32 +603,21 @@ class KiroPublicRoutingTests(unittest.TestCase):
         peer.client_closed = threading.Event()
         peer.chunked_trickle = None
         peer.chunked_framing_finished = threading.Event()
-        peer_thread = threading.Thread(target=peer.serve_forever, daemon=True)
-        peer_thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                values = dict(
-                    provider="auto", upstream=None, model_discovery=False,
-                    kiro_upstream=f"http://127.0.0.1:{peer.server_port}/v1",
-                    log_file=str(Path(directory) / "gateway.log"),
-                    capture_dir=str(Path(directory) / "captures") if capture else None,
-                )
-                values.update(overrides)
-                cfg = config(**values)
-                server = MuseShimServer(("127.0.0.1", 0), cfg)
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                thread.start()
-                try:
-                    yield cfg, f"http://127.0.0.1:{server.server_port}", peer
-                finally:
-                    peer.release_body.set()
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=5)
-        finally:
-            peer.shutdown()
-            peer.server_close()
-            peer_thread.join(timeout=5)
+        with ExitStack() as stack:
+            stack.enter_context(serving(peer))
+            directory = stack.enter_context(tempfile.TemporaryDirectory())
+            values = dict(
+                provider="auto", upstream=None, model_discovery=False,
+                kiro_upstream=f"http://127.0.0.1:{peer.server_port}/v1",
+                log_file=str(Path(directory) / "gateway.log"),
+                capture_dir=str(Path(directory) / "captures") if capture else None,
+            )
+            values.update(overrides)
+            cfg = config(**values)
+            server = MuseShimServer(("127.0.0.1", 0), cfg)
+            base = stack.enter_context(serving(server))
+            stack.callback(peer.release_body.set)
+            yield cfg, base, peer
 
     def _manifest(self, cfg):
         deadline = time.monotonic() + 3
@@ -984,20 +871,7 @@ class KiroPublicRoutingTests(unittest.TestCase):
                         result = json.load(error)
                         self.assertEqual(error.code, 502)
                 self.assertEqual(result["error"]["type"], "kiro_invalid_response")
-                deadline = time.monotonic() + 2
-                manifests = []
-                manifest = None
-                while time.monotonic() < deadline and manifest is None:
-                    manifests = list(Path(cfg.capture_dir).glob("gateway-*/*/manifest.json"))
-                    if manifests:
-                        try:
-                            manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
-                        except (OSError, ValueError):
-                            pass  # The handler may still be closing the manifest.
-                    if manifest is None:
-                        time.sleep(0.01)
-                self.assertEqual(len(manifests), 1)
-                self.assertIsNotNone(manifest)
+                _, manifest = self._manifest(cfg)
                 self.assertTrue(manifest["outcome"]["stream_failed"])
                 self.assertEqual(manifest["outcome"]["status"], 502)
                 if label == "oversized JSON":

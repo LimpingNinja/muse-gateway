@@ -19,10 +19,11 @@ import tempfile
 import threading
 import unittest
 import urllib.request
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from muse_gateway import Config, MuseShimServer, _split_launch_args, ensure_kiro_gateway, launch_main as _launch_main, load_env_file, main, parse_args, run_muse, _kiro_server_python, _port_is_busy, _stop_child
+from tests.peers import serving
 
 
 _EMPTY_ENV_FILE = Path(tempfile.mkdtemp(prefix="muse-gateway-test-env-")) / "empty.env"
@@ -137,7 +138,7 @@ class RemovedDevinConfigTests(unittest.TestCase):
             self.assertIn("removed Devin credential selection", error.getvalue())
             self.assertNotIn("private-value", error.getvalue())
 
-    def test_retired_environment_and_env_file_fail_without_showing_values(self):
+    def test_retired_environment_settings_fail_without_showing_values(self):
         environment = _clean_environment()
         for suffix in ("AUTH_DB", "CREDENTIAL_ID", "DEFAULT_FILE"):
             environment["MUSE_GATEWAY_DEVIN_" + suffix] = "private-value"
@@ -161,8 +162,6 @@ class RemovedDevinConfigTests(unittest.TestCase):
                 self.assertEqual(launch_main([], ["--env-file", str(env_file), "--check-only"]), 2)
             self.assertIn("MUSE_GATEWAY_DEVIN_DEFAULT_FILE", error.getvalue())
             self.assertNotIn("private-value", error.getvalue())
-
-    def test_retired_budget_and_alias_settings_are_diagnostic_only(self):
         environment = _clean_environment()
         environment.update(MUSE_GATEWAY_KIRO_MODEL_BUDGETS="private-value",
                            MUSE_GATEWAY_MAX_OUTPUT_TOKENS="private-value")
@@ -182,7 +181,7 @@ class RemovedDevinConfigTests(unittest.TestCase):
             self.assertEqual(main(["launch", "--kiro-output-limit", "private-value"]), 2)
         self.assertNotIn("private-value", error.getvalue())
 
-    def test_subscription_launch_rejects_explicit_api_billing(self):
+    def test_credential_environment_policy(self):
         environment = _clean_environment()
         environment["META_API_KEY"] = "private-billing-token"
         with patch.dict(os.environ, environment, clear=True), patch(
@@ -192,7 +191,6 @@ class RemovedDevinConfigTests(unittest.TestCase):
         self.assertIn("conflicts with subscription launch", error.getvalue())
         self.assertNotIn("private-billing-token", error.getvalue())
 
-    def test_standard_explicit_token_environment_remains_functional(self):
         environment = _clean_environment()
         environment["DEVIN_API_KEY"] = "ordinary-explicit-token"
         with patch.dict(os.environ, environment, clear=True):
@@ -265,49 +263,29 @@ class ModelsAndReuseTests(unittest.TestCase):
         return environment
 
     def test_launch_attaches_to_compatible_gateway(self):
-        saved = os.environ.copy()
-        environment = self._offline_environment()
-        os.environ.clear()
-        os.environ.update(environment)
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                work = Path(directory)
-                port = _free_port()
-                server_config = Config(parse_args([
-                    "auto", "--port", str(port),
-                    "--log-file", str(work / "server.log"),
-                ]))
-                server = MuseShimServer(
-                    (server_config.host, port), server_config
-                )
-                thread = threading.Thread(
-                    target=server.serve_forever, daemon=True
-                )
-                thread.start()
-                try:
-                    out, err = io.StringIO(), io.StringIO()
-                    with redirect_stdout(out), redirect_stderr(err):
-                        code = launch_main([], [
-                            "--port", str(port), "--check-only",
-                            "--log-file", str(work / "launch.log"),
-                        ])
-                    output = out.getvalue()
-                    self.assertEqual(code, 0)
-                    self.assertIn("reusing existing gateway", output)
-                    self.assertIn("owned by the running gateway", output)  # P2-14
-                    self.assertIn("catalog (", output)
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/health", timeout=5
-                    ) as response:
-                        health = json.loads(response.read().decode("utf-8"))
-                    self.assertTrue(health.get("ok"))
-                finally:
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=5)
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
+        with patch.dict(os.environ, self._offline_environment(), clear=True), \
+                tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            port = _free_port()
+            server_config = Config(parse_args([
+                "auto", "--port", str(port), "--log-file", str(work / "server.log"),
+            ]))
+            server = MuseShimServer((server_config.host, port), server_config)
+            with serving(server):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = launch_main([], [
+                        "--port", str(port), "--check-only",
+                        "--log-file", str(work / "launch.log"),
+                    ])
+                output = out.getvalue()
+                self.assertEqual(code, 0)
+                self.assertIn("reusing existing gateway", output)
+                self.assertIn("owned by the running gateway", output)
+                self.assertIn("catalog (", output)
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as response:
+                    health = json.load(response)
+                self.assertTrue(health.get("ok"))
 
     def test_check_only_reports_per_provider_auth_status(self):
         with patch.dict(os.environ, self._offline_environment(), clear=True):
@@ -337,10 +315,8 @@ class ModelsAndReuseTests(unittest.TestCase):
                     "auto", "--port", "0", "--log-file", str(work / "original.log"),
                 ]))
                 server = MuseShimServer(("127.0.0.1", 0), original)
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                thread.start()
                 port = server.server_port
-                try:
+                with serving(server):
                     for settings in (
                         ["--kiro-api-key", "synthetic-proxy-key"],
                         ["--kiro-upstream", "http://127.0.0.1:1/v1"],
@@ -375,10 +351,6 @@ class ModelsAndReuseTests(unittest.TestCase):
                     self.assertNotIn("synthetic-proxy-key", json.dumps(health))
                     self.assertFalse((work / "launch.log").exists())
                     self.assertFalse((work / "run.log").exists())
-                finally:
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=5)
 
     def test_launch_disabled_discovery_never_fabricates_allowlist_models(self):
         environment = self._offline_environment()
@@ -518,7 +490,9 @@ class LaunchArgTests(unittest.TestCase):
                 self.assertEqual(launch_main([], ["-h"]), 0)
             self.assertIn("launch", output.getvalue())
 
-    def test_env_file_loading_respects_precedence(self):
+    def test_env_file_loading_precedence_and_parser_edges(self):
+        import muse_gateway
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
             path.write_text(
@@ -531,6 +505,24 @@ class LaunchArgTests(unittest.TestCase):
                 self.assertEqual(os.environ["MUSE_GATEWAY_LOCAL_API_KEY"], "")
                 self.assertEqual(os.environ["MUSE_GATEWAY_LOCAL_UPSTREAM"], "http://from-file:4000/v1")
                 self.assertEqual(os.environ["MUSE_GATEWAY_MODELS"], "")
+
+            path.write_bytes(
+                b"\xef\xbb\xbfFIRST_SETTING=one\n"
+                b"export EXPORTED=two\n"
+                b"exportable_T=three\n"
+                b"INLINE=secret # a note\n"
+                b'QUOTED="keep # inside" # trailing note\n'
+                b"SINGLE='also # inside'\n"
+            )
+            expected = {
+                "FIRST_SETTING": "one", "EXPORTED": "two", "exportable_T": "three",
+                "INLINE": "secret", "QUOTED": "keep # inside", "SINGLE": "also # inside",
+            }
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(load_env_file(str(path)), len(expected))
+                for name, value in expected.items():
+                    self.assertEqual(os.environ[name], value)
+                    self.assertIn(name, muse_gateway._FILE_ENV_NAMES)
 
 
 class KiroAutostartTest(unittest.TestCase):
@@ -600,28 +592,47 @@ class KiroAutostartTest(unittest.TestCase):
             argv.extend([f"--{flag.replace('_', '-')}", value])
         return Config(parse_args(argv))
 
-    def test_config_defaults_autostart_off_with_home_checkout(self):
+    @contextmanager
+    def _ensure_stub(self, source, timeout):
+        with patch.dict(os.environ, _clean_environment(), clear=True), \
+                tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "main.py").write_text(source)
+            config = self._kiro_config(directory, _free_port(), autostart=True)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                child = ensure_kiro_gateway(config, timeout=timeout)
+            try:
+                yield child, config, work, output
+            finally:
+                if child is not None:
+                    _stop_child(child)
+
+    def _assert_ensure_does_not_spawn(self, config, expected_note=None):
+        with patch(
+            "muse_gateway.subprocess.Popen",
+            side_effect=AssertionError("must not spawn"),
+        ):
+            self.assertIsNone(ensure_kiro_gateway(config))
+        if expected_note is None:
+            self.assertIsNone(config._kiro_service_note)
+        else:
+            self.assertIn(expected_note, config._kiro_service_note)
+
+    def test_config_autostart_is_cli_only_and_defaults_off(self):
+        expected_dir = os.path.abspath(os.path.expanduser("~/kiro-gateway"))
         with patch.dict(os.environ, _clean_environment(), clear=True):
             config = Config(parse_args(["auto"]))
             self.assertFalse(config.kiro_autostart)
-            self.assertEqual(
-                config.kiro_server_dir,
-                os.path.abspath(os.path.expanduser("~/kiro-gateway")),
-            )
+            self.assertEqual(config.kiro_server_dir, expected_dir)
             self.assertIsNone(config._kiro_service_note)
-
-    def test_config_reads_autostart_env_and_expands_server_dir(self):
-        # P0-02 flip: autostart/server-dir are CLI-only; env is ignored.
         environment = _clean_environment()
         environment["MUSE_GATEWAY_KIRO_AUTOSTART"] = "yes"
         environment["MUSE_GATEWAY_KIRO_SERVER_DIR"] = "~/custom-kiro"
         with patch.dict(os.environ, environment, clear=True):
             config = Config(parse_args(["auto"]))
             self.assertFalse(config.kiro_autostart)
-            self.assertEqual(
-                config.kiro_server_dir,
-                os.path.abspath(os.path.expanduser("~/kiro-gateway")),
-            )
+            self.assertEqual(config.kiro_server_dir, expected_dir)
 
     def test_split_launch_args_parses_autostart_options(self):
         opts, rest = _split_launch_args([
@@ -645,16 +656,34 @@ class KiroAutostartTest(unittest.TestCase):
             venv_python.write_text("stub")
             self.assertEqual(_kiro_server_python(directory), str(venv_python))
 
-    def test_ensure_skips_without_proxy_key(self):
+    def test_ensure_no_spawn_cases(self):
+        def without_key(directory):
+            return Config(parse_args([
+                "auto", "--kiro-autostart",
+                "--kiro-server-dir", directory,
+                "--log-file", str(Path(directory) / "gateway.log"),
+            ]))
+
+        def non_loopback(directory):
+            return Config(parse_args([
+                "auto",
+                "--kiro-api-key", "synthetic-proxy-key",
+                "--kiro-upstream", "https://192.0.2.1:9/v1",
+                "--kiro-autostart",
+                "--kiro-server-dir", directory,
+                "--log-file", str(Path(directory) / "gateway.log"),
+            ]))
+
+        cases = (
+            ("without proxy key", without_key, None),
+            ("autostart off", lambda directory: self._kiro_config(directory, _free_port()), "--kiro-autostart"),
+            ("non-loopback upstream", non_loopback, "not loopback"),
+            ("missing checkout", lambda directory: self._kiro_config(directory, _free_port(), autostart=True), "main.py not found"),
+        )
         with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                config = Config(parse_args([
-                    "auto", "--kiro-autostart",
-                    "--kiro-server-dir", directory,
-                    "--log-file", str(Path(directory) / "gateway.log"),
-                ]))
-                self.assertIsNone(ensure_kiro_gateway(config))
-                self.assertIsNone(config._kiro_service_note)
+            for label, build, expected_note in cases:
+                with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                    self._assert_ensure_does_not_spawn(build(directory), expected_note)
 
     def test_ensure_reports_already_running_service(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -672,9 +701,7 @@ class KiroAutostartTest(unittest.TestCase):
         with patch.dict(os.environ, _clean_environment(), clear=True):
             with tempfile.TemporaryDirectory() as directory:
                 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                thread.start()
-                try:
+                with serving(server):
                     config = self._kiro_config(
                         directory, server.server_port, autostart=True,
                     )
@@ -682,104 +709,30 @@ class KiroAutostartTest(unittest.TestCase):
                     self.assertEqual(
                         config._kiro_service_note, "service already running",
                     )
-                finally:
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=5)
-
-    def test_ensure_off_reports_hint_without_spawning(self):
-        with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                config = self._kiro_config(directory, _free_port())
-                with patch(
-                    "muse_gateway.subprocess.Popen",
-                    side_effect=AssertionError("must not spawn"),
-                ):
-                    self.assertIsNone(ensure_kiro_gateway(config))
-                self.assertIn("--kiro-autostart", config._kiro_service_note)
-
-    def test_ensure_refuses_non_loopback_upstream(self):
-        with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                config = Config(parse_args([
-                    "auto",
-                    "--kiro-api-key", "synthetic-proxy-key",
-                    "--kiro-upstream", "https://192.0.2.1:9/v1",
-                    "--kiro-autostart",
-                    "--kiro-server-dir", directory,
-                    "--log-file", str(Path(directory) / "gateway.log"),
-                ]))
-                with patch(
-                    "muse_gateway.subprocess.Popen",
-                    side_effect=AssertionError("must not spawn"),
-                ):
-                    self.assertIsNone(ensure_kiro_gateway(config))
-                self.assertIn("not loopback", config._kiro_service_note)
-
-    def test_ensure_missing_checkout_reports_failure(self):
-        with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                config = self._kiro_config(directory, _free_port(), autostart=True)
-                with patch(
-                    "muse_gateway.subprocess.Popen",
-                    side_effect=AssertionError("must not spawn"),
-                ):
-                    self.assertIsNone(ensure_kiro_gateway(config))
-                self.assertIn("main.py not found", config._kiro_service_note)
 
     def test_ensure_starts_and_detects_stub_service(self):
-        with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                work = Path(directory)
-                (work / "main.py").write_text(self.stub_main)
-                config = self._kiro_config(
-                    directory, _free_port(), autostart=True,
-                )
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    child = ensure_kiro_gateway(config, timeout=15.0)
-                try:
-                    self.assertIsNotNone(child)
-                    assert child is not None
-                    self.assertIn("service autostarted", config._kiro_service_note or "")
-                    self.assertIn("autostarting from", output.getvalue())
-                    self.assertTrue((work / "autostart.log").exists())
-                    self.assertEqual(
-                        int((work / "stub.pid").read_text().strip()), child.pid,
-                    )
-                    self.assertIsNone(child.poll())
-                finally:
-                    if child is not None:
-                        _stop_child(child)
-                        self.assertFalse(self._pid_alive(child.pid))
+        with self._ensure_stub(self.stub_main, timeout=15.0) as (child, config, work, output):
+            self.assertIsNotNone(child)
+            assert child is not None
+            self.assertIn("service autostarted", config._kiro_service_note or "")
+            self.assertIn("autostarting from", output.getvalue())
+            self.assertTrue((work / "autostart.log").exists())
+            self.assertEqual(int((work / "stub.pid").read_text().strip()), child.pid)
+            self.assertIsNone(child.poll())
+            pid = child.pid
+        self.assertFalse(self._pid_alive(pid))
 
     def test_ensure_timeout_kills_unresponsive_child(self):
-        with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                work = Path(directory)
-                (work / "main.py").write_text(self.sleep_main)
-                config = self._kiro_config(
-                    directory, _free_port(), autostart=True,
-                )
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    self.assertIsNone(ensure_kiro_gateway(config, timeout=2.0))
-                self.assertIn("did not answer", config._kiro_service_note or "")
-                pid = int((work / "stub.pid").read_text().strip())
-                self.assertFalse(self._pid_alive(pid))
+        with self._ensure_stub(self.sleep_main, timeout=2.0) as (child, config, work, _output):
+            self.assertIsNone(child)
+            self.assertIn("did not answer", config._kiro_service_note or "")
+            pid = int((work / "stub.pid").read_text().strip())
+            self.assertFalse(self._pid_alive(pid))
 
     def test_ensure_exited_child_reports_failure(self):
-        with patch.dict(os.environ, _clean_environment(), clear=True):
-            with tempfile.TemporaryDirectory() as directory:
-                work = Path(directory)
-                (work / "main.py").write_text("import sys\nsys.exit(3)\n")
-                config = self._kiro_config(
-                    directory, _free_port(), autostart=True,
-                )
-                output = io.StringIO()
-                with redirect_stdout(output):
-                    self.assertIsNone(ensure_kiro_gateway(config, timeout=10.0))
-                self.assertIn("exited during startup", config._kiro_service_note or "")
+        with self._ensure_stub("import sys\nsys.exit(3)\n", timeout=10.0) as (child, config, _work, _output):
+            self.assertIsNone(child)
+            self.assertIn("exited during startup", config._kiro_service_note or "")
 
     def test_launch_check_only_autostarts_and_stops_service(self):
         environment = _clean_environment()
@@ -906,17 +859,17 @@ class TrustBoundaryTests(unittest.TestCase):
                     Config(args)
                 self.assertEqual(caught.exception.code, "invalid_claude_passthrough")
 
-    def test_passthrough_launch_routing_both_spellings(self):
-        opts, rest = _split_launch_args(["--claude-cli-passthrough", "api-key", "exec", "hi"])
-        self.assertEqual(opts.claude_cli_passthrough, "api-key")
-        self.assertEqual(rest, ["exec", "hi"])
-        opts, rest = _split_launch_args(["--claude-cli-passthrough=none", "exec"])
-        self.assertEqual(opts.claude_cli_passthrough, "none")
-        self.assertEqual(rest, ["exec"])
-
-    def test_subcommand_scanner_contract(self):
+    def test_launch_argument_scanning_and_passthrough_routing(self):
         import muse_gateway
 
+        for argv, expected, rest in (
+            (["--claude-cli-passthrough", "api-key", "exec", "hi"], "api-key", ["exec", "hi"]),
+            (["--claude-cli-passthrough=none", "exec"], "none", ["exec"]),
+        ):
+            with self.subTest(argv=argv):
+                opts, actual_rest = _split_launch_args(argv)
+                self.assertEqual(opts.claude_cli_passthrough, expected)
+                self.assertEqual(actual_rest, rest)
         scan = muse_gateway._subcommand_index
         self.assertEqual(scan(["--kiro-autostart", "launch", "--check-only"], "launch"), 1)
         self.assertEqual(scan(["--models", "launch"], "launch"), 1)
@@ -961,29 +914,6 @@ class TrustBoundaryTests(unittest.TestCase):
         self.assertEqual(launched[0][:3], ["muse", "--provider", "meta"])
         self.assertEqual(launched[0][3], "--base-url")
         self.assertEqual(launched[0][5:], ["exec", "prompt"])
-
-    def test_env_parser_edges(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "edges.env"
-            path.write_bytes(
-                b"\xef\xbb\xbfFIRST_SETTING=one\n"
-                b"export EXPORTED=two\n"
-                b"exportable_T=three\n"
-                b"INLINE=secret # a note\n"
-                b'QUOTED="keep # inside" # trailing note\n'
-                b"SINGLE='also # inside'\n"
-            )
-            names = ("FIRST_SETTING", "EXPORTED", "exportable_T", "INLINE", "QUOTED", "SINGLE")
-            with patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(load_env_file(str(path)), 6)
-                self.assertEqual(os.environ["FIRST_SETTING"], "one")
-                self.assertEqual(os.environ["EXPORTED"], "two")
-                self.assertEqual(os.environ["exportable_T"], "three")
-                self.assertEqual(os.environ["INLINE"], "secret")
-                self.assertEqual(os.environ["QUOTED"], "keep # inside")
-                self.assertEqual(os.environ["SINGLE"], "also # inside")
-                for name in names:
-                    self.assertIn(name, __import__("muse_gateway")._FILE_ENV_NAMES)
 
 
 class LifecycleAndIdentityTests(unittest.TestCase):
@@ -1042,10 +972,7 @@ class LifecycleAndIdentityTests(unittest.TestCase):
             config = Config(parse_args(["auto", "--no-model-discovery", "--port", "0",
                                         "--log-file", str(Path(directory) / "gateway.log")]))
             server = MuseShimServer(("127.0.0.1", 0), config)
-            worker = threading.Thread(target=server.serve_forever, daemon=True)
-            worker.start()
-            try:
-                base = f"http://127.0.0.1:{server.server_port}"
+            with serving(server) as base:
                 with urllib.request.urlopen(base + "/health", timeout=5) as response:
                     health = json.load(response)
                 self.assertNotIn("capture_id", health)
@@ -1061,10 +988,6 @@ class LifecycleAndIdentityTests(unittest.TestCase):
                     muse_gateway._warn_version_mismatch(base, stale)
                 self.assertIn("reporting version 0.0.1", err.getvalue())
                 self.assertIn(f"pid {os.getpid()}", err.getvalue())
-            finally:
-                server.shutdown()
-                server.server_close()
-                worker.join(timeout=5)
         out = io.StringIO()
         with redirect_stdout(out), self.assertRaises(SystemExit) as exited:
             parse_args(["--version"])

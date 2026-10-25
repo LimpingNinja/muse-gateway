@@ -1,5 +1,6 @@
 """Durable checks for the shipped Kiro configuration alternative."""
 
+import json
 from pathlib import Path
 import unittest
 
@@ -7,32 +8,27 @@ import unittest
 ROOT = Path(__file__).resolve().parent
 
 
+def _fallback_ids():
+    namespace = {}
+    example = ROOT / "errata" / "models.py.example"
+    exec(compile(example.read_text(), str(example), "exec"), {}, namespace)
+    return [row["modelId"] for row in namespace["FALLBACK_MODELS"]]
+
+
 class KiroErrataTest(unittest.TestCase):
-    def test_static_models_have_valid_ids_and_existing_alias_shape(self):
-        # Mirror upstream resolver's existing public alias/hiding behavior.
-        namespace = {}
-        example = ROOT / "errata" / "models.py.example"
-        exec(compile(example.read_text(), str(example), "exec"), {}, namespace)
-        rows = namespace["FALLBACK_MODELS"]
-        ids = [row["modelId"] for row in rows]
+    def test_static_models_are_valid_and_in_the_packaged_catalog(self):
+        ids = _fallback_ids()
         self.assertTrue(ids)
         self.assertEqual(len(ids), len(set(ids)))
         self.assertTrue(all(name and not any(char.isspace() for char in name) for name in ids))
-        # Current upstream keeps auto hidden and adds auto-kiro as an alias.
+        # Mirror upstream's public alias/hiding behavior: auto is hidden and
+        # auto-kiro is its exposed alias.
         exposed = (set(ids) - {"auto"}) | {"auto-kiro"}
         self.assertEqual(exposed, set(ids))
         self.assertIn("claude-opus-5.5", exposed)
         self.assertIn("gpt-5.6-sol", exposed)
-
-    def test_static_models_stay_in_lockstep_with_the_packaged_kiro_catalog(self):
-        # P2-06: every example ID is a packaged Kiro model (no standing warning).
-        import json
-        namespace = {}
-        example = ROOT / "errata" / "models.py.example"
-        exec(compile(example.read_text(), str(example), "exec"), {}, namespace)
-        ids = {row["modelId"] for row in namespace["FALLBACK_MODELS"]} - {"auto"}
         packaged = set(json.loads((ROOT / "providers" / "kiro.json").read_text())["models"])
-        self.assertLessEqual(ids, packaged)
+        self.assertLessEqual(set(ids) - {"auto"}, packaged)
 
     def test_patch_does_not_modify_inference_search_or_auth_modules(self):
         patch = (ROOT / "errata" / "kiro-model-discovery.patch").read_text()

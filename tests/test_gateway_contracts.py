@@ -36,6 +36,17 @@ class GatewayContracts(unittest.TestCase):
         self.addCleanup(lambda: self.assertEqual(peer.errors, [], "protocol peer setup failed"))
         return base
 
+    def _post_error(self, base, body=None, *, url=None, request_obj=None):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            if request_obj is not None:
+                urllib.request.urlopen(request_obj, timeout=5)
+            elif url is not None:
+                urllib.request.urlopen(url, timeout=5)
+            else:
+                post(base, body)
+        with caught.exception as response:
+            return response.code, response.headers, json.load(response)
+
     def test_text_and_nonstream_have_equivalent_complete_output(self):
         peer = Peer([text_turn(), text_turn()])
         base = self.start(peer)
@@ -121,11 +132,12 @@ class GatewayContracts(unittest.TestCase):
             with self.subTest(label=label):
                 _, wire = post(base, {"model": "claude/claude-test", "input": "hello", "stream": True})
                 self.assertEqual(consume(wire)["status"], "failed", "FAILURE_SURFACE: Claude failure reported success")
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "claude/claude-test", "input": "continue", "previous_response_id": "resp_missing"})
-        with caught.exception as response:
-            self.assertEqual(response.code, 400)
-            self.assertIn("durable response-state", json.load(response)["error"]["message"])
+        status, _, payload = self._post_error(base, {
+            "model": "claude/claude-test", "input": "continue",
+            "previous_response_id": "resp_missing",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("durable response-state", payload["error"]["message"])
         self.assertEqual(len(peer.requests), 3, "Unsupported native state must fail before opening the upstream")
 
     def test_small_frame_is_visible_while_upstream_is_still_blocked(self):
@@ -184,12 +196,12 @@ class GatewayContracts(unittest.TestCase):
         peer = Peer([b"", (503, b'{"error":{"message":"unavailable"}}')])
         base = self.start(peer)
         for label in ("empty stream", "upstream HTTP error"):
-            with self.subTest(label=label), self.assertRaises(urllib.error.HTTPError) as caught:
-                post(base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
-            with caught.exception as response:
-                self.assertEqual(response.code, 502)
-                self.assertEqual(response.headers.get_content_type(), "application/json")
-                self.assertTrue(json.load(response)["error"]["message"])
+            with self.subTest(label=label):
+                status, headers, payload = self._post_error(
+                    base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
+                self.assertEqual(status, 502)
+                self.assertEqual(headers.get_content_type(), "application/json")
+                self.assertTrue(payload["error"]["message"])
 
     def test_catalog_has_usable_context_not_context_minus_fallback(self):
         catalog = b"".join(field(1, field(1, uid) + field(18, size) + field(22, uid) + field(23, field(13, 64000)))
@@ -200,10 +212,9 @@ class GatewayContracts(unittest.TestCase):
         contexts = {row["id"]: row["metadata"]["muse-code"]["limit"]["context"] for row in rows if row["id"].startswith("devin/")}
         self.assertEqual(contexts, {"devin/small": 200000, "devin/large": 1000000},
                          "CATALOG_CONTEXT: unusable or understated context budget")
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
-        with caught.exception as response:
-            self.assertEqual(json.load(response)["error"]["type"], "devin_unknown_model")
+        _, _, payload = self._post_error(
+            base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
+        self.assertEqual(payload["error"]["type"], "devin_unknown_model")
 
     def test_menu_allowlist_does_not_block_hidden_model_requests(self):
         with patch.dict(os.environ, {"MUSE_GATEWAY_MODELS": "meta/muse-spark-1.3"}):
@@ -331,12 +342,12 @@ class GatewayContracts(unittest.TestCase):
         rejection = (400, b'{"error":{"code":"invalid_encrypted_content","message":"still rejected"}}')
         peer = Peer([rejection, rejection])
         base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "codex/gpt-5.4", "stream": True, "input": [{
-                "type": "reasoning", "encrypted_content": "foreign", "summary": []}]})
-        with caught.exception as response:
-            self.assertEqual(response.code, 400)
-            self.assertEqual(json.load(response)["error"]["type"], "codex_upstream_error")
+        status, _, payload = self._post_error(base, {
+            "model": "codex/gpt-5.4", "stream": True,
+            "input": [{"type": "reasoning", "encrypted_content": "foreign", "summary": []}],
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "codex_upstream_error")
         self.assertEqual(len(peer.requests), 2, "CODEX_RECOVERY: unbounded recovery")
 
     def test_codex_quota_falls_back_to_reserve_once(self):
@@ -365,31 +376,25 @@ class GatewayContracts(unittest.TestCase):
         for outgoing in peer.requests:
             self.assertTrue(outgoing["stream"], "CODEX_STREAM: upstream requires stream:true")
 
-    def test_codex_nonstream_failure_terminal_is_an_error(self):
-        failed = (b'event: response.failed\n'
-                  b'data: {"type":"response.failed","response":{"status":"failed",'
-                  b'"error":{"code":"server_error","message":"boom"}}}\n\n')
-        peer = Peer([failed])
-        base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "codex/gpt-5.4", "input": "hi"})
-        with caught.exception as response:
-            self.assertEqual(response.code, 502)
-            self.assertEqual(json.load(response)["error"]["type"], "codex_upstream_error")
-
-    def test_codex_nonstream_collapses_sse_body_mislabeled_as_json(self):
-        # Upstream Codex turns are always streamed, but a proxy may label
-        # the SSE body application/json (Peer tuple turns do exactly
-        # that). The buffered collapse must sniff the body rather than
-        # trust the label; failure terminals and a body with no terminal
-        # stay typed errors under the mislabel too.
+    def test_codex_nonstream_collapse_outcomes_across_content_type_labels(self):
+        # Bare Peer bytes are labeled text/event-stream; tuple turns are
+        # labeled application/json. Buffered non-streaming must collapse
+        # SSE in both cases and keep failure/truncation outcomes typed.
         failed = (b'event: response.failed\n'
                   b'data: {"type":"response.failed","response":{"status":"failed",'
                   b'"error":{"code":"server_error","message":"boom"}}}\n\n')
         truncated = responses_text("cut")[:60]
-        peer = Peer([(200, responses_text("MISLABELED_OK")), (200, failed),
+        peer = Peer([failed, (200, responses_text("MISLABELED_OK")), (200, failed),
                      (200, truncated), (200, responses_text("STREAMED_OK"))])
         base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
+
+        def expect_error(expected):
+            status, _, payload = self._post_error(
+                base, {"model": "codex/gpt-5.4", "input": "hi", "stream": False})
+            self.assertEqual(status, 502)
+            self.assertEqual(payload["error"]["type"], expected)
+
+        expect_error("codex_upstream_error")
         mime, raw = post(base, {"model": "codex/gpt-5.4", "input": "hi", "stream": False})
         self.assertEqual(mime, "application/json")
         final = json.loads(raw)
@@ -397,14 +402,10 @@ class GatewayContracts(unittest.TestCase):
         self.assertEqual(final["output"][0]["content"][0]["text"], "MISLABELED_OK")
         for expected in ("codex_upstream_error", "codex_truncated_stream"):
             with self.subTest(expected=expected):
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    post(base, {"model": "codex/gpt-5.4", "input": "hi", "stream": False})
-                with caught.exception as response:
-                    self.assertEqual(response.code, 502)
-                    self.assertEqual(json.load(response)["error"]["type"], expected)
+                expect_error(expected)
         _, wire = post(base, {"model": "codex/gpt-5.4", "input": "hi", "stream": True})
         self.assertEqual(consume(wire)["output"][0]["content"][0]["text"], "STREAMED_OK")
-        self.assertEqual(len(peer.requests), 4)
+        self.assertEqual(len(peer.requests), 5)
 
     def test_devin_stop_reason_matrix_and_trailer_strictness(self):
         scenarios = {
@@ -469,11 +470,9 @@ class GatewayContracts(unittest.TestCase):
         threading.Thread(target=reset_once, daemon=True).start()
         peer = Peer([])
         base = self.start(peer, meta_upstream=f"http://127.0.0.1:{port}")
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": False})
-        with caught.exception as response:
-            self.assertEqual(response.code, 502)
-            payload = json.load(response)
+        status, _, payload = self._post_error(
+            base, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": False})
+        self.assertEqual(status, 502)
         self.assertIn(payload["error"]["type"], {"upstream_reset", "upstream_unreachable"})
 
     def test_deeply_nested_body_is_a_400_not_a_drop(self):
@@ -483,9 +482,8 @@ class GatewayContracts(unittest.TestCase):
             base + "/responses", data=b"[" * 10000,
             headers={"Content-Type": "application/json"},
         )
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(req, timeout=5)
-        self.assertEqual(caught.exception.code, 400)
+        status, _, _ = self._post_error(base, request_obj=req)
+        self.assertEqual(status, 400)
 
     def test_previous_response_id_policy_is_identical_across_stateless_routes(self):
         # P1-06 (inverts R21): null/"" proceed; full history drops + logs;
@@ -515,11 +513,9 @@ class GatewayContracts(unittest.TestCase):
                     logged = log.read_text().count("previous_response_id_dropped") if log.exists() else 0
                     body = {"model": model, "input": history, "stream": True, "previous_response_id": previous}
                     if outcome == "reject":
-                        with self.assertRaises(urllib.error.HTTPError) as caught:
-                            post(base, body)
-                        with caught.exception as response:
-                            self.assertEqual(response.code, 400)
-                            self.assertTrue(json.load(response)["error"]["type"].endswith("_previous_response_unsupported"))
+                        status, _, payload = self._post_error(base, body)
+                        self.assertEqual(status, 400)
+                        self.assertTrue(payload["error"]["type"].endswith("_previous_response_unsupported"))
                         self.assertEqual(len(peer.requests), before, "delta-only reached inference")
                         continue
                     _, wire = post(base, body)
@@ -558,10 +554,9 @@ class GatewayContracts(unittest.TestCase):
         self.addCleanup(lambda: [conn.close() for conn, _ in silent])
         port = listener.getsockname()[1]
         slow = self.start(Peer([]), meta_upstream=f"http://127.0.0.1:{port}", timeout=1)
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(slow, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": True})
-        with caught.exception as response:
-            self.assertEqual(response.code, 502)
+        status, _, _ = self._post_error(
+            slow, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": True})
+        self.assertEqual(status, 502)
 
         # The slow gateway runs with timeout=1, so the body deadline is
         # max(floor, 1) once the 60 s floor is lowered for the test.
@@ -655,11 +650,9 @@ class GatewayContracts(unittest.TestCase):
         peer = Peer([chat("partial", stop=13) + TRAILER])
         base = self.start(peer)
         with patch("muse_gateway.provider_model_catalog", side_effect=RuntimeError("boom")):
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(base + "/muse-code/models", timeout=5)
-        with caught.exception as response:
-            self.assertEqual(response.code, 500)
-            self.assertEqual(json.load(response)["error"]["type"], "internal_error")
+            status, _, payload = self._post_error(base, url=base + "/muse-code/models")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["type"], "internal_error")
         _, raw = post(base, {"model": "devin/swe-1-6", "input": "hi", "stream": False})
         self.assertEqual(json.loads(raw)["status"], "failed")
         logs = (Path(self.directory) / "gateway.log").read_text()
@@ -677,12 +670,11 @@ class GatewayContracts(unittest.TestCase):
         with patch("muse_gateway.CODEX_RESERVE_MODEL", "gpt-5.4"):
             for model in ("meta/muse-spark-1.3", "codex/gpt-5.4", "devin/swe-1-6"):
                 with self.subTest(model=model):
-                    with self.assertRaises(urllib.error.HTTPError) as caught:
-                        post(base, {"model": model, "input": "hi", "stream": True})
-                    with caught.exception as response:
-                        self.assertEqual(response.code, 429)
-                        self.assertEqual(response.headers.get("Retry-After"), "7")
-                        error = json.load(response)["error"]
+                    status, headers, payload = self._post_error(
+                        base, {"model": model, "input": "hi", "stream": True})
+                    self.assertEqual(status, 429)
+                    self.assertEqual(headers.get("Retry-After"), "7")
+                    error = payload["error"]
                     self.assertEqual(error["upstream_request_id"], "req_fixture_7")
                     if model.startswith("devin/"):
                         self.assertNotIn(sentinel, json.dumps(error))
@@ -695,12 +687,11 @@ class GatewayContracts(unittest.TestCase):
         self.addCleanup(_AUTH_FAILURE_MARKS.pop, _token_fingerprint(token), None)
         peer = Peer([(401, json.dumps({"error": {"message": sentinel + " " + token}}).encode())])
         base = self.start(peer, devin_api_key=token)
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
-        with caught.exception as response:
-            self.assertEqual(response.code, 401)
-            raw = response.read().decode()
-        self.assertEqual(json.loads(raw)["error"]["type"], "devin_upstream_unauthorized")
+        status, _, payload = self._post_error(
+            base, {"model": "devin/swe-1-6", "input": "hi", "stream": True})
+        self.assertEqual(status, 401)
+        raw = json.dumps(payload)
+        self.assertEqual(payload["error"]["type"], "devin_upstream_unauthorized")
         self.assertNotIn(sentinel, raw)
         self.assertNotIn(token, raw)
         self.assertIsNotNone(auth_failure_mark(token))

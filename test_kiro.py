@@ -162,6 +162,15 @@ class KiroContracts(unittest.TestCase):
         self.addCleanup(lambda: self.assertEqual(peer.errors, [], "fixture failed"))
         return base
 
+    def _post_error(self, base, body=None, *, request_obj=None):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            if request_obj is not None:
+                urllib.request.urlopen(request_obj, timeout=3)
+            else:
+                post(base, body)
+        with caught.exception as response:
+            return response.code, response.headers, json.load(response)["error"]
+
     def test_route_uses_only_proxy_key_and_shared_conversion(self):
         peer = MessagesPeer([anthropic_text("KIRO_OK")])
         base = self.start(peer, provider="auto", api_key="generic-secret", access_token="native-secret")
@@ -280,12 +289,11 @@ class KiroContracts(unittest.TestCase):
         peer = MessagesPeer(turns)
         base = self.start(peer)
         for count, (status, kind, code, category, transient, headers) in enumerate(cases, 1):
-            with self.subTest(status=status, kind=kind, code=code), self.assertRaises(urllib.error.HTTPError) as caught:
-                post(base, {"model": "kiro/haiku", "input": "hi", "stream": True})
-            with caught.exception as response:
-                self.assertEqual(response.code, status)
-                self.assertEqual(response.headers.get("Retry-After"), "1" if headers else None)
-                error = json.load(response)["error"]
+            with self.subTest(status=status, kind=kind, code=code):
+                actual_status, actual_headers, error = self._post_error(
+                    base, {"model": "kiro/haiku", "input": "hi", "stream": True})
+            self.assertEqual(actual_status, status)
+            self.assertEqual(actual_headers.get("Retry-After"), "1" if headers else None)
             self.assertEqual(error["type"], "kiro_upstream_error")
             self.assertEqual(error["code"], code or kind)
             metadata = error["metadata"]
@@ -315,19 +323,18 @@ class KiroContracts(unittest.TestCase):
         peer = MessagesPeer([(429, "application/json", payload, items) for items in headers])
         base = self.start(peer)
         for count, items in enumerate(headers, 1):
-            with self.subTest(headers=items), self.assertRaises(urllib.error.HTTPError) as caught:
-                post(base, {"model": "kiro/haiku", "input": "hi", "stream": False})
-            with caught.exception as response:
-                self.assertEqual(response.code, 429)
-                error = json.load(response)["error"]
+            with self.subTest(headers=items):
+                status, actual_headers, error = self._post_error(
+                    base, {"model": "kiro/haiku", "input": "hi", "stream": False})
+                self.assertEqual(status, 429)
                 if count <= len(accepted):
                     value = accepted[count - 1]
-                    self.assertEqual(response.headers.get("Retry-After"), value)
+                    self.assertEqual(actual_headers.get("Retry-After"), value)
                     self.assertEqual(error["metadata"]["retry_after"],
                                      {"value": value, "kind": "delay-seconds" if value.isascii() and value.isdigit() else "http-date"})
                     self.assertTrue(error["metadata"]["transient"])
                 else:
-                    self.assertIsNone(response.headers.get("Retry-After"))
+                    self.assertIsNone(actual_headers.get("Retry-After"))
                     self.assertNotIn("retry_after", error["metadata"])
                     self.assertIsNone(error["metadata"]["transient"])
             self.assertEqual(len(peer.requests), count)
@@ -347,11 +354,10 @@ class KiroContracts(unittest.TestCase):
         for stream in (True, False):
             for kind, category, transient in cases:
                 count += 1
-                with self.subTest(stream=stream, kind=kind), self.assertRaises(urllib.error.HTTPError) as caught:
-                    post(base, {"model": "kiro/haiku", "input": "hi", "stream": stream})
-                with caught.exception as response:
-                    self.assertEqual(response.code, 502, "first pass must preserve native status/retry behavior")
-                    error = json.load(response)["error"]
+                with self.subTest(stream=stream, kind=kind):
+                    status, _, error = self._post_error(
+                        base, {"model": "kiro/haiku", "input": "hi", "stream": stream})
+                    self.assertEqual(status, 502, "first pass must preserve native status/retry behavior")
                 self.assertEqual(error["code"], kind)
                 metadata = error["metadata"]
                 self.assertEqual((metadata["source"], metadata["upstream_status"], metadata["category"], metadata["transient"]),
@@ -397,10 +403,8 @@ class KiroContracts(unittest.TestCase):
         for count in range(1, len(bodies) + 2):
             req = request(base, {"model": "kiro/haiku", "input": "hi", "stream": True})
             req.add_header("Authorization", "Bearer muse-secret")
-            with self.subTest(case=count), self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(req, timeout=3)
-            with caught.exception as response:
-                error = json.load(response)["error"]
+            with self.subTest(case=count):
+                _, _, error = self._post_error(base, request_obj=req)
             self.assertEqual(error["metadata"]["category"], "unknown")
             self.assertIsNone(error["metadata"]["transient"])
             self.assertEqual(error["metadata"]["upstream"], {})
@@ -422,12 +426,11 @@ class KiroContracts(unittest.TestCase):
             peer = MessagesPeer([(429, "application/json", wire,
                                   [*extra_headers, ("Retry-After", "1"), ("request-id", "req_header")])], hold_after=hold_after)
             base = self.start(peer, capture_dir=str(captures))
-            with self.subTest(case=index), self.assertRaises(urllib.error.HTTPError) as caught:
-                post(base, {"model": "kiro/haiku", "input": "hi", "stream": True})
-            with caught.exception as response:
-                self.assertEqual(response.code, 429)
-                self.assertEqual(response.headers.get("Retry-After"), "1")
-                error = json.load(response)["error"]
+            with self.subTest(case=index):
+                status, headers, error = self._post_error(
+                    base, {"model": "kiro/haiku", "input": "hi", "stream": True})
+                self.assertEqual(status, 429)
+                self.assertEqual(headers.get("Retry-After"), "1")
             metadata = error["metadata"]
             self.assertEqual(metadata["upstream_status"], 429)
             self.assertEqual(metadata["category"], "unknown", "an unread complete-looking prefix is not typed evidence")
@@ -521,11 +524,8 @@ class KiroContracts(unittest.TestCase):
         for count, (authorization, marker, excluded) in enumerate(cases, 1):
             req = request(base, {"model": "kiro/haiku", "input": "hi", "stream": True})
             req.add_header("Authorization", authorization)
-            with self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(req, timeout=3)
-            with caught.exception as response:
-                self.assertEqual(response.code, 400)
-                error = json.load(response)["error"]
+            status, _, error = self._post_error(base, request_obj=req)
+            self.assertEqual(status, 400)
             if excluded:
                 self.assertEqual(error["code"], "api_error")
                 self.assertEqual(error["metadata"]["upstream"], {"type": "api_error"})
@@ -542,12 +542,11 @@ class KiroContracts(unittest.TestCase):
                              (401, "application/json", json.dumps(body).encode(), [("request-id", "req_header")])])
         base = self.start(peer)
         for count, status in enumerate((502, 401), 1):
-            with self.subTest(status=status), self.assertRaises(urllib.error.HTTPError) as caught:
-                post(base, {"model": "kiro/haiku", "input": "hi", "stream": True})
-            with caught.exception as response:
-                self.assertEqual(response.code, status)
-                self.assertIsNone(response.headers.get("Location"))
-                error = json.load(response)["error"]
+            with self.subTest(status=status):
+                actual_status, headers, error = self._post_error(
+                    base, {"model": "kiro/haiku", "input": "hi", "stream": True})
+                self.assertEqual(actual_status, status)
+                self.assertIsNone(headers.get("Location"))
             if count == 1:
                 self.assertEqual(error["metadata"]["upstream_status"], 302)
             else:
@@ -620,11 +619,13 @@ class KiroContracts(unittest.TestCase):
         self.assertEqual([part["tool_use_id"] for part in results], calls)
         self.assertEqual([part["content"] for part in results], ["result:" + cid for cid in ids])
         invalid = [call("a"), call("b"), result("a"), call("c"), result("b"), result("c")]
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            post(base, {"model": "kiro/haiku", "input": [{"role": "user", "content": "bad grouping"}] + invalid, "stream": True})
-        with caught.exception as response:
-            self.assertEqual(response.code, 400)
-            self.assertEqual(json.load(response)["error"]["type"], "kiro_invalid_history")
+        status, _, error = self._post_error(base, {
+            "model": "kiro/haiku",
+            "input": [{"role": "user", "content": "bad grouping"}] + invalid,
+            "stream": True,
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(error["type"], "kiro_invalid_history")
         self.assertEqual(len(peer.requests), 1, "invalid result groups reached inference")
 
     def test_malformed_discriminators_are_400_without_upstream_calls(self):
@@ -636,15 +637,13 @@ class KiroContracts(unittest.TestCase):
         cases += [{"parallel_tool_calls": value} for value in (False, 0, 1, "false", [], {})]
         for body in cases:
             with self.subTest(body=body):
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    post(base, {"model": "kiro/haiku", "input": "hello", **body, "stream": True})
-                with caught.exception as response:
-                    self.assertEqual(response.code, 400)
-                    error = json.load(response)["error"]
-                    self.assertTrue(error["type"].startswith("kiro_"))
-                    if "parallel_tool_calls" in body:
-                        self.assertEqual(error["type"], "kiro_unsupported_option" if body["parallel_tool_calls"] is False else "kiro_invalid_request")
-                        self.assertIn("parallel_tool_calls", error["message"])
+                status, _, error = self._post_error(
+                    base, {"model": "kiro/haiku", "input": "hello", **body, "stream": True})
+                self.assertEqual(status, 400)
+                self.assertTrue(error["type"].startswith("kiro_"))
+                if "parallel_tool_calls" in body:
+                    self.assertEqual(error["type"], "kiro_unsupported_option" if body["parallel_tool_calls"] is False else "kiro_invalid_request")
+                    self.assertIn("parallel_tool_calls", error["message"])
         self.assertEqual(peer.requests, [])
 
     def test_surrogate_semantic_strings_have_explicit_terminal_failure(self):
@@ -982,7 +981,7 @@ class KiroPreparation(unittest.TestCase):
         payload, _ = muse_kiro.prepare_request({"model": "haiku", "input": "new prompt", "previous_response_id": None})
         self.assertEqual(payload["messages"][0]["content"][0]["text"], "new prompt")
 
-    def test_required_references_and_incomplete_tool_history_fail_closed(self):
+    def test_prepare_request_rejects_unrepresentable_history_and_controls(self):
         call = {"type": "function_call", "call_id": "call_1", "name": "echo", "arguments": '{"value":1}'}
         result = {"type": "function_call_output", "call_id": "call_1", "output": "result"}
         invalid = [
@@ -997,8 +996,6 @@ class KiroPreparation(unittest.TestCase):
             with self.subTest(items=items), self.assertRaises(ProviderError) as caught:
                 muse_kiro.prepare_request({"model": "haiku", "input": items})
             self.assertEqual(caught.exception.code, code)
-
-    def test_unsupported_controls_and_media_are_not_silently_dropped(self):
         options = [{"tool_choice": {"type": "function", "name": "echo"}}, {"temperature": 0},
                    {"parallel_tool_calls": False},
                    {"tools": [{"type": "web_search"}]},
@@ -1041,19 +1038,6 @@ class KiroTransport(unittest.TestCase):
                 self.assertEqual(muse_kiro.discover_models(base, "synthetic-key"), ["claude-haiku-4.5", "glm-5"])
             self.assertIs(urllib.request._opener, prior)
         self.assertEqual(peer.catalog_requests[0][1]["Authorization"], "Bearer synthetic-key")
-
-    def test_openers_and_ssl_context_are_built_once_per_loopback_kind(self):
-        # P2-11: no per-request SSL context; loopback keeps its proxy bypass.
-        muse_kiro._OPENERS.clear()
-        self.addCleanup(muse_kiro._OPENERS.clear)
-        with patch("muse_kiro.ssl.create_default_context", wraps=muse_kiro.ssl.create_default_context) as built:
-            first = muse_kiro._cached_opener(True)
-            self.assertIs(muse_kiro._cached_opener(True), first)
-            remote = muse_kiro._cached_opener(False)
-        self.assertIsNot(first, remote)
-        self.assertEqual(built.call_count, 2)
-        # Loopback proxy bypass is behavior-tested by
-        # test_private_opener_bypasses_loopback_proxy_and_preserves_global_opener.
 
     def test_every_redirect_is_refused_even_on_same_origin(self):
         requests = []

@@ -16,6 +16,7 @@ from muse_providers import AuthError, CLAUDE_TOKEN_URLS, CLAUDE_OAUTH_CLIENT_ID,
 from contextlib import redirect_stderr
 
 from muse_gateway import Config, MuseShimHandler, ShimError, _redact_bytes, parse_args, run_claude_cli, run_doctor, run_muse
+from tests.peers import serving
 
 
 class FakeResponse:
@@ -59,6 +60,13 @@ class FakeClaudePopen:
     stdout = ""
     stderr = ""
     script_returncode = 0
+
+    @classmethod
+    def script(cls, result, returncode=0):
+        cls.spawned = []
+        cls.stdout = json.dumps(result)
+        cls.stderr = ""
+        cls.script_returncode = returncode
 
     def __init__(self, command, **kwargs):
         self.command = command
@@ -610,9 +618,7 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
         assert_downstream_cache_usage([{"type": "response.completed", "response": {"usage": usage}}])
         for path in (("input_tokens_details",), ("input_tokens_details", "cached_tokens"),
                      ("input_tokens_details", "anthropic_cache_creation_input_tokens"), ("input_tokens",), ("total_tokens",)):
-            broken = json.loads(json.dumps(usage))
-            parent = broken if len(path) == 1 else broken[path[0]]
-            parent.pop(path[-1])
+            broken = self._replace_path(usage, path, None)
             with self.subTest(missing=path), self.assertRaisesRegex(AssertionError, "cache counters or unchanged token totals"):
                 assert_downstream_cache_usage([{"type": "response.completed", "response": {"usage": broken}}])
         doubled = {**usage, "input_tokens": 16, "total_tokens": 18}
@@ -633,19 +639,57 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
             "terminal": "completed", "text": "PARTIAL"}})
         return records
 
-    def test_acceptance_requires_completed_for_every_model_request(self):
+    def _clone(self, value):
+        return json.loads(json.dumps(value))
+
+    def _replace_path(self, value, path, replacement):
+        broken = self._clone(value)
+        parent = broken
+        for key in path[:-1]:
+            parent = parent[key]
+        if replacement is None:
+            parent.pop(path[-1])
+        else:
+            parent[path[-1]] = replacement
+        return broken
+
+    def _details(self, record):
+        return record["payload"]["event"]["details"]
+
+    def _kiro_http_response(self, *, status, kind, code, category, transient, retry_after=None):
+        from tests.check_muse import KIRO_ERROR_MESSAGE
+
+        upstream = {"type": kind, "code": code}
+        metadata = {
+            "provider": "kiro", "layer": "kiro_gateway", "source": "http",
+            "phase": "before_response", "upstream_status": status,
+            "category": category, "transient": transient,
+            "output_exposure": "none", "upstream": upstream,
+        }
+        headers = {"content-type": "application/json"}
+        if retry_after is not None:
+            metadata["retry_after"] = {"value": retry_after, "kind": "delay-seconds"}
+            headers["retry-after"] = retry_after
+        return upstream, {
+            "status": status, "headers": headers, "events": [],
+            "json": {"error": {
+                "type": "kiro_upstream_error", "code": code,
+                "request_id": "gateway_id", "message": KIRO_ERROR_MESSAGE,
+                "metadata": metadata,
+            }},
+        }
+
+    def test_acceptance_requires_completed_without_retry(self):
         from tests.check_muse import assert_accepted
+
         assert_accepted(self._records(["response.completed", "response.completed"]), "PARTIAL")
         for events in (["response.incomplete"], ["response.incomplete", "response.completed"],
                        ["response.completed", "response.incomplete"], [None]):
             with self.subTest(events=events), self.assertRaisesRegex(AssertionError, "requires response.completed"):
                 assert_accepted(self._records(events), "PARTIAL")
-
-    def test_acceptance_rejects_retry_even_when_attempt_stays_one(self):
-        from tests.check_muse import assert_accepted
         records = self._records(["response.completed"])
-        retry = json.loads(json.dumps(records[0]))
-        retry["payload"]["event"]["details"]["phase"] = "retry_scheduled"
+        retry = self._clone(records[0])
+        self._details(retry)["phase"] = "retry_scheduled"
         records.insert(1, retry)
         with self.assertRaisesRegex(AssertionError, "without retries"):
             assert_accepted(records, "PARTIAL")
@@ -654,7 +698,7 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
         from tests.check_muse import assert_failed
         for error_kind, wire_event in (("decode", "response.failed"), ("stream_error", None)):
             records = self._records([wire_event])
-            details = records[1]["payload"]["event"]["details"]
+            details = self._details(records[1])
             details["phase"] = "stream_failed"
             details["facets"][0]["error_kind"] = error_kind
             records[-1] = {"payload_type": "run.terminal.failed", "payload": {
@@ -734,14 +778,11 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
             self.assertEqual(result["post_counts"], {"responses_incoming": 2, "upstream_inference": 2, "responses_captured": 2})
 
     def test_http_error_acceptance_rejects_flattened_or_missing_wire_evidence(self):
-        from tests.check_muse import KIRO_ERROR_MESSAGE, assert_http_error
-        upstream = {"type": "rate_limit_error", "code": "rate_limit_exceeded"}
-        metadata = {"provider": "kiro", "layer": "kiro_gateway", "source": "http", "phase": "before_response",
-                    "upstream_status": 429, "category": "rate_limit", "transient": True, "output_exposure": "none",
-                    "upstream": upstream, "retry_after": {"value": "1", "kind": "delay-seconds"}}
-        response = {"status": 429, "headers": {"content-type": "application/json", "retry-after": "1"}, "events": [],
-                    "json": {"error": {"type": "kiro_upstream_error", "code": "rate_limit_exceeded", "request_id": "gateway_id",
-                                       "message": KIRO_ERROR_MESSAGE, "metadata": metadata}}}
+        from tests.check_muse import assert_http_error
+
+        upstream, response = self._kiro_http_response(
+            status=429, kind="rate_limit_error", code="rate_limit_exceeded",
+            category="rate_limit", transient=True, retry_after="1")
         def check(value):
             assert_http_error(value, status=429, kind="rate_limit_error", code="rate_limit_exceeded",
                               category="rate_limit", transient=True, upstream=upstream, retry_after="1")
@@ -752,23 +793,16 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
                    (('json', 'error', 'metadata', 'upstream_status'), None),
                    (('json', 'error', 'metadata', 'retry_after'), None), (('headers', 'retry-after'), None)]
         for path, replacement in changes:
-            broken = json.loads(json.dumps(response))
-            parent = broken
-            for key in path[:-1]:
-                parent = parent[key]
-            if replacement is None:
-                parent.pop(path[-1])
-            else:
-                parent[path[-1]] = replacement
+            broken = self._replace_path(response, path, replacement)
             with self.subTest(path=path, replacement=replacement), self.assertRaisesRegex(AssertionError, "KIRO_"):
                 check(broken)
 
     def test_http_failure_acceptance_rejects_setup_decode_and_retry(self):
         from tests.check_muse import assert_http_failed
         records = self._records([None])
-        records[1]["payload"]["event"]["details"]["phase"] = "stream_failed"
-        facet = records[1]["payload"]["event"]["details"]["facets"][0]
-        facet["error_kind"] = "http_status"
+        details = self._details(records[1])
+        details["phase"] = "stream_failed"
+        details["facets"][0]["error_kind"] = "http_status"
         records[-1] = {"payload_type": "run.terminal.failed", "payload": {
             "terminal": "failed", "text": "", "reason": "HTTP401 fixture"}}
         peer = type("Peer", (), {"requests": [object()]})()
@@ -778,12 +812,12 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
         # The observed native HTTP401 path has no stream_failed status.
         assert_http_failed([records[0], records[-1]], peer, response)
         for kind in (None, "decode", "setup", "configuration"):
-            broken = json.loads(json.dumps(records))
-            broken[1]["payload"]["event"]["details"]["facets"][0]["error_kind"] = kind
+            broken = self._clone(records)
+            self._details(broken[1])["facets"][0]["error_kind"] = kind
             with self.subTest(kind=kind), self.assertRaisesRegex(AssertionError, "decode/setup"):
                 assert_http_failed(broken, peer, response)
-        retry = json.loads(json.dumps(records[0]))
-        retry["payload"]["event"]["details"]["phase"] = "retry_scheduled"
+        retry = self._clone(records[0])
+        self._details(retry)["phase"] = "retry_scheduled"
         with self.assertRaisesRegex(AssertionError, "without retry"):
             assert_http_failed(records[:-1] + [retry, records[-1]], peer, response)
         with self.assertRaisesRegex(AssertionError, "observed typed HTTP401"):
@@ -796,13 +830,11 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
             assert_http_failed([records[0], records[-1]], type("Peer", (), {"requests": []})(), response)
 
     def test_context_http_failure_acceptance_rejects_missing_code_metadata_and_retry(self):
-        from tests.check_muse import KIRO_ERROR_MESSAGE, assert_http_error, assert_http_failed
-        upstream = {"type": "invalid_request_error", "code": "context_length_exceeded"}
-        response = {"status": 400, "headers": {"content-type": "application/json"}, "events": [], "json": {"error": {
-            "type": "kiro_upstream_error", "code": "context_length_exceeded", "request_id": "gateway_id",
-            "message": KIRO_ERROR_MESSAGE, "metadata": {"provider": "kiro", "layer": "kiro_gateway", "source": "http",
-                "phase": "before_response", "upstream_status": 400, "category": "context", "transient": False,
-                "output_exposure": "none", "upstream": upstream}}}}
+        from tests.check_muse import assert_http_error, assert_http_failed
+
+        upstream, response = self._kiro_http_response(
+            status=400, kind="invalid_request_error", code="context_length_exceeded",
+            category="context", transient=False)
         records = self._records([None])
         records.pop(1)  # Natural HTTP rejection need not emit stream_failed.
         records[-1] = {"payload_type": "run.terminal.failed", "payload": {
@@ -813,22 +845,17 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
                               category="context", transient=False, upstream=upstream)
             assert_http_failed(observed, peer, wire, status=400, code="context_length_exceeded", category="context")
         check(records, response)
-        for path, value in ((('code',), None), (('code',), 'invalid_request_error'),
-                            (('metadata', 'category'), 'request'), (('metadata', 'transient'), None)):
-            broken = json.loads(json.dumps(response))
-            parent = broken['json']['error']
-            for key in path[:-1]:
-                parent = parent[key]
-            if value is None:
-                parent.pop(path[-1])
-            else:
-                parent[path[-1]] = value
+        for path, value in ((('json', 'error', 'code'), None),
+                            (('json', 'error', 'code'), 'invalid_request_error'),
+                            (('json', 'error', 'metadata', 'category'), 'request'),
+                            (('json', 'error', 'metadata', 'transient'), None)):
+            broken = self._replace_path(response, path, value)
             with self.subTest(path=path, value=value), self.assertRaisesRegex(AssertionError, "KIRO_"):
                 check(records, broken)
         for phase, error in (("retry_scheduled", None), ("stream_succeeded", None),
                              ("stream_failed", "decode"), ("stream_failed", "setup")):
-            extra = json.loads(json.dumps(records[0]))
-            details = extra['payload']['event']['details']
+            extra = self._clone(records[0])
+            details = self._details(extra)
             details['phase'] = phase
             details['facets'][0]['error_kind'] = error
             with self.subTest(phase=phase, error=error), self.assertRaisesRegex(AssertionError, "KIRO_NATIVE_HTTP"):
@@ -846,27 +873,27 @@ class MuseAcceptanceAssertionTests(unittest.TestCase):
         peer = type("Peer", (), {"requests": [object(), object()]})()
         assert_retry_completed(records, peer, "RETRIED")
         for change in ("missing_retry", "extra_retry", "wrong_attempt", "decode", "incomplete"):
-            broken = json.loads(json.dumps(records))
+            broken = self._clone(records)
             if change == "missing_retry":
                 broken.pop(1)
             elif change == "extra_retry":
                 broken.insert(1, broken[1])
             elif change == "wrong_attempt":
-                broken[2]["payload"]["event"]["details"]["facets"][0]["attempt"] = 1
+                self._details(broken[2])["facets"][0]["attempt"] = 1
             elif change == "decode":
-                broken[1]["payload"]["event"]["details"]["facets"][0]["error_kind"] = "decode"
+                self._details(broken[1])["facets"][0]["error_kind"] = "decode"
             else:
-                broken[3]["payload"]["event"]["details"]["facets"][1]["detail"]["stream"]["last_wire_event_type"] = "response.incomplete"
+                self._details(broken[3])["facets"][1]["detail"]["stream"]["last_wire_event_type"] = "response.incomplete"
             with self.subTest(change=change), self.assertRaisesRegex(AssertionError, "KIRO_NATIVE_RETRY"):
                 assert_retry_completed(broken, peer, "RETRIED")
-        records[1]["payload"]["event"]["details"]["facets"][0]["retry_delay_ms"] = 4000
+        self._details(records[1])["facets"][0]["retry_delay_ms"] = 4000
         peer.request_times = [10.0, 14.0]
         assert_retry_completed(records, peer, "RETRIED", retry_delay_ms=4000, min_retry_spacing=3.8)
         for change in ("default_delay", "default_spacing"):
-            broken = json.loads(json.dumps(records))
+            broken = self._clone(records)
             peer.request_times = [10.0, 11.0 if change == "default_spacing" else 14.0]
             if change == "default_delay":
-                broken[1]["payload"]["event"]["details"]["facets"][0]["retry_delay_ms"] = 1000
+                self._details(broken[1])["facets"][0]["retry_delay_ms"] = 1000
             with self.subTest(change=change), self.assertRaisesRegex(AssertionError, "honor Retry-After"):
                 assert_retry_completed(broken, peer, "RETRIED", retry_delay_ms=4000, min_retry_spacing=3.8)
 
@@ -908,10 +935,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             },
             "usage": {"input_tokens": 11, "output_tokens": 5},
         }
-        FakeClaudePopen.spawned = []
-        FakeClaudePopen.stdout = json.dumps(cli_result)
-        FakeClaudePopen.stderr = ""
-        FakeClaudePopen.script_returncode = 0
+        FakeClaudePopen.script(cli_result)
         config = Config(_args(provider="auto"))
         with patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=False):
             with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
@@ -948,11 +972,8 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertEqual(caught.exception.code, code)
 
         def cli(request, calls):
-            FakeClaudePopen.spawned = []
-            FakeClaudePopen.stdout = json.dumps({
+            FakeClaudePopen.script({
                 "is_error": False, "structured_output": {"text": "plain", "tool_calls": calls}})
-            FakeClaudePopen.stderr = ""
-            FakeClaudePopen.script_returncode = 0
             with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
                 result = run_claude_cli(dict(body, **request), Config(_args(provider="auto")))
             command = FakeClaudePopen.spawned[-1].command
@@ -986,11 +1007,8 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             ), self.assertRaises(ProviderError) as caught:
                 run_claude_cli({"model": "claude-sonnet-5", "input": "hi", **extra}, Config(_args(provider="auto")))
             self.assertEqual(caught.exception.code, code)
-        FakeClaudePopen.spawned = []
-        FakeClaudePopen.stdout = json.dumps({
+        FakeClaudePopen.script({
             "is_error": False, "structured_output": {"text": "ok", "tool_calls": []}})
-        FakeClaudePopen.stderr = ""
-        FakeClaudePopen.script_returncode = 0
         with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
             run_claude_cli({"model": "claude-sonnet-5", "input": "hi", "max_output_tokens": 10_000_000},
                            Config(_args(provider="auto")))
@@ -1004,10 +1022,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             "api_error_status": 429,
             "result": "You've hit your session limit",
         }
-        FakeClaudePopen.spawned = []
-        FakeClaudePopen.stdout = json.dumps(cli_result)
-        FakeClaudePopen.stderr = ""
-        FakeClaudePopen.script_returncode = 1
+        FakeClaudePopen.script(cli_result, returncode=1)
         config = Config(_args(provider="auto"))
         with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
             with self.assertRaises(ProviderError) as raised:
@@ -1018,7 +1033,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(raised.exception.status, 429)
         self.assertIn("session limit", str(raised.exception))
 
-    def test_run_mode_launches_muse_with_local_wiring_and_passthrough_args(self):
+    def test_run_mode_launch_wiring_and_interrupt_lifecycle(self):
         config = Config(_args(provider="auto", port=0))
         with patch("muse_gateway.subprocess.Popen") as launched:
             launched.return_value.wait.return_value = 7
@@ -1027,15 +1042,12 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(result, 7)
         command = launched.call_args.args[0]
         environment = launched.call_args.kwargs["env"]
-        self.assertTrue(command[0].endswith("muse") or command[0].endswith("muse.cmd")); self.assertEqual(command[1], "--provider")
-        self.assertEqual(command[2], "meta")
-        self.assertEqual(command[3], "--base-url")
+        self.assertTrue(command[0].endswith("muse") or command[0].endswith("muse.cmd"))
+        self.assertEqual(command[1:4], ["--provider", "meta", "--base-url"])
         self.assertTrue(command[4].startswith("http://127.0.0.1:"))
         self.assertEqual(command[5:], ["--resume", "session-id"])
         self.assertEqual(environment["META_API_KEY"], "local-gateway-placeholder")
 
-    def test_run_mode_stops_muse_when_launcher_is_interrupted(self):
-        config = Config(_args(provider="auto", port=0))
         with patch("muse_gateway.subprocess.Popen") as launched:
             process = launched.return_value
             process.wait.side_effect = [KeyboardInterrupt(), None]
@@ -1114,9 +1126,6 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             log_path = Path(directory) / "gateway.log"
             config = Config(_args(api_key="route-secret", log_file=str(log_path)))
             server = MuseShimServer(("127.0.0.1", 0), config)
-            worker = threading.Thread(target=server.serve_forever, daemon=True)
-            worker.start()
-            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
             stderr = io.StringIO()
             upstream_body = json.dumps({"error": {
                 "message": "route-secret incoming-secret private-prompt",
@@ -1126,6 +1135,9 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             failure = urllib.error.HTTPError(
                 "http://127.0.0.1/responses", 400, "bad request", {}, io.BytesIO(upstream_body)
             )
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
             try:
                 with patch("muse_gateway._credentialed_urlopen", side_effect=failure), redirect_stderr(stderr):
                     connection.request("POST", "/responses", json.dumps({
@@ -1170,8 +1182,8 @@ class RedirectAndHermesTests(unittest.TestCase):
     """P0-04 scoped opener matrix + P1-14 prompt fidelity."""
 
     def test_redirect_matrix_through_real_opener(self):
-        import threading
         import urllib.request
+        from contextlib import ExitStack
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         from muse_providers import build_gateway_opener
@@ -1219,10 +1231,9 @@ class RedirectAndHermesTests(unittest.TestCase):
                 pass
 
         source = ThreadingHTTPServer(("127.0.0.1", 0), Source)
-        for server in (target, source):
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-        try:
-            base = f"http://127.0.0.1:{source.server_port}"
+        with ExitStack() as stack:
+            stack.enter_context(serving(target))
+            base = stack.enter_context(serving(source))
             for path in ("/cross-port", "/bad-port", "/bad-bracket"):
                 with self.subTest(path=path):
                     request = urllib.request.Request(base + path)
@@ -1245,10 +1256,6 @@ class RedirectAndHermesTests(unittest.TestCase):
             before = urllib.request._opener  # noqa: SLF001
             build_gateway_opener(base)
             self.assertIs(urllib.request._opener, before)  # noqa: SLF001
-        finally:
-            for server in (target, source):
-                server.shutdown()
-                server.server_close()
 
     def test_hermes_nous_text_is_not_rewritten(self):
         needles = "Hermes Agent hermes-agent Hermes agent Nous Research"
@@ -1286,7 +1293,7 @@ class ClaudeLifecycleTruthfulnessTests(unittest.TestCase):
             ("message_stop", {}),
         )
 
-    def test_ping_and_unknown_before_message_start_are_ignored(self):
+    def test_pre_start_event_policy(self):
         raw = self._sse(
             ("ping", {}),
             ("future_extension", {"anything": 1}),
@@ -1297,7 +1304,6 @@ class ClaudeLifecycleTruthfulnessTests(unittest.TestCase):
         self.assertIn(b"response.completed", wire)
         self.assertNotIn(b"response.failed", wire)
 
-    def test_lifecycle_events_before_message_start_fail(self):
         for kind, payload in (
             ("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}),
             ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "x"}}),
@@ -1377,7 +1383,7 @@ class ClaudeLifecycleTruthfulnessTests(unittest.TestCase):
         self.assertIn(b"response.failed", wire)
         self.assertNotIn(b"function_call_arguments.done", wire)
 
-    def test_stop_reason_matrix_stream_and_json(self):
+    def test_stop_reason_matrix_and_empty_json(self):
         cases = {
             "max_tokens": "incomplete",
             "model_context_window_exceeded": "incomplete",
@@ -1400,8 +1406,6 @@ class ClaudeLifecycleTruthfulnessTests(unittest.TestCase):
                     "stop_reason": reason,
                 })
                 self.assertEqual(converted["status"], expected)
-
-    def test_empty_json_response_is_rejected(self):
         with self.assertRaises(ProviderError) as caught:
             anthropic_json_to_responses({})
         self.assertEqual(caught.exception.code, "claude_invalid_response")
@@ -1436,12 +1440,9 @@ class NamedCoverageGapTests(NoCredentialEnvTest):
     def test_forward_claude_cli_streams_on_the_wire(self):
         from tests.contracts import consume
 
-        FakeClaudePopen.spawned = []
-        FakeClaudePopen.stdout = json.dumps({
+        FakeClaudePopen.script({
             "is_error": False, "structured_output": {"text": "CLI_WIRE", "tool_calls": []},
             "usage": {"input_tokens": 1, "output_tokens": 1}})
-        FakeClaudePopen.stderr = ""
-        FakeClaudePopen.script_returncode = 0
         handler = DummyForwardHandler(Config(_args(provider="auto")))
         handler.wfile = io.BytesIO()
         handler._log_event = lambda *args, **kwargs: None
@@ -1454,11 +1455,8 @@ class NamedCoverageGapTests(NoCredentialEnvTest):
         # P1-10: the owned `claude -p` child is handed to the tracker so
         # server shutdown can terminate it; the request-end release then
         # untracks it.
-        FakeClaudePopen.spawned = []
-        FakeClaudePopen.stdout = json.dumps({
+        FakeClaudePopen.script({
             "is_error": False, "structured_output": {"text": "hi", "tool_calls": []}})
-        FakeClaudePopen.stderr = ""
-        FakeClaudePopen.script_returncode = 0
         tracked = []
         config = Config(_args(provider="auto"))
         with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
@@ -1513,12 +1511,9 @@ class NitTests(NoCredentialEnvTest):
                 with self.assertRaises(ProviderError) as caught:
                     run_claude_cli({"model": model, "input": "hi"}, Config(_args(provider="auto")))
                 self.assertEqual(caught.exception.code, "claude_cli_invalid_model")
-        FakeClaudePopen.spawned = []
-        FakeClaudePopen.stdout = json.dumps({
+        FakeClaudePopen.script({
             "is_error": False, "structured_output": {"text": "ok", "tool_calls": []},
             "usage": {"input_tokens": "many", "output_tokens": [1]}})
-        FakeClaudePopen.stderr = ""
-        FakeClaudePopen.script_returncode = 0
         with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
             payload, _ = run_claude_cli({"model": "claude-test", "input": "hi"}, Config(_args(provider="auto")))
         self.assertEqual(payload["usage"], {"input_tokens": 0, "output_tokens": 0})

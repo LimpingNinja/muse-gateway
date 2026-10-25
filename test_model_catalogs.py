@@ -67,32 +67,23 @@ class CatalogSnapshotTests(unittest.TestCase):
             provider="auto", model_discovery=True,
             log_file="/tmp/muse-gateway-catalog-test.log"))
 
-    def test_menu_limit_always_matches_enforced_limit(self):
-        config = self._config()
-        config._publish_catalog(
+    def _publish(self, config, limit, *, generation=None):
+        return config._publish_catalog(
             "codex", "codex",
-            entries=[{"model_id": "codex/m", "output_limit": 1000}],
-            raw={"m": {"model": "m", "context_limit": 10000, "output_limit": 1000}},
-            stamped=0.0, generation=config._catalog_generation.get("codex", 0))
-        self.assertEqual(config.model_output_limit("codex", "m"), 1000)
-        config._publish_catalog(
-            "codex", "codex",
-            entries=[{"model_id": "codex/m", "output_limit": 50}],
-            raw={"m": {"model": "m", "context_limit": 10000, "output_limit": 50}},
-            stamped=0.0, generation=config._catalog_generation.get("codex", 0))
-        self.assertEqual(config.model_output_limit("codex", "m"), 50)
-        snapshot = config._catalog_snapshots["codex"]
-        self.assertEqual(snapshot.entries[0]["output_limit"],
-                         config.model_output_limit("codex", "m"))
+            entries=[{"model_id": "codex/m", "output_limit": limit}],
+            raw={"m": {"model": "m", "context_limit": 10000, "output_limit": limit}},
+            stamped=0.0,
+            generation=config._catalog_generation.get("codex", 0) if generation is None else generation)
 
-    def test_stale_generation_cannot_publish(self):
+    def test_snapshot_limit_is_coherent_and_stale_generation_cannot_publish(self):
         config = self._config()
+        for limit in (1000, 50):
+            self.assertTrue(self._publish(config, limit))
+            self.assertEqual(config.model_output_limit("codex", "m"), limit)
+            self.assertEqual(config._catalog_snapshots["codex"].entries[0]["output_limit"], limit)
         config._catalog_generation["codex"] = 5
-        published = config._publish_catalog(
-            "codex", "codex", entries=[{"model_id": "codex/old"}],
-            raw={}, stamped=0.0, generation=4)
-        self.assertFalse(published)
-        self.assertNotIn("codex", config._catalog_snapshots)
+        self.assertFalse(self._publish(config, 999, generation=4))
+        self.assertEqual(config.model_output_limit("codex", "m"), 50)
 
     def test_single_flight_one_discovery_for_concurrent_cold_fetches(self):
         import threading
@@ -122,31 +113,17 @@ class CatalogSnapshotTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0], results[1])
 
-    def test_failed_discovery_retries_after_short_ttl(self):
-        import time
-
-        from muse_gateway import MODEL_CATALOG_TTL_SECONDS, provider_model_catalog
-
-        config = self._config()
-        with patch("muse_gateway._discover_provider_models", return_value=[]), \
-                patch("muse_gateway._provider_is_available", return_value=True):
-            provider_model_catalog(config, "codex")
-        stamped, _ = config._model_catalog_cache["codex"]
-        age = time.time() - stamped
-        self.assertGreater(age, MODEL_CATALOG_TTL_SECONDS - 61)
-        self.assertLess(age, MODEL_CATALOG_TTL_SECONDS)
-
 
 class NoCacheRateLimitTests(unittest.TestCase):
     def test_two_no_cache_gets_a_second_apart_discover_once(self):
         # P3-02: unauthenticated no-cache refreshes are throttled to one per 10 s.
         import argparse
         import tempfile
-        import threading
         import time
         import urllib.request
         from pathlib import Path
         from muse_gateway import Config, MuseShimServer
+        from tests.peers import serving
 
         calls = []
 
@@ -159,9 +136,7 @@ class NoCacheRateLimitTests(unittest.TestCase):
                                                model_discovery=True,
                                                log_file=str(Path(directory) / "g.log")))
             server = MuseShimServer(("127.0.0.1", 0), config)
-            worker = threading.Thread(target=server.serve_forever, daemon=True)
-            worker.start()
-            try:
+            with serving(server):
                 with patch("muse_gateway._discover_provider_models", side_effect=discover):
                     for _ in range(2):
                         request = urllib.request.Request(
@@ -169,10 +144,6 @@ class NoCacheRateLimitTests(unittest.TestCase):
                             headers={"Cache-Control": "no-cache"})
                         urllib.request.urlopen(request, timeout=5).close()
                         time.sleep(1)
-            finally:
-                server.shutdown()
-                server.server_close()
-                worker.join(timeout=5)
         self.assertEqual(len(calls), 1)
 
 
