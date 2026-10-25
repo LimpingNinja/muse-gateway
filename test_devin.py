@@ -7,12 +7,10 @@ junie's prost golden tests (independent oracle).
 """
 
 import argparse
-import base64
 import gzip
 import io
 import json
 import os
-import sqlite3
 import tempfile
 import threading
 import time
@@ -24,7 +22,7 @@ from unittest.mock import patch
 from muse_gateway import Config, MuseShimServer, run_doctor
 
 import devin_pb2
-from muse_devin import DevinChatError, DevinCredentialError, DevinModel, DevinStreamState, credential_state, deref_schema_refs, fetch_auth, list_store_credentials, mark_auth_failure, normalize_configs, normalize_schema_for_google, read_store_credentials, resolve_access_token, run_turn_events, select_credential
+from muse_devin import DevinChatError, DevinCredentialError, DevinModel, DevinStreamState, credential_state, deref_schema_refs, fetch_auth, mark_auth_failure, normalize_configs, normalize_schema_for_google, resolve_access_token, run_turn_events
 from muse_devin_wire import ConnectFrameDecoder, DevinAuthError, DevinFrameError, DevinHttpError, decode_unary, frame_message, unary_rpc
 
 
@@ -38,39 +36,6 @@ def devin_config(**overrides):
     }
     values.update(overrides)
     return Config(argparse.Namespace(**values))
-
-
-def make_jwt(exp=None):
-    """Assemble (never literalize) a JWT for expiry tests."""
-    def b64(obj):
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
-
-    payload = {}
-    if exp is not None:
-        payload["exp"] = exp
-    return f"{b64({'alg': 'none'})}.{b64(payload)}.sig"
-
-
-def make_auth_db(rows):
-    """Create a synthetic OMP agent.db; rows are (provider, type, data, cause, identity)."""
-    handle, path = tempfile.mkstemp(suffix=".db")
-    os.close(handle)
-    connection = sqlite3.connect(path)
-    connection.execute(
-        "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,"
-        " disabled_cause TEXT DEFAULT NULL, identity_key TEXT DEFAULT NULL,"
-        " created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0)"
-    )
-    for provider, cred_type, data, cause, identity in rows:
-        connection.execute(
-            "INSERT INTO auth_credentials (provider, credential_type, data,"
-            " disabled_cause, identity_key) VALUES (?, ?, ?, ?, ?)",
-            (provider, cred_type, json.dumps(data), cause, identity),
-        )
-    connection.commit()
-    connection.close()
-    return path
 
 
 def devin_model(**overrides):
@@ -132,6 +97,21 @@ class DevinWireTests(unittest.TestCase):
         with self.assertRaises(DevinFrameError):
             decoder.decode(frame_message(b"toolong", 0))
 
+    def test_valid_prefix_frames_survive_any_chunk_split(self):
+        # P2-04 (inverts R19): combined and split reads deliver the same frames.
+        import struct
+        valid = b"\x00\x00\x00\x00\x01x"
+        oversized = b"\x00" + struct.pack(">I", 5)
+        combined = ConnectFrameDecoder(max_payload_bytes=4)
+        self.assertEqual(combined.decode(valid + oversized), [(0, b"x")])
+        self.assertEqual(combined.pending_bytes, len(oversized))
+        with self.assertRaises(DevinFrameError):
+            combined.decode()
+        split = ConnectFrameDecoder(max_payload_bytes=4)
+        self.assertEqual(split.decode(valid), [(0, b"x")])
+        with self.assertRaises(DevinFrameError):
+            split.decode(oversized)
+
     def test_unary_decodes_bare_and_gzip_but_rejects_garbage(self):
         # Literal field bytes, independent of the protobuf serializer.
         for body in (b"\x0a\x01j", gzip.compress(b"\x0a\x01j")):
@@ -143,7 +123,7 @@ class DevinWireTests(unittest.TestCase):
         error = urllib.error.HTTPError("http://127.0.0.1/rpc", 503, "busy",
                                        {"Content-Type": "application/json"}, body)
         try:
-            with patch("muse_devin_wire.urllib.request.urlopen", side_effect=error):
+            with patch("muse_devin_wire.build_gateway_opener", return_value=unittest.mock.Mock(**{"open.side_effect": error})):
                 with self.assertRaises(DevinHttpError) as raised:
                     unary_rpc("http://127.0.0.1", "/rpc", b"request")
             self.assertEqual(raised.exception.status, 503)
@@ -159,155 +139,70 @@ class DevinCredentialTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         patcher.start()
 
-    def test_store_reads_active_rows_only(self):
-        now = int(time.time())
-        path = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now + 3600)}, None, "a"),
-            ("devin", "oauth", {"access": make_jwt(now + 3600)}, "revoked", "b"),
-            ("devin", "oauth", "not-json", None, "c"),
-            ("other", "oauth", {"access": "x"}, None, "d"),
-        ])
-        try:
-            active, disabled = read_store_credentials(path)
-        finally:
-            os.unlink(path)
-        self.assertEqual([row["identity_key"] for row in active], ["a"])
-        self.assertEqual([row["identity_key"] for row in disabled], ["b"])
+    def test_explicit_cli_and_unconfigured_chain(self):
+        self.assertEqual(credential_state()["state"], "unconfigured")
+        with self.assertRaisesRegex(DevinCredentialError, "devin auth login"):
+            resolve_access_token()
+        with patch("muse_devin.read_cli_token", return_value=("cli-token", "cli.toml")) as read:
+            self.assertEqual(resolve_access_token(), ("cli-token", "devin-cli:cli.toml"))
+            self.assertEqual(credential_state()["source"], "devin-cli")
+            read.reset_mock()
+            self.assertEqual(resolve_access_token("explicit-token"), ("explicit-token", "explicit"))
+            self.assertEqual(credential_state("explicit-token")["source"], "explicit")
+            read.assert_not_called()
 
-    def test_selection_auto_picks_first_usable_row(self):
-        now_ms = int(time.time() * 1000)
-        rows = [
-            {"id": 1, "identity_key": "a", "access": "x"},
-            {"id": 2, "identity_key": "b", "access": "y"},
-        ]
-        self.assertEqual(select_credential(rows)["id"], 1)
-        self.assertEqual(select_credential(rows, "b")["id"], 2)
-        self.assertEqual(select_credential([rows[0]])["id"], 1)
-        expired_first = [
-            {"id": 1, "identity_key": "a", "access": "x",
-             "expires_at": now_ms - 60000},
-            {"id": 2, "identity_key": "b", "access": "y",
-             "expires_at": now_ms + 3600000},
-        ]
-        self.assertEqual(select_credential(expired_first)["id"], 2)
-        with self.assertRaises(DevinCredentialError):
-            select_credential([])
-        with self.assertRaises(DevinCredentialError):
-            select_credential(rows, "missing")
+    def test_quarantine_is_source_independent_without_silent_fallback(self):
+        from muse_devin import _AUTH_FAILURE_MARKS, _token_fingerprint
 
-    def test_selection_skips_quarantined_token(self):
-        now_ms = int(time.time() * 1000)
-        rows = [
-            {"id": 1, "identity_key": "a", "access": "quarantined-token",
-             "expires_at": now_ms + 3600000},
-            {"id": 2, "identity_key": "b", "access": "healthy-token",
-             "expires_at": now_ms + 3600000},
-        ]
-        mark_auth_failure("quarantined-token", "probe 401")
-        try:
-            self.assertEqual(select_credential(rows)["id"], 2)
-        finally:
-            from muse_devin import _AUTH_FAILURE_MARKS, _token_fingerprint
-            _AUTH_FAILURE_MARKS.pop(_token_fingerprint("quarantined-token"), None)
+        token = "quarantined-token"
+        mark_auth_failure(token, "probe 401")
+        self.addCleanup(_AUTH_FAILURE_MARKS.pop, _token_fingerprint(token), None)
+        with patch("muse_devin.read_cli_token", return_value=("healthy-cli", "cli.toml")) as read:
+            self.assertEqual(credential_state(token)["state"], "auth-failed")
+            with self.assertRaisesRegex(DevinCredentialError, "quarantined"):
+                resolve_access_token(token)
+            read.assert_not_called()
+        with patch("muse_devin.read_cli_token", return_value=(token, "cli.toml")):
+            self.assertEqual(credential_state()["state"], "auth-failed")
+            with self.assertRaisesRegex(DevinCredentialError, "quarantined"):
+                resolve_access_token()
+        with patch("muse_devin.read_cli_token", return_value=("new-cli", "cli.toml")):
+            self.assertEqual(resolve_access_token(), ("new-cli", "devin-cli:cli.toml"))
 
-    def test_multi_row_state_is_ready_not_ambiguous(self):
-        now = int(time.time())
-        path = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now + 3600)}, None, "a"),
-            ("devin", "oauth", {"access": make_jwt(now + 7200)}, None, "b"),
-        ])
-        try:
-            state = credential_state(auth_db_path=path)
-            self.assertEqual(state["state"], "ready")
-            self.assertEqual(state["credential_id"], 1)
-            token, identity = resolve_access_token(auth_db_path=path)
-            self.assertEqual(identity, "a")
-            self.assertTrue(token.startswith("eyJ"))
-        finally:
-            os.unlink(path)
-
-    def test_list_store_credentials_is_token_free(self):
-        now = int(time.time())
-        secret = make_jwt(now + 3600)
-        path = make_auth_db([
-            ("devin", "oauth", {"access": secret, "email": "a@x.io"}, None, "a"),
-            ("devin", "oauth", {"access": make_jwt(now - 3600)}, None, "b"),
-        ])
-        try:
-            resolved, rows = list_store_credentials(path)
-        finally:
-            os.unlink(path)
-        self.assertEqual(resolved, path)
-        self.assertEqual([row["id"] for row in rows], [1, 2])
-        self.assertEqual(rows[0]["email"], "a@x.io")
-        self.assertFalse(rows[0]["expired"])
-        self.assertTrue(rows[1]["expired"])
-        self.assertNotIn(secret, json.dumps(rows))
-        self.assertTrue(all("access" not in row for row in rows))
-
-    def test_doctor_lists_rows_with_selection_and_expiry(self):
-        now = int(time.time())
-        first = make_jwt(now + 3600)
-        path = make_auth_db([
-            ("devin", "oauth", {"access": first, "email": "a@x.io"}, None, "a"),
-            ("devin", "oauth", {"access": make_jwt(now + 7200)}, None, "b"),
-        ])
-        try:
-            cfg = devin_config(devin_api_key=None, devin_auth_db=path,
-                               upstream="http://127.0.0.1:1")
-            cfg.doctor_provider = "devin"
-            output = io.StringIO()
+    def test_doctor_reports_cli_readiness_without_tokens_or_row_listing(self):
+        cfg = devin_config(devin_api_key=None, upstream="http://127.0.0.1:1")
+        cfg.doctor_provider = "devin"
+        output = io.StringIO()
+        with patch("muse_devin.read_cli_token", return_value=("doctor-secret", "cli.toml")):
             self.assertEqual(run_doctor(cfg, output=output), 0)
-        finally:
-            os.unlink(path)
         rendered = output.getvalue()
-        self.assertIn("using id 1 of 2 active", rendered)
-        self.assertIn("devin credential: id=1", rendered)
-        self.assertIn("devin credential: id=2", rendered)
-        self.assertIn("expires=", rendered)
-        self.assertIn("[selected]", rendered)
-        self.assertNotIn(first, rendered)
+        self.assertIn("credential ready (Devin CLI login)", rendered)
+        self.assertNotIn("doctor-secret", rendered)
+        self.assertNotIn("devin store:", rendered)
+        self.assertNotIn("devin credential:", rendered)
 
-    def test_credential_state_matrix(self):
-        now = int(time.time())
-        fresh = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now + 3600)}, None, "a"),
-        ])
-        stale = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now - 10)}, None, "a"),
-        ])
-        try:
-            ready = credential_state(auth_db_path=fresh)
-            self.assertEqual(ready["state"], "ready")
-            self.assertEqual(ready["credential_id"], 1)
-            expired = credential_state(auth_db_path=stale)
-            self.assertEqual(expired["state"], "expired")
-            missing = credential_state(auth_db_path="/nonexistent/agent.db")
-            self.assertEqual(missing["state"], "unconfigured")
-            explicit = credential_state(api_key="tok")
-            self.assertEqual((explicit["state"], explicit["source"]), ("ready", "explicit"))
-        finally:
-            os.unlink(fresh)
-            os.unlink(stale)
+    def test_server_directed_base_must_be_https_unless_loopback(self):
+        # P2-09: the auth response cannot downgrade the session to cleartext.
+        import contextlib
 
-    def test_sixty_second_use_skew(self):
-        now = int(time.time())
-        path = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now + 30)}, None, "a"),
-        ])
-        try:
-            state = credential_state(auth_db_path=path)
-        finally:
-            os.unlink(path)
-        self.assertEqual(state["state"], "expired")
-        path = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now + 90)}, None, "a"),
-        ])
-        try:
-            state = credential_state(auth_db_path=path)
-        finally:
-            os.unlink(path)
-        self.assertEqual(state["state"], "ready")
+        def auth_reply(url):
+            body = devin_pb2.GetUserJwtResponse(user_jwt="jwt", custom_api_server_url=url).SerializeToString()
+            return lambda *args, **kwargs: (200, "application/proto", body)
+
+        with patch("muse_devin.unary_rpc", side_effect=auth_reply("http://evil.example")), \
+                self.assertRaises(DevinAuthError):
+            fetch_auth("tok", "https://x")
+        for url in ("http://127.0.0.1:9", "https://chat.example"):
+            err = io.StringIO()
+            with self.subTest(url=url), contextlib.redirect_stderr(err), \
+                    patch("muse_devin.unary_rpc", side_effect=auth_reply(url)):
+                _, jwt, effective = fetch_auth("tok", "https://x")
+            self.assertEqual((jwt, effective), ("jwt", url))
+            self.assertIn("directed chat traffic to " + url, err.getvalue())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            devin_config(devin_upstream="http://onprem.example/devin")
+        self.assertIn("uses plain http", err.getvalue())
 
     def test_fetch_auth_marks_persistent_401(self):
         from muse_devin import auth_failure_mark, fetch_auth
@@ -359,24 +254,84 @@ class DevinCliCredentialTests(unittest.TestCase):
             broken = self._write_toml(directory, "windsurf_api_key = \n")
             self.assertEqual(read_cli_token(broken), (None, None))
 
-    def test_cli_source_precedence_over_store(self):
-        now = int(time.time())
-        db = make_auth_db([
-            ("devin", "oauth", {"access": make_jwt(now + 3600)}, None, "a"),
-        ])
-        try:
-            with patch(
-                "muse_devin.read_cli_token", return_value=("cli-tok", "p")
+    def test_cli_toml_fallback_without_tomllib(self):
+        from muse_devin import read_cli_token
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_toml(directory, '# CLI credentials\nwindsurf_api_key = "  cli-token  "\n')
+            with patch.dict("sys.modules", {"tomllib": None}):
+                self.assertEqual(read_cli_token(path), ("cli-token", path))
+
+    def test_cli_candidates_prefer_xdg_data_home(self):
+        from muse_devin import _cli_credentials_candidates
+
+        with tempfile.TemporaryDirectory() as home:
+            with patch("os.path.expanduser", return_value=home), patch.dict(
+                os.environ, {"XDG_DATA_HOME": "", "XDG_CONFIG_HOME": ""}, clear=False,
             ):
-                state = credential_state(auth_db_path=db)
-                self.assertEqual(state["source"], "devin-cli")
-                self.assertEqual(state["access_token"], "cli-tok")
-                token, identity = resolve_access_token(auth_db_path=db)
-                self.assertEqual((token, identity), ("cli-tok", "devin-cli:p"))
-                explicit_id = credential_state(auth_db_path=db, credential_id="1")
-                self.assertEqual(explicit_id["source"], "store")
-        finally:
-            os.unlink(db)
+                os.environ.pop("XDG_DATA_HOME", None)
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                candidates = _cli_credentials_candidates()
+            self.assertEqual(
+                candidates[0], os.path.join(home, ".local", "share", "devin", "credentials.toml"),
+            )
+            with patch("os.path.expanduser", return_value=home), patch.dict(
+                os.environ, {"XDG_DATA_HOME": os.path.join(home, "data")}, clear=False,
+            ):
+                candidates = _cli_credentials_candidates()
+            self.assertEqual(
+                candidates[0], os.path.join(home, "data", "devin", "credentials.toml"),
+            )
+
+    def test_runtime_catalog_and_inference_follow_cli_relogin_and_explicit_token(self):
+        from muse_devin import _AUTH_FAILURE_MARKS, _token_fingerprint
+        from muse_gateway import _devin_provider_ready
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_toml(directory, 'windsurf_api_key = "cli-first"\n')
+            cfg = devin_config(provider="devin", devin_api_key=None,
+                               log_file=os.path.join(directory, "gateway.log"))
+            server = MuseShimServer(("127.0.0.1", 0), cfg)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            request = urllib.request.Request(
+                base + "/responses",
+                data=json.dumps({"model": "devin/swe-1-6", "input": "hi"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with patch("muse_devin._cli_credentials_candidates", return_value=[path]), patch(
+                    "muse_devin.run_turn_final", return_value={"id": "resp_test"},
+                ) as turn:
+                    for token in ("cli-first", "cli-relogin"):
+                        original = f'windsurf_api_key = "{token}"\n'
+                        self._write_toml(directory, original)
+                        self.assertTrue(_devin_provider_ready(cfg))
+                        with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as response:
+                            self.assertIn("devin/swe-1-6", [row["id"] for row in json.load(response)["data"]])
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            self.assertEqual(json.load(response), {"id": "resp_test"})
+                        self.assertEqual(turn.call_args.args[3], token)
+                        with open(path, encoding="utf-8") as handle:
+                            self.assertEqual(handle.read(), original)
+                    cfg.devin_api_key = "explicit-runtime-token"
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(turn.call_args.args[3], "explicit-runtime-token")
+                    mark_auth_failure(cfg.devin_api_key)
+                    self.addCleanup(_AUTH_FAILURE_MARKS.pop, _token_fingerprint(cfg.devin_api_key), None)
+                    self.assertFalse(_devin_provider_ready(cfg))
+                    turn.reset_mock()
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(request, timeout=5)
+                    with caught.exception as response:
+                        self.assertEqual(json.load(response)["error"]["type"], "devin_credential_unavailable")
+                    turn.assert_not_called()
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=5)
 
 
 def devin_config_row(uid, label="M", **kwargs):
@@ -537,6 +492,72 @@ class DevinTranslationTests(unittest.TestCase):
         with self.assertRaises(DevinChatError):
             normalize_schema_for_google({"type": ["string", "number"]})
 
+    def test_google_normalize_keeps_nullability_of_scalarized_unions(self):
+        # P2-03 (inverts R11), including nested nodes.
+        self.assertEqual(normalize_schema_for_google({"type": ["string", "null"]}),
+                         {"type": "string", "nullable": True})
+        nested = normalize_schema_for_google({"type": "object", "properties": {
+            "a": {"type": ["null", "integer"]}, "b": {"type": "integer"}}})
+        self.assertEqual(nested["properties"]["a"], {"type": "integer", "nullable": True})
+        self.assertNotIn("nullable", nested["properties"]["b"])
+
+
+class DevinRequestPolicyTests(unittest.TestCase):
+    """P1-05 (inverts R08 Devin half): per-request policy beats capability."""
+
+    TOOL = {"type": "function", "name": "read_file", "parameters": {"type": "object"}}
+
+    def _request(self, **body):
+        from muse_devin import build_chat_request, build_tools
+        model = devin_model(supports_parallel=True)
+        return build_chat_request("", {"input": "hi", **body}, model, model.uid, "k", "jwt",
+                                  "cascade", [], build_tools([self.TOOL], False))
+
+    def test_none_serial_named_and_stop_sequences_reach_the_wire(self):
+        default = self._request()
+        self.assertEqual((default.tool_choice.option_name, len(default.tools)), ("auto", 1))
+        self.assertFalse(default.disable_parallel_tool_calls)
+        self.assertEqual(len(self._request(tool_choice="none").tools), 0)
+        self.assertTrue(self._request(parallel_tool_calls=False).disable_parallel_tool_calls)
+        named = self._request(tool_choice={"type": "function", "name": "read_file"})
+        self.assertEqual(named.tool_choice.WhichOneof("choice"), "tool_name")
+        self.assertEqual(named.tool_choice.tool_name, "read_file")
+        self.assertEqual(list(self._request(stop_sequences=["END"]).configuration.stop_patterns), ["END"])
+
+    def test_unrepresentable_controls_are_rejected_before_inference(self):
+        cases = (
+            ({"tool_choice": "required"}, "devin_unsupported_tool_choice"),
+            ({"tool_choice": {"type": "function", "name": "missing"}}, "devin_unsupported_tool_choice"),
+            ({"tool_choice": {"type": "web_search"}}, "devin_unsupported_tool_choice"),
+            ({"parallel_tool_calls": "no"}, "devin_invalid_request"),
+            ({"max_output_tokens": 0}, "invalid_output_limit"),
+            ({"max_output_tokens": -5}, "invalid_output_limit"),
+        )
+        for extra, code in cases:
+            with self.subTest(extra=extra), patch(
+                "muse_devin.fetch_auth", side_effect=AssertionError("policy check reached upstream")
+            ):
+                with self.assertRaises(DevinChatError) as caught:
+                    list(run_turn_events({"input": "hi", **extra}, [self.TOOL], devin_model(), "k"))
+                self.assertEqual(caught.exception.code, code)
+
+
+class DevinHistoryReferenceTests(unittest.TestCase):
+    def test_item_reference_resolves_inline_or_is_rejected(self):
+        # P2-04: resolvable references name inline content; others are rejected.
+        from muse_devin import history_to_prompts
+        inline = {"type": "message", "id": "msg_1", "role": "assistant", "content": "kept"}
+        _, staged, _ = history_to_prompts({"input": [
+            {"role": "user", "content": "hi"}, inline,
+            {"type": "item_reference", "id": "msg_1"}, {"role": "user", "content": "go"}]}, "c")
+        self.assertEqual([prompt["text"] for prompt in staged], ["hi", "kept", "go"])
+        with patch("muse_devin.fetch_auth", side_effect=AssertionError("reached upstream")), \
+                self.assertRaises(DevinChatError) as caught:
+            list(run_turn_events({"input": [{"role": "user", "content": "hi"},
+                                            {"type": "item_reference", "id": "msg_missing"}]},
+                                 [], devin_model(), "k"))
+        self.assertEqual(caught.exception.code, "devin_unresolved_reference")
+
 
 class DevinStreamTests(unittest.TestCase):
     def _text_tool_sequence(self):
@@ -588,6 +609,101 @@ class DevinStreamTests(unittest.TestCase):
         deltas = "".join(payload["delta"] for kind, payload in events
                          if kind == "response.function_call_arguments.delta")
         self.assertEqual(deltas, calls[0]["arguments"])
+
+    def test_nested_prefix_fragments_survive_every_chunk_boundary(self):
+        # P1-04 (inverts R07): a delta that happens to share the received
+        # prefix is appended, never mistaken for a snapshot.
+        target = '{"x":{"x":1}}'
+        splits = [[target[:i], target[i:]] for i in range(1, len(target))]
+        splits += [[target[:i], target[i:j], target[j:]]
+                   for i in range(1, len(target)) for j in range(i + 1, len(target))]
+        splits.append(['{"x":', '{"x":1}}'])
+        for parts in splits:
+            with self.subTest(parts=parts):
+                state = DevinStreamState("devin/swe-1-6")
+                events = []
+                for index, fragment in enumerate(parts):
+                    message = devin_pb2.GetChatMessageResponse(message_id="r-split")
+                    call = message.delta_tool_calls.add()
+                    if index == 0:
+                        call.id, call.name = "c1", "t"
+                    call.arguments_json = fragment
+                    events += state.feed(message)
+                events += state.finish()
+                self.assertEqual(events[-1][0], "response.completed")
+                arguments = events[-1][1]["response"]["output"][0]["arguments"]
+                self.assertEqual(json.loads(arguments), {"x": {"x": 1}})
+                self.assertNotIn("__parseError", arguments)
+
+    def test_oversized_tool_arguments_end_in_one_failed_terminal(self):
+        # P1-13: per-block arguments are capped at Kiro's _BLOCK_LIMIT.
+        from muse_devin_wire import CONNECT_END_STREAM_FLAG, frame_message
+        frames = b""
+        for index in range(9):
+            message = devin_pb2.GetChatMessageResponse(message_id="r-big")
+            call = message.delta_tool_calls.add()
+            if index == 0:
+                call.id, call.name = "c1", "t"
+            call.arguments_json = "x" * (1024 * 1024)
+            frames += frame_message(message.SerializeToString())
+        frames += frame_message(b"{}", CONNECT_END_STREAM_FLAG)
+
+        class FakeStream(io.BytesIO):
+            def close(self):
+                pass
+
+        with patch("muse_devin.fetch_auth", return_value=("k", "jwt", "https://x")), patch(
+            "muse_devin.open_chat_stream", return_value=FakeStream(frames)
+        ):
+            events = list(run_turn_events({"input": "hi"}, [], devin_model(), "k"))
+        kinds = [kind for kind, _ in events]
+        self.assertEqual(kinds.count("response.failed"), 1)
+        self.assertEqual(kinds[-1], "response.failed")
+        self.assertNotIn("response.completed", kinds)
+        self.assertIn("safety size limit", events[-1][1]["response"]["error"]["message"])
+
+    def test_tool_before_text_keeps_output_index_order(self):
+        # P2-04: a deferred tool released after streaming text never makes
+        # output_index run backwards for positional consumers.
+        from tests.contracts import consume
+        from muse_providers import response_sse_line
+        state = DevinStreamState("devin/swe-1-6")
+        tool = devin_pb2.GetChatMessageResponse(message_id="r-order")
+        call = tool.delta_tool_calls.add()
+        call.id, call.name, call.arguments_json = "c1", "t", "{}"
+        text = devin_pb2.GetChatMessageResponse(delta_text="after", stop_reason=10)
+        events = state.feed(tool) + state.feed(text) + state.finish()
+        added = [payload["output_index"] for kind, payload in events if kind == "response.output_item.added"]
+        self.assertEqual(added, sorted(added))
+        final = consume(b"".join(response_sse_line(kind, payload) for kind, payload in events))
+        self.assertEqual([item["type"] for item in final["output"]], ["message", "function_call"])
+
+    def test_item_ids_are_allocated_once_and_never_collide(self):
+        # P1-03: call_x/fc_x derive the same function ID; text/tool/text and
+        # repeated deltas must still publish distinct, stable item IDs.
+        state = DevinStreamState("devin/swe-1-6")
+        messages = [devin_pb2.GetChatMessageResponse(message_id="r-ids", delta_text="a")]
+        for wire_id in ("call_x", "fc_x"):
+            message = devin_pb2.GetChatMessageResponse()
+            call = message.delta_tool_calls.add()
+            call.id, call.name, call.arguments_json = wire_id, "t", "{}"
+            messages.append(message)
+        messages.append(devin_pb2.GetChatMessageResponse(delta_text="b"))
+        events = [event for message in messages for event in state.feed(message)] + state.finish()
+        final = events[-1][1]["response"]
+        ids = [item["id"] for item in final["output"]]
+        self.assertEqual([item["type"] for item in final["output"]],
+                         ["message", "function_call", "function_call"])
+        self.assertEqual(len(set(ids)), len(ids))
+        self.assertEqual([item.get("call_id") for item in final["output"][1:]], ["call_x", "fc_x"])
+        text_ids = {payload["item_id"] for kind, payload in events if kind == "response.output_text.delta"}
+        self.assertEqual(text_ids, {ids[0]})
+        for kind, payload in events:
+            if kind == "response.output_item.added":
+                self.assertIn(payload["item"]["id"], ids)
+            if "item_id" in payload:
+                self.assertIn(payload["item_id"], ids)
+        self.assertEqual(len(state._used_item_ids), len(ids))
 
     def test_chunked_http_truncation_emits_failed_terminal(self):
         from http.client import HTTPResponse
@@ -682,8 +798,7 @@ class DevinGatewayTests(unittest.TestCase):
         for model, key, expected in (("nope", "dummy-key", "devin_unknown_model"),
                                      ("swe-1-6", None, "devin_credential_unavailable")):
             with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
-                cfg = devin_config(devin_api_key=key, devin_auth_db=os.path.join(directory, "missing.db"),
-                                   log_file=os.path.join(directory, "gateway.log"))
+                cfg = devin_config(devin_api_key=key, log_file=os.path.join(directory, "gateway.log"))
                 server = MuseShimServer(("127.0.0.1", 0), cfg)
                 worker = threading.Thread(target=server.serve_forever, daemon=True)
                 worker.start()

@@ -169,7 +169,7 @@ class CaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             capture = CaptureSession(directory).request("raw-cli-token")
             try:
-                with patch("muse_devin_wire.urllib.request.urlopen", side_effect=error):
+                with patch("muse_devin_wire.build_gateway_opener", return_value=unittest.mock.Mock(**{"open.side_effect": error})):
                     with self.assertRaises(DevinHttpError):
                         unary_rpc("https://x", AUTH_PATH, request.SerializeToString())
             finally:
@@ -459,9 +459,10 @@ class CaptureTests(unittest.TestCase):
         import muse_devin
         from muse_gateway import provider_model_catalog
         config = Config(argparse.Namespace(provider="auto", model_discovery=True, devin_api_key="account-a"))
-        def discover(token, *args):
+        def discover(token, *args, **kwargs):
             model = muse_devin.DevinModel(uid=token, logical_id=token, label=token,
-                                          context_limit=200000, output_limit=64000)
+                                          context_limit=200000,
+                                          output_limit=64000 if token == "account-a" else 128000)
             return [model], 0, []
         with patch("muse_devin.discover_models", side_effect=discover) as discovery:
             first = provider_model_catalog(config, "devin")
@@ -472,6 +473,8 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(first[0]["model_id"], "devin/account-a")
         self.assertEqual(second[0]["model_id"], "devin/account-b")
         self.assertEqual(repeated, first)
+        self.assertEqual(set(config._raw_model_rosters["devin"]), {"account-a"})
+        self.assertEqual(config.model_output_limit("devin", "account-a"), 64000)
         self.assertEqual(discovery.call_count, 2)
         from concurrent.futures import ThreadPoolExecutor
         from muse_gateway import _devin_catalog_entries, _devin_cache_key
@@ -483,7 +486,7 @@ class CaptureTests(unittest.TestCase):
                     self.first_iteration = False
                     barrier.wait(timeout=3)
                 return super().__iter__()
-        def concurrent_discovery(token, *args):
+        def concurrent_discovery(token, *args, **kwargs):
             rows, dropped, warnings = discover(token)
             return SynchronizedModels(rows), dropped, warnings
         with patch("muse_devin.discover_models", side_effect=concurrent_discovery):
@@ -495,6 +498,105 @@ class CaptureTests(unittest.TestCase):
         for token in ("concurrent-a", "concurrent-b"):
             roster, _ = config._devin_rosters[_devin_cache_key(config, token)]
             self.assertEqual(set(roster), {token})
+
+    def test_source_fingerprint_covers_catalogs_and_alias_module(self):
+        # P2-08: installs that differ only in catalog data get different fingerprints.
+        import muse_capture
+
+        _root, files = muse_capture._source_files()
+        for name in ("muse_models.py", "muse_shim.py", "providers/kiro.json", "providers/devin.json"):
+            self.assertIn(name, files)
+        before = muse_capture.source_fingerprint()
+        original = muse_capture._source_files
+
+        def changed_catalog():
+            root, hashes = original()
+            return root, {**hashes, "providers/kiro.json": "0" * 64}
+
+        with patch.object(muse_capture, "_source_files", changed_catalog):
+            self.assertNotEqual(muse_capture.source_fingerprint(), before)
+        self.assertEqual(muse_capture._source_identity()["fingerprint"], before)
+
+    def test_claude_http_capture_keeps_outgoing_upstream_and_error_evidence(self):
+        # P1-07 (inverts R16): Claude HTTP captures outgoing + upstream bytes
+        # and the error body, and registers a non-heuristic (cc-) token.
+        from tests.peers import Peer, anthropic_text, gateway
+        token = "cc-opaque-claude-token-0123456789"
+        error_body = json.dumps({"type": "error", "error": {
+            "type": "invalid_request_error", "message": "rejected " + token}}).encode()
+        peer = Peer([anthropic_text("CAPTURED"), (400, error_body, {"request-id": "req_claude_1"})])
+        with tempfile.TemporaryDirectory() as directory:
+            captures = Path(directory) / "captures"
+            with patch.dict(os.environ, {"NO_PROXY": "127.0.0.1,localhost"}, clear=True), gateway(
+                directory, peer, claude_transport="http", access_token=token,
+                capture_dir=str(captures),
+            ) as base:
+                post(base, {"model": "claude/claude-test", "input": "synthetic", "stream": True})
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    post(base, {"model": "claude/claude-test", "input": "synthetic", "stream": True})
+                with caught.exception as response:
+                    self.assertEqual(response.code, 400)
+                    result = json.load(response)["error"]
+            self.assertNotIn("rejected", result["message"])
+            self.assertEqual(result["upstream_request_id"], "req_claude_1")
+            requests = [path.parent for path in captures.rglob("manifest.json")]
+            self.assertEqual(len(requests), 2)
+            requests.sort(key=lambda path: (path / "upstream.error.body").exists())
+            success, failure = ({path.name for path in directory.iterdir()} for directory in requests)
+            for name in ("outgoing.body", "outgoing.headers.json", "upstream.body"):
+                self.assertIn(name, success)
+            self.assertIn("upstream.error.body", failure)
+            self.assertIn(b"CAPTURED", (requests[0] / "upstream.body").read_bytes())
+            self.assertIn(b"rejected [REDACTED]", (requests[1] / "upstream.error.body").read_bytes())
+            tree = b"".join(path.read_bytes() for path in captures.rglob("*") if path.is_file())
+            self.assertNotIn(token.encode(), tree)
+            self.assertNotIn(token.encode(), (Path(directory) / "gateway.log").read_bytes())
+
+    def test_claude_cli_registers_passed_credential_before_capture(self):
+        # P1-07: the credential the CLI child inherits is a request secret.
+        import subprocess
+        from tests.peers import Peer, gateway
+        token = "cc-cli-oauth-secret-9876543210"
+        echoed_stdout = json.dumps({
+            "is_error": False, "structured_output": {"text": "echo " + token, "tool_calls": []}})
+
+        class OwnedClaudeChild:
+            def __init__(self, command, **kwargs):
+                self.command = command
+                self.kwargs = kwargs
+                self.returncode: int | None = None
+
+            def communicate(self, input=None, timeout=None):
+                self.returncode = 0
+                return echoed_stdout, ""
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as directory:
+            captures = Path(directory) / "captures"
+            real_popen = subprocess.Popen
+
+            def claude_only(command, *args, **kwargs):
+                return OwnedClaudeChild(command, **kwargs) if command[:2] == ["claude", "-p"] \
+                    else real_popen(command, *args, **kwargs)
+
+            with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": token, "NO_PROXY": "127.0.0.1"}, clear=True), \
+                    patch("muse_gateway.subprocess.Popen", side_effect=claude_only), \
+                    gateway(directory, Peer([]), claude_transport="cli", capture_dir=str(captures)) as base:
+                post(base, {"model": "claude/claude-test", "input": "synthetic", "stream": True})
+            tree = b"".join(path.read_bytes() for path in captures.rglob("*") if path.is_file())
+            self.assertIn(b"[REDACTED]", tree)
+            self.assertNotIn(token.encode(), tree)
 
     def test_upstream_disconnect_before_headers_returns_502(self):
         from http.client import RemoteDisconnected

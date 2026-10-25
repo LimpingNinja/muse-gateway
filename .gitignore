@@ -49,6 +49,7 @@ secrets/
 .codex/
 .claude/
 .muse/
+.devin/
 
 # Editor / OS
 .idea/

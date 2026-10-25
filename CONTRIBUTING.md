@@ -105,12 +105,19 @@ Protocol references: [Connect](https://connectrpc.com/docs/protocol/),
   diagnostics, the unified `launch` command, and the inherited low-level
   `run` launcher.
 - `muse_providers.py`: provider authentication and protocol adapters.
+- `muse_models.py` and `providers/*.json`: packaged capacity catalogs and
+  their loader/validator (runtime-required).
 - `muse_kiro.py`: Kiro-specific history preparation, endpoint/response
   validation, and Messages stream lifecycle. Shared Anthropic codecs stay
   in `muse_providers.py`; native Claude authentication is not reused.
 - `muse_devin.py`, `muse_devin_wire.py`: Devin credentials, catalog, history,
   stream conversion, and Connect transport. `devin.proto` and `devin_pb2.py`
   are the wire schema and generated bindings; do not hand-edit the bindings.
+  Regenerate from the checkout root with `protoc -I. --python_out=. devin.proto`
+  using a `protoc` whose Python gencode matches the stamp at the top of
+  `devin_pb2.py` (currently "Protobuf Python Version: 7.35.1"); the runtime
+  pin in `pyproject.toml` is `protobuf>=7.35.1,<8`, so a new protobuf major
+  needs regenerated bindings and a raised cap together.
 - `muse-gateway` and `muse-gateway.ps1`: thin wrappers forwarding to
   `python muse_gateway.py launch`.
 - `test_muse_shim.py` and `test_native_providers.py`: provider regression tests.
@@ -124,8 +131,9 @@ Protocol references: [Connect](https://connectrpc.com/docs/protocol/),
   and the explicit installed-Muse acceptance command.
 - `test_capture.py`: private diagnostic capture and related security checks.
 
-The `muse_shim` module alias, the `muse-shim` command alias, `MUSE_SHIM_*`
-settings, and legacy protocol identifiers are compatibility interfaces.
+The `muse_shim` module alias, the `muse-shim` command alias, and legacy
+protocol identifiers are compatibility interfaces. `MUSE_SHIM_*` settings are
+retired: they produce migration diagnostics, not aliases.
 Avoid cosmetic renames that break existing setups. Use **muse-gateway** in new user-facing documentation and messages.
 
 ## Change guidelines

@@ -9,7 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # 3.11/3.12 are advertised in pyproject classifiers but not run here.
         python-version: ["3.10", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -25,7 +26,20 @@ jobs:
         run: python -m tests.check_regressions
       - name: Verify installed package outside the checkout
         working-directory: ${{ runner.temp }}
-        run: python -I -c "import muse_gateway, muse_devin, muse_devin_wire, muse_capture, devin_pb2; print('Installed runtime imports OK')"
+        run: python -I -c "import muse_gateway, muse_devin, muse_devin_wire, muse_capture, muse_models, devin_pb2, providers; print('Installed runtime imports and provider catalogs OK')"
+      - name: Console-script smokes outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          muse-gateway launch -h
+          muse-shim --help
+          muse-gateway --version
+      - name: Parse the PowerShell launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/muse-gateway.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
 
   # Actual Muse acceptance is an explicit pre-release gate documented in
   # CONTRIBUTING.md, not an implicitly skipped check on hosted runners.

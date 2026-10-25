@@ -26,19 +26,18 @@ import urllib.request
 
 from muse_capture import current_capture, encoded_secret_forms
 from muse_providers import (
-    ProviderError, StreamState, ToolNameMap, anthropic_json_to_responses,
-    convert_anthropic_event, responses_to_anthropic,
+    ProviderError, StreamState, ToolNameMap, _input_items as _canonical_input_items,
+    anthropic_json_to_responses, convert_anthropic_event, responses_to_anthropic,
 )
 
 
 DEFAULT_UPSTREAM = "http://127.0.0.1:8000/v1"
-DEFAULT_CONTEXT_LIMIT = 65536
-DEFAULT_OUTPUT_LIMIT = 8192
 _CATALOG_LIMIT = 2 * 1024 * 1024
 _EVENT_LIMIT = 4 * 1024 * 1024
 _BLOCK_LIMIT = 8 * 1024 * 1024
 _RESPONSE_LIMIT = 64 * 1024 * 1024
-_STOP_REASONS = {"end_turn", "stop_sequence", "tool_use", "max_tokens", "refusal"}
+_STOP_REASONS = {"end_turn", "stop_sequence", "tool_use", "max_tokens", "refusal",
+                 "model_context_window_exceeded", "sensitive", "pause_turn"}
 
 # These are explicit machine identifiers, never matches against error prose.
 # A rate_limit_error can also denote a spend cap, so it is not temporary
@@ -360,6 +359,25 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "Kiro redirects are disabled.", headers, fp)
 
 
+_OPENERS: dict[bool, urllib.request.OpenerDirector] = {}
+
+
+def _cached_opener(loopback: bool) -> urllib.request.OpenerDirector:
+    """One verified opener per loopback-ness (P2-11).
+
+    Openers hold no per-request state (``open`` builds its own chain), so
+    sharing them across handler threads is safe. The SSL context is created
+    once instead of per request.
+    """
+    opener = _OPENERS.get(loopback)
+    if opener is None:
+        handlers = [_NoRedirects(), urllib.request.HTTPSHandler(context=ssl.create_default_context())]
+        if loopback:
+            handlers.append(urllib.request.ProxyHandler({}))
+        opener = _OPENERS.setdefault(loopback, urllib.request.build_opener(*handlers))
+    return opener
+
+
 def open_request(url: str, key: str, *, body: bytes | None = None, timeout: float = 8.0):
     """Open once, with a private verified opener and no redirect credentials."""
     parsed = _validated_url(url)
@@ -368,10 +386,7 @@ def open_request(url: str, key: str, *, body: bytes | None = None, timeout: floa
         raise ProviderError("Kiro timeout must be positive and finite.", code="kiro_invalid_timeout")
     if body is not None and not isinstance(body, bytes):
         raise TypeError("Kiro request body must be bytes")
-    handlers = [_NoRedirects(), urllib.request.HTTPSHandler(context=ssl.create_default_context())]
-    if _loopback(parsed.hostname or ""):
-        handlers.append(urllib.request.ProxyHandler({}))
-    opener = urllib.request.build_opener(*handlers)
+    opener = _cached_opener(_loopback(parsed.hostname or ""))
     headers = {"Authorization": "Bearer " + key, "Accept": "text/event-stream, application/json" if body is not None else "application/json",
                "User-Agent": "muse-gateway", "anthropic-version": "2023-06-01"}
     if body is not None:
@@ -445,24 +460,21 @@ def _text_content(content: Any, *, summary: bool = False) -> None:
 
 
 def _input_items(body: Mapping[str, Any]) -> list[dict[str, Any]]:
-    value = body.get("input")
-    if value is None:
-        value = body.get("messages")
-    if isinstance(value, str):
-        return [{"role": "user", "content": value}]
-    if isinstance(value, dict):
-        return [value]
-    if isinstance(value, list):
-        result = []
-        for item in value:
-            if isinstance(item, str):
-                result.append({"role": "user", "content": item})
-            elif isinstance(item, dict):
-                result.append(item)
-            else:
-                raise ProviderError("Kiro input must contain conversation items.", code="kiro_invalid_request")
-        return result
-    return []
+    """Kiro's strict input extraction: the canonical shape plus validation.
+
+    Extraction is shared with the other routes
+    (``muse_providers._input_items``); Kiro additionally rejects
+    non-object list items instead of passing them through.
+    """
+    result = []
+    for item in _canonical_input_items(body):
+        if isinstance(item, str):
+            result.append({"role": "user", "content": item})
+        elif isinstance(item, dict):
+            result.append(item)
+        else:
+            raise ProviderError("Kiro input must contain conversation items.", code="kiro_invalid_request")
+    return result
 
 
 def _validate_tools(tools: Any) -> None:
@@ -688,7 +700,7 @@ def _validate_tool_policy(tool_names: ToolNameMap, name: str) -> None:
 def _validate_stop(reason: Any, *, has_tools: bool) -> None:
     if not isinstance(reason, str) or reason not in _STOP_REASONS:
         raise _invalid_response("Kiro Gateway did not supply a supported stop reason.")
-    if reason == "tool_use" and not has_tools or has_tools and reason not in {"tool_use", "max_tokens"}:
+    if reason == "tool_use" and not has_tools or has_tools and reason not in {"tool_use", "max_tokens", "model_context_window_exceeded", "sensitive", "pause_turn"}:
         raise _invalid_response("Kiro Gateway stop reason disagrees with its tool output.")
 
 
@@ -717,15 +729,8 @@ def convert_json(payload: Mapping[str, Any], *, model: str, tool_names: ToolName
         raise _invalid_response("Kiro Gateway returned an empty response.")
     _validate_stop(payload.get("stop_reason"), has_tools="tool_use" in kinds)
     _validate_usage(payload.get("usage"))
-    converted = anthropic_json_to_responses(payload, model=model, tool_names=tool_names, coalesce_text=True)
-    # Distinct tool call IDs can collide in the shared synthetic item-ID
-    # convention. Keep each inline replay item unambiguous.
-    seen: set[str] = set()
-    for index, item in enumerate(converted["output"]):
-        while item["id"] in seen:
-            item["id"] += "_" + str(index)
-        seen.add(item["id"])
-    return converted
+    # Item IDs are unique per response: the shared codec allocates them (P1-03).
+    return anthropic_json_to_responses(payload, model=model, tool_names=tool_names, coalesce_text=True)
 
 
 def _validate_usage(usage: Any) -> None:
@@ -839,20 +844,8 @@ def stream_events(upstream: Any, *, model: str, tool_names: ToolNameMap,
 
     def convert(kind, payload):
         nonlocal sequence, output_exposure
+        # Item IDs are unique per response: the shared codec allocates them (P1-03).
         events = convert_anthropic_event(kind, payload, state)
-        for name, data in events:
-            # Distinct wire call IDs such as call_x and fc_x can collide in
-            # the shared Responses item-ID convention. Keep call_id intact,
-            # and update only this output item's synthetic identity.
-            if name == "response.output_item.added":
-                index = data["output_index"]
-                item = state.output[index]
-                used = {previous["id"] for previous in state.output[:index]}
-                while item["id"] in used:
-                    item["id"] += "_" + str(index)
-                data["item"]["id"] = item["id"]
-            if "item_id" in data:
-                data["item_id"] = state.output[data["output_index"]]["id"]
         block = blocks.get(payload.get("index")) if kind.startswith("content_block_") else None
         if block is not None and block["kind"] == "tool_use":
             # A syntactically truncated call is not executable. Hold its

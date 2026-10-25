@@ -32,9 +32,10 @@ def assert_checkout_imports():
     root = Path(__file__).resolve().parents[1]
     expected = {name: root / (name + ".py") for name in (
         "muse_gateway", "muse_providers", "muse_devin", "muse_devin_wire",
-        "devin_pb2", "muse_capture", "muse_kiro")}
+        "devin_pb2", "muse_capture", "muse_kiro", "muse_models")}
     expected.update({"tests": root / "tests" / "__init__.py", "tests.peers": root / "tests" / "peers.py",
-                     "tests.contracts": root / "tests" / "contracts.py"})
+                     "tests.contracts": root / "tests" / "contracts.py",
+                     "providers": root / "providers" / "__init__.py"})
     origins = {"tests.check_muse": str(Path(__file__).resolve())}
     for name, path in expected.items():
         module = sys.modules.get(name)
@@ -58,8 +59,10 @@ KIRO_ERROR_MESSAGE = "Kiro Gateway returned a provider error; check its configur
 
 def source_hashes():
     root = Path(__file__).resolve().parents[1]
+    paths = (sorted(root.glob("*.py")) + sorted((root / "tests").glob("*.py"))
+             + sorted((root / "providers").glob("*.py")) + sorted((root / "providers").glob("*.json")))
     return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted(root.glob("*.py")) + sorted((root / "tests").glob("*.py"))}
+            for path in paths}
 
 
 def isolated_environment(directory):

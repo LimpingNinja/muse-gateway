@@ -938,6 +938,30 @@ class KiroContracts(unittest.TestCase):
                 self.assertEqual([part["input"] for part in calls], [{"index": 0}, {"index": 1}])
                 self.assertEqual([(part["tool_use_id"], part["content"]) for part in results], list(zip(expected_ids, ["result:0", "result:1"])))
 
+    def test_colliding_call_ids_get_distinct_item_ids_from_the_shared_codec(self):
+        # P1-03: call_x and fc_x derive the same Responses item ID; uniqueness
+        # now comes from the shared codec, not a Kiro-side rewrite.
+        blocks = [{"type": "tool_use", "id": cid, "name": "echo", "input": {"index": index}}
+                  for index, cid in enumerate(("call_x", "fc_x"))]
+        wire = KiroMessages.START
+        for index, block in enumerate(blocks):
+            wire += event("content_block_start", index=index, content_block={**block, "input": {}})
+            wire += event("content_block_delta", index=index, delta={"type": "input_json_delta", "partial_json": json.dumps(block["input"])})
+            wire += event("content_block_stop", index=index)
+        wire += event("message_delta", delta={"stop_reason": "tool_use"}) + event("message_stop")
+        json_body = json.dumps({"type": "message", "id": "msg_contract", "role": "assistant",
+                                "content": blocks, "stop_reason": "tool_use"}).encode()
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                upstream = wire if stream else (200, "application/json", json_body)
+                base = self.start(MessagesPeer([upstream]))
+                _, raw = post(base, {"model": "kiro/haiku", "input": "go", "tools": [function_tool()],
+                                     "parallel_tool_calls": True, "stream": stream})
+                final = consume(raw) if stream else json.loads(raw)
+                self.assertEqual(final["status"], "completed")
+                self.assertEqual([item["call_id"] for item in final["output"]], ["call_x", "fc_x"])
+                self.assertEqual(len({item["id"] for item in final["output"]}), 2)
+
     def test_precontent_service_retry_keeps_one_lifecycle_but_postcontent_restart_fails(self):
         restarted = KiroMessages.START + anthropic_text("RETRY_OK")
         after_content = anthropic_text("visible").split(b"event: content_block_stop")[0] + KiroMessages.START
@@ -1017,6 +1041,19 @@ class KiroTransport(unittest.TestCase):
                 self.assertEqual(muse_kiro.discover_models(base, "synthetic-key"), ["claude-haiku-4.5", "glm-5"])
             self.assertIs(urllib.request._opener, prior)
         self.assertEqual(peer.catalog_requests[0][1]["Authorization"], "Bearer synthetic-key")
+
+    def test_openers_and_ssl_context_are_built_once_per_loopback_kind(self):
+        # P2-11: no per-request SSL context; loopback keeps its proxy bypass.
+        muse_kiro._OPENERS.clear()
+        self.addCleanup(muse_kiro._OPENERS.clear)
+        with patch("muse_kiro.ssl.create_default_context", wraps=muse_kiro.ssl.create_default_context) as built:
+            first = muse_kiro._cached_opener(True)
+            self.assertIs(muse_kiro._cached_opener(True), first)
+            remote = muse_kiro._cached_opener(False)
+        self.assertIsNot(first, remote)
+        self.assertEqual(built.call_count, 2)
+        # Loopback proxy bypass is behavior-tested by
+        # test_private_opener_bypasses_loopback_proxy_and_preserves_global_opener.
 
     def test_every_redirect_is_refused_even_on_same_origin(self):
         requests = []

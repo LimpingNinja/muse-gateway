@@ -48,12 +48,63 @@ class RecordingOpener:
         return self.response
 
 
+class FakeClaudePopen:
+    """Stand-in for the owned `claude -p` child (P1-10: tracked, stoppable).
+
+    Class attributes set the scripted outcome per test; ``spawned``
+    records every constructed child in order.
+    """
+
+    spawned: list = []
+    stdout = ""
+    stderr = ""
+    script_returncode = 0
+
+    def __init__(self, command, **kwargs):
+        self.command = command
+        self.kwargs = kwargs
+        self.stdin_text = None
+        self.returncode: int | None = None
+        self.terminated = False
+        FakeClaudePopen.spawned.append(self)
+
+    def communicate(self, input=None, timeout=None):
+        self.stdin_text = input
+        self.returncode = FakeClaudePopen.script_returncode
+        return FakeClaudePopen.stdout, FakeClaudePopen.stderr
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 class DummyForwardHandler:
     server_version = "muse-shim-test"
 
     def __init__(self, config):
         self.config = config
         self.wfile = io.BytesIO()
+        self.headers = {}
+        self._request_secrets = []
+
+    def _register_secret(self, value):
+        if isinstance(value, str) and value and value not in self._request_secrets:
+            self._request_secrets.append(value)
+
+    def _all_secrets(self):
+        return [*self.config.secret_values(), *self._request_secrets, ""]
+
+    _note_upstream_error_headers = MuseShimHandler._note_upstream_error_headers
+    _track_upstream = MuseShimHandler._track_upstream
 
     def _send_upstream_headers(self, *args, **kwargs):
         return None
@@ -66,6 +117,9 @@ class DummyForwardHandler:
 
     def end_headers(self):
         return None
+
+    def send_json(self, status, value, **kwargs):
+        self.wfile.write(json.dumps(value).encode("utf-8"))
 
 
 def _unauthorized_response():
@@ -124,23 +178,9 @@ class NoCredentialEnvTest(unittest.TestCase):
         self._credential_env = patch.dict(
             os.environ,
             {
-                "MUSE_GATEWAY_CODEX_ACCESS_TOKEN": "",
-                "MUSE_SHIM_CODEX_ACCESS_TOKEN": "",
-                "CODEX_ACCESS_TOKEN": "",
-                "OPENAI_CODEX_ACCESS_TOKEN": "",
-                "MUSE_GATEWAY_CODEX_REFRESH_TOKEN": "",
-                "MUSE_SHIM_CODEX_REFRESH_TOKEN": "",
-                "CODEX_REFRESH_TOKEN": "",
                 "CLAUDE_CODE_OAUTH_TOKEN": "",
-                "ANTHROPIC_TOKEN": "",
-                "MUSE_GATEWAY_CLAUDE_ACCESS_TOKEN": "",
-                "MUSE_SHIM_CLAUDE_ACCESS_TOKEN": "",
                 "CLAUDE_CODE_REFRESH_TOKEN": "",
-                "MUSE_GATEWAY_CLAUDE_REFRESH_TOKEN": "",
-                "MUSE_SHIM_CLAUDE_REFRESH_TOKEN": "",
                 "ANTHROPIC_API_KEY": "",
-                "MUSE_GATEWAY_CLAUDE_CREDENTIALS": "",
-                "MUSE_SHIM_CLAUDE_CREDENTIALS": "",
                 "CLAUDE_CODE_CREDENTIALS_PATH": "",
                 "CLAUDE_CONFIG_DIR": "",
             },
@@ -260,11 +300,11 @@ class NativeRetryTests(NoCredentialEnvTest):
                         self.addCleanup(response.close)
                     replies = list(denied)
                     if outcome == "success":
-                        replies.append(FakeResponse(json.dumps({"id": "msg-ok", "content": [{"type": "text", "text": "OK"}]})))
+                        replies.append(FakeResponse(json.dumps({"id": "msg-ok", "type": "message", "content": [{"type": "text", "text": "OK"}]})))
                     handler = DummyForwardHandler(Config(_args(provider=provider)))
                     forward = getattr(MuseShimHandler, "forward_" + provider)
                     with patch("muse_gateway.resolve_" + provider + "_credentials", side_effect=states) as resolve, patch(
-                        "muse_gateway.urllib.request.urlopen", side_effect=replies,
+                        "muse_gateway._credentialed_urlopen", side_effect=replies,
                     ) as opened:
                         if outcome == "success":
                             forward(handler, {"model": "fixture-model", "input": "hello", "stream": False})
@@ -360,11 +400,55 @@ class ClaudeAuthAndConversionTests(NoCredentialEnvTest):
         self.assertEqual(names.decode("mcp__read_file"), "read_file")
 
 
+class FlattenWireShapeTests(NoCredentialEnvTest):
+    """P2-07 contract: namespace-flatten error wire shapes are pinned.
+
+    The gateway transform path reports ``shim_error``; the provider codec
+    reports ``duplicate_tool``/``invalid_tools``. The flatten
+    consolidation must share logic without changing these wire types.
+    """
+
+    def _shapes(self):
+        from muse_gateway import ShimError, flatten_namespace_tools
+        from muse_providers import ProviderError as CodecError, _flatten_tools
+
+        dup = [
+            {"type": "namespace", "name": "ns", "tools": [
+                {"type": "function", "name": "same"},
+                {"type": "function", "name": "same"},
+            ]},
+        ]
+        no_list = [{"type": "namespace", "name": "ns"}]
+        unnamed = [{"type": "namespace", "name": "ns", "tools": [{"type": "function"}]}]
+        shapes = {}
+        for key, tools in (("duplicate", dup), ("no_list", no_list), ("unnamed", unnamed)):
+            with self.assertRaises(ShimError, msg=f"gateway {key}"):
+                flatten_namespace_tools(tools)
+            shapes[f"gateway_{key}"] = "shim_error"
+            with self.assertRaises(CodecError, msg=f"provider {key}") as caught:
+                _flatten_tools(tools)
+            shapes[f"provider_{key}"] = caught.exception.code
+        return shapes
+
+    def test_flatten_error_wire_shapes(self):
+        self.assertEqual(
+            self._shapes(),
+            {
+                "gateway_duplicate": "shim_error",
+                "gateway_no_list": "shim_error",
+                "gateway_unnamed": "shim_error",
+                "provider_duplicate": "duplicate_tool",
+                "provider_no_list": "invalid_tools",
+                "provider_unnamed": "invalid_tools",
+            },
+        )
+
+
 class ClaudeStreamTests(NoCredentialEnvTest):
     def _converted_calls(self, names, ids, wire_name):
         content = [{"type": "tool_use", "id": call_id, "name": wire_name, "input": {"index": index}}
                    for index, call_id in enumerate(ids)]
-        converted = anthropic_json_to_responses({"id": "msg_ids", "content": content}, tool_names=names)
+        converted = anthropic_json_to_responses({"id": "msg_ids", "type": "message", "content": content}, tool_names=names)
         state = StreamState("fixture", names)
         convert_anthropic_event("message_start", {"message": {"id": "msg_ids"}}, state)
         for index, block in enumerate(content):
@@ -384,12 +468,85 @@ class ClaudeStreamTests(NoCredentialEnvTest):
                 self.assertEqual([item["call_id"] for item in output], ["toolu_original", name, "mcp__unregistered"])
                 self.assertEqual([item["name"] for item in output], [name] * 3)
 
+    def test_identity_maps_are_injective(self):
+        # P1-03 (inverts R09): no tool name, call ID, or item ID collapses.
+        names = ToolNameMap(oauth=True)
+        first, second = names.add("_foo"), names.add("mcp__foo")
+        self.assertNotEqual(first, second)
+        self.assertEqual((names.decode(first), names.decode(second)), ("_foo", "mcp__foo"))
+        history = [
+            {"type": "function_call", "call_id": "a:b", "name": "f", "arguments": "{}"},
+            {"type": "function_call", "call_id": "muse_call_YTpi", "name": "f", "arguments": "{}"},
+            {"type": "function_call", "name": "f", "arguments": "{}"},
+            {"type": "function_call", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "a:b", "output": "first"},
+            {"type": "function_call_output", "call_id": "muse_call_YTpi", "output": "second"},
+            {"type": "function_call_output", "call_id": "orphan:id", "output": "orphan"},
+        ]
+        payload, _ = responses_to_anthropic({"model": "claude-test", "input": history})
+        parts = [part for message in payload["messages"] for part in message["content"] if isinstance(part, dict)]
+        call_ids = [part["id"] for part in parts if part["type"] == "tool_use"]
+        result_ids = [part["tool_use_id"] for part in parts if part["type"] == "tool_result"]
+        self.assertEqual(len(set(call_ids)), 4)
+        self.assertEqual(result_ids[:2], call_ids[:2])
+        self.assertRegex(result_ids[2], r"^muse_call_[A-Za-z0-9_-]{1,54}$")
+        for ids in (["call_x", "fc_x"], ["fc_x", "call_x"]):
+            with self.subTest(ids=ids):
+                for output in self._converted_calls(ToolNameMap(oauth=False), ids, "read_file"):
+                    self.assertEqual(len({item["id"] for item in output}), 2)
+                    self.assertEqual([item["call_id"] for item in output], ids)
+
+    def test_text_tool_text_item_ids_are_distinct_and_equal_across_modes(self):
+        content = [
+            {"type": "text", "text": "before"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+            {"type": "text", "text": "after"},
+        ]
+        for coalesce in (False, True):
+            with self.subTest(coalesce_text=coalesce):
+                converted = anthropic_json_to_responses({
+                    "id": "msg-dummy", "type": "message", "stop_reason": "tool_use", "content": content,
+                }, coalesce_text=coalesce)
+                state = StreamState("fixture", ToolNameMap(oauth=False), coalesce_text=coalesce)
+                convert_anthropic_event("message_start", {"message": {"id": "msg-dummy"}}, state)
+                for index, block in enumerate(content):
+                    start = dict(block, text="") if block["type"] == "text" else dict(block, input={})
+                    convert_anthropic_event("content_block_start", {"index": index, "content_block": start}, state)
+                    delta = ({"type": "text_delta", "text": block["text"]} if block["type"] == "text"
+                             else {"type": "input_json_delta", "partial_json": "{}"})
+                    convert_anthropic_event("content_block_delta", {"index": index, "delta": delta}, state)
+                    convert_anthropic_event("content_block_stop", {"index": index}, state)
+                convert_anthropic_event("message_delta", {"delta": {"stop_reason": "tool_use"}}, state)
+                streamed = convert_anthropic_event("message_stop", {}, state)[-1][1]["response"]
+                json_ids = [item["id"] for item in converted["output"]]
+                stream_ids = [item["id"] for item in streamed["output"]]
+                self.assertEqual(len(json_ids), 2 if coalesce else 3)
+                self.assertEqual(len(set(json_ids)), len(json_ids))
+                self.assertEqual(stream_ids, json_ids)
+                self.assertEqual([item["type"] for item in streamed["output"]],
+                                 [item["type"] for item in converted["output"]])
+
+    def test_native_usage_counts_cache_and_summary_arrays_replay(self):
+        # P2-03 (inverts R20 and R10); Kiro's caller-estimated total unchanged.
+        from muse_providers import _anthropic_usage
+        usage = {"input_tokens": 50, "output_tokens": 1,
+                 "cache_read_input_tokens": 100_000, "cache_creation_input_tokens": 2_000}
+        self.assertEqual(_anthropic_usage(usage, native=True)["input_tokens"], 102_050)
+        self.assertEqual(_anthropic_usage(usage)["input_tokens"], 50)
+        payload, _ = responses_to_anthropic({"model": "claude-test", "input": [
+            {"role": "user", "content": "first"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "SUMMARY_SENTINEL"}],
+             "encrypted_content": "ENCRYPTED_SENTINEL"},
+            {"role": "user", "content": "next"}]})
+        self.assertIn("SUMMARY_SENTINEL", json.dumps(payload))
+        self.assertNotIn("ENCRYPTED_SENTINEL", json.dumps(payload))
+
     def test_cache_usage_is_preserved_across_modes_without_adding_to_totals(self):
         for cached, created in ((31, 17), (0, 0)):
             with self.subTest(cached=cached, created=created):
                 usage = {"input_tokens": 101, "output_tokens": 7,
                          "cache_read_input_tokens": cached, "cache_creation_input_tokens": created}
-                converted = anthropic_json_to_responses({"content": [], "usage": usage})
+                converted = anthropic_json_to_responses({"type": "message", "content": [], "usage": usage})
                 state = StreamState("fixture", ToolNameMap(oauth=False))
                 convert_anthropic_event("message_start", {"message": {"usage": {**usage, "output_tokens": 0}}}, state)
                 convert_anthropic_event("message_delta", {"usage": {"output_tokens": 7}}, state)
@@ -401,18 +558,21 @@ class ClaudeStreamTests(NoCredentialEnvTest):
                 convert_anthropic_event("message_delta", {"usage": {"cache_read_input_tokens": 9, "cache_creation_input_tokens": 2}}, state)
                 self.assertEqual(state.response()["usage"]["input_tokens_details"], {
                     "cached_tokens": 9, "anthropic_cache_creation_input_tokens": 2})
-        ordinary = anthropic_json_to_responses({"usage": {"input_tokens": 1}})
+        ordinary = anthropic_json_to_responses({"type": "message", "content": [], "usage": {"input_tokens": 1}})
         self.assertNotIn("input_tokens_details", ordinary["usage"])
 
     def test_coalescing_message_stop_does_not_finish_partial_tool_arguments(self):
+        # P0-07: an unclosed block at message_stop fails the turn (never a
+        # finished call); partial arguments stay in_progress, not done.
         state = StreamState("fixture", ToolNameMap(oauth=False), coalesce_text=True)
+        convert_anthropic_event("message_start", {"message": {"id": "msg_partial"}}, state)
         convert_anthropic_event("content_block_start", {"index": 0, "content_block": {
             "type": "tool_use", "id": "partial", "name": "read_file"}}, state)
         convert_anthropic_event("content_block_delta", {"index": 0, "delta": {
             "type": "input_json_delta", "partial_json": '{"path":'}}, state)
         convert_anthropic_event("message_delta", {"delta": {"stop_reason": "max_tokens"}}, state)
         events = convert_anthropic_event("message_stop", {}, state)
-        self.assertEqual([kind for kind, _ in events], ["response.incomplete"])
+        self.assertEqual([kind for kind, _ in events], ["response.failed"])
         self.assertEqual(events[0][1]["response"]["output"][0]["status"], "in_progress")
         self.assertEqual(events[0][1]["response"]["output"][0]["arguments"], '{"path":')
 
@@ -748,21 +908,23 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             },
             "usage": {"input_tokens": 11, "output_tokens": 5},
         }
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=json.dumps(cli_result), stderr=""
-        )
+        FakeClaudePopen.spawned = []
+        FakeClaudePopen.stdout = json.dumps(cli_result)
+        FakeClaudePopen.stderr = ""
+        FakeClaudePopen.script_returncode = 0
         config = Config(_args(provider="auto"))
         with patch.dict(os.environ, {"CLAUDECODE": "1"}, clear=False):
-            with patch("muse_gateway.subprocess.run", return_value=completed) as launched:
+            with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
                 payload, tool_names = run_claude_cli(body, config)
-        command = launched.call_args.args[0]
+        child = FakeClaudePopen.spawned[0]
+        command = child.command
         self.assertEqual(command[:2], ["claude", "-p"])
         self.assertIn("--safe-mode", command)
         self.assertIn("--json-schema", command)
         self.assertIn("--effort", command)
         self.assertNotIn("Look up item 7", command)
-        self.assertIn("Look up item 7", launched.call_args.kwargs["input"])
-        self.assertNotIn("CLAUDECODE", launched.call_args.kwargs["env"])
+        self.assertIn("Look up item 7", child.stdin_text)
+        self.assertNotIn("CLAUDECODE", child.kwargs["env"])
         converted = anthropic_json_to_responses(
             payload, model="claude-sonnet-5", tool_names=tool_names
         )
@@ -770,17 +932,84 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(converted["output"][0]["name"], "lookup")
         self.assertEqual(converted["output"][0]["arguments"], '{"id":7}')
 
+    def test_request_tool_policy_reaches_claude_http_and_cli(self):
+        # P1-05 (inverts R08 Claude halves): serial and forced choices are
+        # sent or enforced, and unrepresentable controls are rejected.
+        tool = {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+        body = {"model": "claude-sonnet-5", "input": "go", "tools": [tool]}
+        native, _ = responses_to_anthropic(dict(body, parallel_tool_calls=False))
+        self.assertEqual(native["tool_choice"], {"type": "auto", "disable_parallel_tool_use": True})
+        native, _ = responses_to_anthropic(dict(body, tool_choice="required", parallel_tool_calls=False))
+        self.assertEqual(native["tool_choice"], {"type": "any", "disable_parallel_tool_use": True})
+        for bad, code in (({"tool_choice": {"type": "web_search"}}, "claude_unsupported_tool_choice"),
+                          ({"parallel_tool_calls": "no"}, "claude_invalid_request")):
+            with self.subTest(bad=bad), self.assertRaises(ProviderError) as caught:
+                responses_to_anthropic(dict(body, **bad))
+            self.assertEqual(caught.exception.code, code)
+
+        def cli(request, calls):
+            FakeClaudePopen.spawned = []
+            FakeClaudePopen.stdout = json.dumps({
+                "is_error": False, "structured_output": {"text": "plain", "tool_calls": calls}})
+            FakeClaudePopen.stderr = ""
+            FakeClaudePopen.script_returncode = 0
+            with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
+                result = run_claude_cli(dict(body, **request), Config(_args(provider="auto")))
+            command = FakeClaudePopen.spawned[-1].command
+            return result, json.loads(command[command.index("--json-schema") + 1])
+
+        one = [{"name": "lookup", "arguments_json": "{}"}]
+        for request, calls in (({"tool_choice": "required"}, []),
+                               ({"tool_choice": {"type": "function", "name": "lookup"}}, []),
+                               ({"parallel_tool_calls": False}, one * 2)):
+            with self.subTest(request=request), self.assertRaises(ProviderError) as caught:
+                cli(request, calls)
+            self.assertEqual(caught.exception.code, "claude_cli_invalid_response")
+        (_, _), schema = cli({"tool_choice": "required", "parallel_tool_calls": False}, one)
+        self.assertEqual((schema["properties"]["tool_calls"]["minItems"],
+                          schema["properties"]["tool_calls"]["maxItems"]), (1, 1))
+        (payload, _), schema = cli({"tool_choice": "none"}, [])
+        self.assertEqual(schema["properties"]["tool_calls"]["maxItems"], 0)
+        self.assertEqual(payload["stop_reason"], "end_turn")
+
+    def test_claude_cli_rejects_images_and_unenforceable_output_caps_before_spawn(self):
+        # P2-02 (inverts R22): no silent no-op cap, no base64 images in stdin.
+        cases = (
+            ({"max_output_tokens": 100}, "claude_cli_output_limit_unsupported"),
+            ({"input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}]},
+             "claude_cli_images_unsupported"),
+        )
+        for extra, code in cases:
+            with self.subTest(code=code), patch(
+                "muse_gateway.subprocess.Popen", side_effect=AssertionError("child spawned")
+            ), self.assertRaises(ProviderError) as caught:
+                run_claude_cli({"model": "claude-sonnet-5", "input": "hi", **extra}, Config(_args(provider="auto")))
+            self.assertEqual(caught.exception.code, code)
+        FakeClaudePopen.spawned = []
+        FakeClaudePopen.stdout = json.dumps({
+            "is_error": False, "structured_output": {"text": "ok", "tool_calls": []}})
+        FakeClaudePopen.stderr = ""
+        FakeClaudePopen.script_returncode = 0
+        with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
+            run_claude_cli({"model": "claude-sonnet-5", "input": "hi", "max_output_tokens": 10_000_000},
+                           Config(_args(provider="auto")))
+        child_kwargs = FakeClaudePopen.spawned[-1].kwargs
+        self.assertEqual(child_kwargs["encoding"], "utf-8")
+        self.assertEqual(child_kwargs["errors"], "replace")
+
     def test_claude_cli_transport_surfaces_subscription_limit(self):
         cli_result = {
             "is_error": True,
             "api_error_status": 429,
             "result": "You've hit your session limit",
         }
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout=json.dumps(cli_result), stderr=""
-        )
+        FakeClaudePopen.spawned = []
+        FakeClaudePopen.stdout = json.dumps(cli_result)
+        FakeClaudePopen.stderr = ""
+        FakeClaudePopen.script_returncode = 1
         config = Config(_args(provider="auto"))
-        with patch("muse_gateway.subprocess.run", return_value=completed):
+        with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
             with self.assertRaises(ProviderError) as raised:
                 run_claude_cli(
                     {"model": "claude-haiku-4-5-20251001", "input": "hello"},
@@ -798,7 +1027,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         self.assertEqual(result, 7)
         command = launched.call_args.args[0]
         environment = launched.call_args.kwargs["env"]
-        self.assertEqual(command[:2], ["muse", "--provider"])
+        self.assertTrue(command[0].endswith("muse") or command[0].endswith("muse.cmd")); self.assertEqual(command[1], "--provider")
         self.assertEqual(command[2], "meta")
         self.assertEqual(command[3], "--base-url")
         self.assertTrue(command[4].startswith("http://127.0.0.1:"))
@@ -835,7 +1064,12 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             },
             clear=False,
         ):
-            self.assert_cli_error(["codex"], "not an approved native URL")
+            with redirect_stderr(io.StringIO()) as output:
+                args = parse_args(["codex"])
+            self.assertEqual(args.upstream, DEFAULT_CODEX_ENDPOINT)
+            self.assertFalse(args.allow_oauth_host_override)
+            self.assertIn("MUSE_SHIM_CODEX_UPSTREAM is removed and ignored", output.getvalue())
+            self.assertNotIn("https://evil.example", output.getvalue())
 
     def test_non_loopback_binding_requires_explicit_opt_in(self):
         self.assert_cli_error(["generic", "--host", "0.0.0.0"], "refusing non-loopback")
@@ -893,7 +1127,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 "http://127.0.0.1/responses", 400, "bad request", {}, io.BytesIO(upstream_body)
             )
             try:
-                with patch("muse_gateway.urllib.request.urlopen", side_effect=failure), redirect_stderr(stderr):
+                with patch("muse_gateway._credentialed_urlopen", side_effect=failure), redirect_stderr(stderr):
                     connection.request("POST", "/responses", json.dumps({
                         "model": "audit-model", "input": "private-prompt",
                         "reasoning": {"effort": "minimal"},
@@ -906,13 +1140,15 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                 stream_bytes = b'event: error\ndata: {"type":"error","error":{"message":"Unsupported effort","param":"reasoning.effort","code":"unsupported_value"}}\n\n'
                 stream = FakeResponse(stream_bytes, headers={"Content-Type": "text/event-stream"})
                 stream.readline = io.BytesIO(stream_bytes).readline
-                with patch("muse_gateway.urllib.request.urlopen", return_value=stream), redirect_stderr(stderr):
+                with patch("muse_gateway._credentialed_urlopen", return_value=stream), redirect_stderr(stderr):
                     connection.request("POST", "/responses", json.dumps({
                         "model": "audit-model", "input": "private-prompt", "stream": True,
                     }), {"Authorization": "Bearer incoming-secret", "Content-Type": "application/json"})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
-                    self.assertEqual(response.read(), stream_bytes)
+                    relayed = response.read()
+                    self.assertTrue(relayed.startswith(stream_bytes))
+                    self.assertIn(b"response.failed", relayed)
             finally:
                 connection.close()
                 server.shutdown()
@@ -928,6 +1164,452 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertIn('"stream_failed": true', logged)
             self.assertIn("upstream_stream_error", logged)
             self.assertEqual(stderr.getvalue(), "")
+
+
+class RedirectAndHermesTests(unittest.TestCase):
+    """P0-04 scoped opener matrix + P1-14 prompt fidelity."""
+
+    def test_redirect_matrix_through_real_opener(self):
+        import threading
+        import urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from muse_providers import build_gateway_opener
+
+        hits = {"target": []}
+
+        class Target(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits["target"].append(dict(self.headers))
+                body = b"target"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        target_port = target.server_port
+
+        class Source(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/cross-port":
+                    location = f"http://127.0.0.1:{target_port}/stolen"
+                elif self.path == "/bad-port":
+                    location = "http://127.0.0.1:notaport/x"
+                elif self.path == "/bad-bracket":
+                    location = "http://[::1/x"
+                else:
+                    location = "/landed"
+                if self.path == "/landed":
+                    body = b"landed"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        source = ThreadingHTTPServer(("127.0.0.1", 0), Source)
+        for server in (target, source):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{source.server_port}"
+            for path in ("/cross-port", "/bad-port", "/bad-bracket"):
+                with self.subTest(path=path):
+                    request = urllib.request.Request(base + path)
+                    request.add_header("x-api-key", "sentinel-key")
+                    opener = build_gateway_opener(base + path)
+                    with self.assertRaises(urllib.error.HTTPError):
+                        opener.open(request, timeout=5)
+            self.assertEqual(hits["target"], [])
+            request = urllib.request.Request(base + "/same-origin")
+            with build_gateway_opener(base).open(request, timeout=5) as response:
+                self.assertEqual(response.read(), b"landed")
+            # Unit-level origin checks for scheme/port tuples.
+            from muse_providers import _SameOriginRedirectHandler
+
+            origin = _SameOriginRedirectHandler._origin
+            self.assertEqual(origin("https://Example.COM/x"), ("https", "example.com", 443))
+            self.assertNotEqual(origin("https://example.com"), origin("http://example.com"))
+            self.assertIsNone(origin("https://example.com:notaport/"))
+            # The global opener is never replaced by building ours.
+            before = urllib.request._opener  # noqa: SLF001
+            build_gateway_opener(base)
+            self.assertIs(urllib.request._opener, before)  # noqa: SLF001
+        finally:
+            for server in (target, source):
+                server.shutdown()
+                server.server_close()
+
+    def test_hermes_nous_text_is_not_rewritten(self):
+        needles = "Hermes Agent hermes-agent Hermes agent Nous Research"
+        payload, _ = responses_to_anthropic(
+            {"model": "claude-test", "instructions": needles, "input": "hi"},
+            oauth=True,
+        )
+        system_text = " ".join(
+            str(part.get("text") or "") for part in payload.get("system", [])
+        )
+        self.assertIn(needles, system_text)
+
+
+class ClaudeLifecycleTruthfulnessTests(unittest.TestCase):
+    """P0-07/P1-12/P2-01: no false completions from malformed lifecycles."""
+
+    def _run(self, raw: bytes) -> bytes:
+        from muse_providers import convert_anthropic_stream
+
+        return b"".join(convert_anthropic_stream(
+            io.BytesIO(raw), model="claude-test", tool_names=ToolNameMap(oauth=False)))
+
+    def _sse(self, *events) -> bytes:
+        out = b""
+        for kind, payload in events:
+            out += f"event: {kind}\ndata: {json.dumps({'type': kind, **payload})}\n\n".encode()
+        return out
+
+    def _valid_tail(self):
+        return (
+            ("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}),
+            ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "hi"}}),
+            ("content_block_stop", {"index": 0}),
+            ("message_delta", {"delta": {"stop_reason": "end_turn"}}),
+            ("message_stop", {}),
+        )
+
+    def test_ping_and_unknown_before_message_start_are_ignored(self):
+        raw = self._sse(
+            ("ping", {}),
+            ("future_extension", {"anything": 1}),
+            ("message_start", {"message": {"id": "msg_x"}}),
+            *self._valid_tail(),
+        )
+        wire = self._run(raw)
+        self.assertIn(b"response.completed", wire)
+        self.assertNotIn(b"response.failed", wire)
+
+    def test_lifecycle_events_before_message_start_fail(self):
+        for kind, payload in (
+            ("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}),
+            ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "x"}}),
+            ("content_block_stop", {"index": 0}),
+            ("message_delta", {"delta": {"stop_reason": "end_turn"}}),
+            ("message_stop", {}),
+        ):
+            with self.subTest(kind=kind):
+                wire = self._run(self._sse((kind, payload)))
+                self.assertIn(b"response.failed", wire)
+                self.assertNotIn(b"response.completed", wire)
+
+    def test_malformed_json_and_bad_index_and_midstream_raise_fail(self):
+        malformed = b'event: content_block_delta\ndata: {not-json\n\n'
+        raw = self._sse(("message_start", {"message": {"id": "m"}})) + malformed
+        wire = self._run(raw)
+        self.assertIn(b"response.failed", wire)
+        self.assertNotIn(b"response.completed", wire)
+
+        raw = self._sse(
+            ("message_start", {"message": {"id": "m"}}),
+            ("content_block_start", {"index": "zero", "content_block": {"type": "text", "text": ""}}),
+        )
+        wire = self._run(raw)
+        self.assertIn(b"response.failed", wire)
+        self.assertIn(b"claude_invalid_sse", wire)
+
+        class Exploding:
+            def __init__(self, prefix):
+                self._stream = io.BytesIO(prefix)
+
+            def readline(self, limit=-1):
+                line = self._stream.readline(limit)
+                if not line:
+                    raise ConnectionResetError("boom")
+                return line
+
+        from muse_providers import convert_anthropic_stream
+
+        prefix = self._sse(("message_start", {"message": {"id": "m"}}))
+        wire = b"".join(convert_anthropic_stream(
+            Exploding(prefix), model="claude-test", tool_names=ToolNameMap(oauth=False)))
+        self.assertIn(b"response.failed", wire)
+        self.assertNotIn(b"response.completed", wire)
+
+    def test_no_read_after_message_stop(self):
+        raw = self._sse(("message_start", {"message": {"id": "m"}}), *self._valid_tail())
+
+        class Guarded:
+            def __init__(self, data):
+                self._stream = io.BytesIO(data)
+
+            def readline(self, limit=-1):
+                line = self._stream.readline(limit)
+                if not line:
+                    raise AssertionError("read past message_stop")
+                return line
+
+        from muse_providers import convert_anthropic_stream
+
+        wire = b"".join(convert_anthropic_stream(
+            Guarded(raw), model="claude-test", tool_names=ToolNameMap(oauth=False)))
+        self.assertIn(b"response.completed", wire)
+
+    def test_invalid_tool_arguments_fail_without_done(self):
+        raw = self._sse(
+            ("message_start", {"message": {"id": "m"}}),
+            ("content_block_start", {"index": 0, "content_block": {
+                "type": "tool_use", "id": "t1", "name": "read_file", "input": {}}}),
+            ("content_block_delta", {"index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": "{bad"}}),
+            ("content_block_stop", {"index": 0}),
+            ("message_delta", {"delta": {"stop_reason": "tool_use"}}),
+            ("message_stop", {}),
+        )
+        wire = self._run(raw)
+        self.assertIn(b"response.failed", wire)
+        self.assertNotIn(b"function_call_arguments.done", wire)
+
+    def test_stop_reason_matrix_stream_and_json(self):
+        cases = {
+            "max_tokens": "incomplete",
+            "model_context_window_exceeded": "incomplete",
+            "refusal": "failed",
+            "sensitive": "failed",
+            "end_turn": "completed",
+            "pause_turn": "completed",
+            "some_future_reason": "failed",
+        }
+        for reason, expected in cases.items():
+            with self.subTest(reason=reason):
+                events = list(self._valid_tail())
+                events[-2] = ("message_delta", {"delta": {"stop_reason": reason}})
+                raw = self._sse(("message_start", {"message": {"id": "m"}}), *events)
+                wire = self._run(raw)
+                self.assertIn(f"response.{expected}".encode(), wire)
+                converted = anthropic_json_to_responses({
+                    "type": "message",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "stop_reason": reason,
+                })
+                self.assertEqual(converted["status"], expected)
+
+    def test_empty_json_response_is_rejected(self):
+        with self.assertRaises(ProviderError) as caught:
+            anthropic_json_to_responses({})
+        self.assertEqual(caught.exception.code, "claude_invalid_response")
+
+
+class NamedCoverageGapTests(NoCredentialEnvTest):
+    """P1-16: CLI stream synthesis, effort correction, expiry arithmetic."""
+
+    def test_claude_cli_stream_synthesis_satisfies_the_consumer_oracle(self):
+        from muse_gateway import _anthropic_message_sse
+        from muse_providers import convert_anthropic_stream
+        from tests.contracts import consume
+
+        for content, terminal_type in (
+            ([{"type": "text", "text": "hi \u03bb"}], "message"),
+            ([{"type": "text", "text": "calling"},
+              {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"id": 7}}], "function_call"),
+        ):
+            with self.subTest(last=terminal_type):
+                payload = {"id": "msg_cli", "type": "message", "role": "assistant", "model": "claude-test",
+                           "content": content, "stop_reason": "tool_use" if terminal_type == "function_call" else "end_turn",
+                           "usage": {"input_tokens": 3, "output_tokens": 2}}
+                wire = b"".join(convert_anthropic_stream(
+                    _anthropic_message_sse(payload), model="claude-test",
+                    tool_names=ToolNameMap(oauth=False), coalesce_text=True, native_usage=True))
+                final = consume(wire)
+                self.assertEqual(final["status"], "completed")
+                self.assertEqual(final["output"][-1]["type"], terminal_type)
+                if terminal_type == "function_call":
+                    self.assertEqual(json.loads(final["output"][-1]["arguments"]), {"id": 7})
+
+    def test_forward_claude_cli_streams_on_the_wire(self):
+        from tests.contracts import consume
+
+        FakeClaudePopen.spawned = []
+        FakeClaudePopen.stdout = json.dumps({
+            "is_error": False, "structured_output": {"text": "CLI_WIRE", "tool_calls": []},
+            "usage": {"input_tokens": 1, "output_tokens": 1}})
+        FakeClaudePopen.stderr = ""
+        FakeClaudePopen.script_returncode = 0
+        handler = DummyForwardHandler(Config(_args(provider="auto")))
+        handler.wfile = io.BytesIO()
+        handler._log_event = lambda *args, **kwargs: None
+        with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
+            MuseShimHandler.forward_claude_cli(handler, {"model": "claude-test", "input": "hi", "stream": True})
+        final = consume(handler.wfile.getvalue())
+        self.assertEqual(final["output"][0]["content"][0]["text"], "CLI_WIRE")
+
+    def test_claude_cli_child_is_tracked_for_shutdown(self):
+        # P1-10: the owned `claude -p` child is handed to the tracker so
+        # server shutdown can terminate it; the request-end release then
+        # untracks it.
+        FakeClaudePopen.spawned = []
+        FakeClaudePopen.stdout = json.dumps({
+            "is_error": False, "structured_output": {"text": "hi", "tool_calls": []}})
+        FakeClaudePopen.stderr = ""
+        FakeClaudePopen.script_returncode = 0
+        tracked = []
+        config = Config(_args(provider="auto"))
+        with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
+            run_claude_cli({"model": "claude-test", "input": "hi"}, config,
+                           track=tracked.append)
+        self.assertEqual(len(FakeClaudePopen.spawned), 1)
+        self.assertEqual(tracked, FakeClaudePopen.spawned)
+
+    def test_correct_codex_effort_all_branches(self):
+        from muse_providers import correct_codex_effort
+
+        self.assertEqual(correct_codex_effort("xhigh", []), ("xhigh", False))
+        self.assertEqual(correct_codex_effort("high", ["low", "high"]), ("high", False))
+        self.assertEqual(correct_codex_effort("HIGH", ["low", "high"]), ("high", True))
+        self.assertEqual(correct_codex_effort("minimal", ["low", "high"]), ("low", True))
+        self.assertEqual(correct_codex_effort("ultra", ["max"]), ("max", True))
+        with self.assertRaises(ProviderError) as caught:
+            correct_codex_effort("minimal", ["medium"])
+        self.assertEqual(caught.exception.code, "codex_unsupported_reasoning_effort")
+        self.assertIn("medium", str(caught.exception))
+
+    def test_expiry_parsing_jwt_claims_and_skew_boundaries(self):
+        from muse_providers import _parse_expiry, jwt_claims, token_is_expiring
+
+        self.assertEqual(_parse_expiry(1_800_000_000), 1_800_000_000.0)
+        self.assertEqual(_parse_expiry(1_800_000_000_000), 1_800_000_000.0)
+        self.assertEqual(_parse_expiry("1800000000000"), 1_800_000_000.0)
+        self.assertEqual(_parse_expiry("2027-01-15T08:00:00Z"), 1_800_000_000.0)
+        for value in (None, True, 0, -5, "", "  ", "not-a-date"):
+            self.assertIsNone(_parse_expiry(value), value)
+        self.assertEqual(jwt_claims(_jwt({"exp": 5, "sub": "x"}))["exp"], 5)
+        for opaque in ("opaque-token", "a.!!!.c", "a." + base64.urlsafe_b64encode(b"[1]").decode() + ".c", None):
+            self.assertEqual(jwt_claims(opaque), {})
+        now = 1_000_000.0
+        with patch("muse_providers._now", return_value=now):
+            self.assertTrue(token_is_expiring("x", now + 120, skew_seconds=120))
+            self.assertFalse(token_is_expiring("x", now + 121, skew_seconds=120))
+            self.assertTrue(token_is_expiring("x", now, skew_seconds=-30))
+            self.assertFalse(token_is_expiring("opaque", None))
+            self.assertTrue(token_is_expiring(_jwt({"exp": int(now) + 60}), None))
+
+
+class NitTests(NoCredentialEnvTest):
+    """P3-01 / P3-03 / P3-04 one-line fixes."""
+
+    def test_cli_model_token_usage_ints_and_endpoint_boundary(self):
+        from muse_providers import endpoint_for
+
+        for model in ("--dangerously-skip-permissions", "claude sonnet", "x" * 129):
+            with self.subTest(model=model), patch("muse_gateway.subprocess.Popen",
+                                                  side_effect=AssertionError("child spawned")):
+                with self.assertRaises(ProviderError) as caught:
+                    run_claude_cli({"model": model, "input": "hi"}, Config(_args(provider="auto")))
+                self.assertEqual(caught.exception.code, "claude_cli_invalid_model")
+        FakeClaudePopen.spawned = []
+        FakeClaudePopen.stdout = json.dumps({
+            "is_error": False, "structured_output": {"text": "ok", "tool_calls": []},
+            "usage": {"input_tokens": "many", "output_tokens": [1]}})
+        FakeClaudePopen.stderr = ""
+        FakeClaudePopen.script_returncode = 0
+        with patch("muse_gateway.subprocess.Popen", FakeClaudePopen):
+            payload, _ = run_claude_cli({"model": "claude-test", "input": "hi"}, Config(_args(provider="auto")))
+        self.assertEqual(payload["usage"], {"input_tokens": 0, "output_tokens": 0})
+        self.assertEqual(endpoint_for("https://x/v1/responses", "responses"), "https://x/v1/responses")
+        self.assertEqual(endpoint_for("https://x/myresponses", "responses"), "https://x/myresponses/responses")
+
+    def test_capture_marks_account_id_and_auth_marks_are_bounded(self):
+        import muse_capture
+        import muse_devin
+
+        self.assertTrue(muse_capture._secret_field("ChatGPT-Account-ID"))
+        saved = dict(muse_devin._AUTH_FAILURE_MARKS)
+        self.addCleanup(lambda: (muse_devin._AUTH_FAILURE_MARKS.clear(), muse_devin._AUTH_FAILURE_MARKS.update(saved)))
+        for index in range(80):
+            muse_devin.mark_auth_failure(f"token-{index}")
+        self.assertEqual(len(muse_devin._AUTH_FAILURE_MARKS), 64)
+        self.assertIsNotNone(muse_devin.auth_failure_mark("token-79"))
+        self.assertIsNone(muse_devin.auth_failure_mark("token-0"))
+
+
+class RefreshLockingTests(NoCredentialEnvTest):
+    """P1-01: one R0 spend under concurrency; retained fileless rotation."""
+
+    def setUp(self):
+        super().setUp()
+        import muse_providers
+
+        muse_providers._RETAINED_FILELESS.clear()
+        self.addCleanup(muse_providers._RETAINED_FILELESS.clear)
+
+    def _fileless_config(self):
+        return Config(_args(provider="claude"))
+
+    def test_fileless_rotation_is_retained_and_never_respents_r0(self):
+        expired = _jwt({"exp": int(time.time()) - 10})
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": expired, "CLAUDE_CODE_REFRESH_TOKEN": "r0-refresh"}
+        calls = []
+
+        def opener(request, timeout=None):
+            calls.append(request.data.decode())
+            return FakeResponse(json.dumps({
+                "access_token": "r1-access", "refresh_token": "r1-refresh",
+                "expires_in": 3600}))
+
+        with patch.dict(os.environ, env, clear=False):
+            first = resolve_claude_credentials(self._fileless_config(), opener=opener)
+            second = resolve_claude_credentials(self._fileless_config(), opener=opener)
+        self.assertEqual(first.access_token, "r1-access")
+        self.assertEqual(second.access_token, "r1-access")
+        self.assertEqual(len(calls), 1, "second resolve must adopt retained R1, not re-spend R0")
+        self.assertIn("r0-refresh", calls[0])
+
+    def test_concurrent_fileless_refresh_spends_grant_once_without_fcntl(self):
+        import threading as threading_module
+
+        import muse_providers
+
+        expired = _jwt({"exp": int(time.time()) - 10})
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": expired, "CLAUDE_CODE_REFRESH_TOKEN": "r0-refresh"}
+        calls = []
+        active = {"now": 0, "max": 0}
+        guard = threading_module.Lock()
+
+        def opener(request, timeout=None):
+            with guard:
+                active["now"] += 1
+                active["max"] = max(active["max"], active["now"])
+                calls.append(request.data.decode())
+            time.sleep(0.25)
+            with guard:
+                active["now"] -= 1
+            return FakeResponse(json.dumps({
+                "access_token": "r1-access", "refresh_token": "r1-refresh",
+                "expires_in": 3600}))
+
+        results = []
+
+        def worker():
+            with patch.dict(os.environ, env, clear=False):
+                results.append(
+                    resolve_claude_credentials(self._fileless_config(), opener=opener).access_token)
+
+        with patch.object(muse_providers, "fcntl", None):
+            threads = [threading_module.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(sorted(results), ["r1-access", "r1-access"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(active["max"], 1)
 
 
 if __name__ == "__main__":

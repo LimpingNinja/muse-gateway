@@ -37,6 +37,51 @@ def config(**overrides):
 
 
 class TransformTests(unittest.TestCase):
+    def test_discovery_resolves_each_capacity_field_independently(self):
+        cases = (
+            ("meta", {"data": [{"id": "muse-wonder-1.0"}]},
+             "meta/muse-wonder-1.0", (1048576, 128000)),
+            ("codex", {"models": [{"slug": "gpt-6.1-sol", "max_output_tokens": 777}]},
+             "codex/gpt-6.1-sol", (1050000, 777)),
+            ("claude", {"data": [{"id": "claude-opus-5", "context_window": 999,
+                                    "max_tokens": 888}]},
+             "claude/claude-opus-5", (999, 888)),
+        )
+        login = SimpleNamespace(access_token="synthetic-token", auth_mode="api_key")
+        for provider, payload, model_id, expected in cases:
+            cfg = config(provider="auto", upstream=None, meta_api_key="synthetic-key",
+                         claude_transport="http")
+            with self.subTest(provider=provider), patch(
+                "muse_gateway.discover_codex_credentials", return_value=login,
+            ), patch("muse_gateway.discover_claude_credentials", return_value=login), patch(
+                "muse_gateway._credentialed_urlopen", return_value=_ModelsResponse(payload),
+            ):
+                (row,) = provider_model_catalog(cfg, provider)
+                self.assertEqual(row["model_id"], model_id)
+                wire = muse_catalog_response([row])["data"][0]["metadata"]["muse-code"]
+                self.assertEqual((wire["limit"]["context"], wire["limit"]["output"]), expected)
+
+    def test_menu_filter_preserves_raw_codex_capabilities_and_order(self):
+        from muse_gateway import _codex_model_efforts
+
+        payload = {"models": [
+            {"slug": "gpt-6.1-sol", "context_window": 500000,
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+            {"slug": "gpt-6-luna", "context_window": 272000},
+        ]}
+        with patch.dict(os.environ, {"MUSE_GATEWAY_MODELS": "codex/gpt-6-luna"}), patch(
+            "muse_gateway.discover_codex_credentials",
+            return_value=SimpleNamespace(access_token="fixture-token"),
+        ), patch("muse_gateway._credentialed_urlopen", return_value=_ModelsResponse(payload)):
+            cfg = config(provider="auto", upstream=None)
+            rows = provider_model_catalog(cfg, "codex")
+            self.assertEqual([row["model_id"] for row in rows], ["codex/gpt-6-luna"])
+            self.assertEqual(_codex_model_efforts(cfg, "gpt-6.1-sol"), ["low", "high"])
+            self.assertEqual(cfg.resolve_model("codex/gpt-6.1-sol"), ("codex", "gpt-6.1-sol"))
+            cfg.menu_models = ["codex/gpt-6-luna", "codex/gpt-6.1-sol"]
+            self.assertEqual([row["model_id"] for row in provider_model_catalog(cfg, "codex")],
+                             ["codex/gpt-6.1-sol", "codex/gpt-6-luna"])
+
     def test_mocked_codex_discovery_replaces_bundled_fallbacks(self):
         class Response:
             def __enter__(self):
@@ -64,11 +109,83 @@ class TransformTests(unittest.TestCase):
                 "muse_gateway.discover_codex_credentials",
                 return_value=SimpleNamespace(access_token="test-token"),
             ),
-            patch("muse_gateway.urllib.request.urlopen", return_value=Response()),
+            patch("muse_gateway._credentialed_urlopen", return_value=Response()),
         ):
             catalog = provider_model_catalog(auto, "codex")
         self.assertEqual([item["model_id"] for item in catalog], ["codex/gpt-account-model"])
         self.assertEqual(catalog[0]["context_limit"], 123456)
+
+    def test_codex_discovery_keeps_backend_context_and_fills_approved_output(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-6.1-sol",
+                                "context_window": 500000,
+                                "supported_reasoning_levels": [
+                                    {"effort": "low"}, {"effort": "medium"},
+                                ],
+                                "default_reasoning_level": "low",
+                            }
+                        ]
+                    }
+                ).encode()
+
+        auto = config(provider="auto", upstream=None)
+        with (
+            patch(
+                "muse_gateway.discover_codex_credentials",
+                return_value=SimpleNamespace(access_token="test-token"),
+            ),
+            patch("muse_gateway._credentialed_urlopen", return_value=Response()),
+        ):
+            catalog = provider_model_catalog(auto, "codex")
+        (row,) = catalog
+        self.assertEqual(row["model_id"], "codex/gpt-6.1-sol")
+        self.assertEqual(row["context_limit"], 500000)
+        self.assertEqual(row["output_limit"], 128000)
+        self.assertFalse(row["limits_verified"])
+        self.assertEqual((row["context_source"], row["output_source"]), ("live", "documented"))
+
+    def test_codex_menu_hides_reserve_and_auto_review_slugs(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "models": [
+                            {"slug": "gpt-6.1-sol", "context_window": 500000},
+                            {"slug": "gpt-reserve", "context_window": 272000},
+                            {"slug": "codex-auto-review", "context_window": 272000},
+                        ]
+                    }
+                ).encode()
+
+        auto = config(provider="auto", upstream=None)
+        with (
+            patch(
+                "muse_gateway.discover_codex_credentials",
+                return_value=SimpleNamespace(access_token="test-token"),
+            ),
+            patch("muse_gateway._credentialed_urlopen", return_value=Response()),
+        ):
+            catalog = provider_model_catalog(auto, "codex")
+        self.assertEqual(
+            [item["model_id"] for item in catalog], ["codex/gpt-6.1-sol"]
+        )
 
     def test_current_claude_oauth_fallback_catalog_and_limits(self):
         auto = config(provider="auto", upstream=None, model_discovery=True)
@@ -92,6 +209,11 @@ class TransformTests(unittest.TestCase):
         for item in catalog[:3]:
             self.assertEqual(item["context_limit"], 1_000_000)
             self.assertEqual(item["output_limit"], 128_000)
+        self.assertEqual(
+            (catalog[3]["context_limit"], catalog[3]["output_limit"]),
+            (1_000_000, 128_000),
+        )
+        self.assertEqual(catalog[3]["limit_source"], "documented")
         self.assertEqual(catalog[-1]["output_limit"], 64_000)
 
     def test_unusable_credentials_hide_codex_and_claude_models(self):
@@ -158,7 +280,7 @@ class ProxyTests(unittest.TestCase):
                     cfg = config(provider=route, upstream=endpoint, meta_upstream=endpoint, local_upstream=endpoint,
                                  model_discovery=False, meta_api_key="meta-key", local_api_key="local-key",
                                  model="pinned-model" if route == "generic" else None,
-                                 portable=True, max_output_tokens=16000)
+                                 portable=True)
                     body = {"model": "requested-model", "stream": True, "max_output_tokens": 128000,
                             "reasoning": {"effort": "high"}, "include": ["reasoning.encrypted_content"],
                             "prompt_cache_key": "cache-sentinel",
@@ -173,7 +295,7 @@ class ProxyTests(unittest.TestCase):
                     thread.start()
                     try:
                         keys = {"generic": ["test-key"], "meta": ["meta-key", "incoming-key"],
-                                "local": ["local-key", "test-key"]}[route]
+                                "local": ["local-key", None]}[route]
                         for index, expected_key in enumerate(keys):
                             if index:
                                 setattr(cfg, route + "_api_key", None)
@@ -184,10 +306,10 @@ class ProxyTests(unittest.TestCase):
                             self.assertEqual(wire, FakeUpstreamHandler.wire)
                             self.assertEqual(consume(wire)["output"][0]["content"][0]["text"], "FORWARDED")
                             self.assertEqual(FakeUpstreamHandler.path_seen, "/v1/responses")
-                            self.assertEqual(FakeUpstreamHandler.authorization, "Bearer " + expected_key)
+                            self.assertEqual(FakeUpstreamHandler.authorization, "Bearer " + expected_key if expected_key else None)
                             sent = FakeUpstreamHandler.request_body
                             self.assertEqual(sent["model"], "pinned-model" if route == "generic" else "requested-model")
-                            self.assertEqual(sent["max_output_tokens"], 16000)
+                            self.assertEqual(sent["max_output_tokens"], 128000)
                             if route == "meta":
                                 self.assertEqual(sent["tools"], original["tools"])
                                 self.assertEqual(sent["input"], original["input"])
@@ -283,7 +405,7 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
             raise AssertionError("subscription setups must not probe Meta")
 
         cfg = config(provider="auto", upstream=None)
-        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway._credentialed_urlopen", new=fail_urlopen):
             catalog = provider_model_catalog(cfg, "meta")
         self.assertEqual(
             [entry["model_id"] for entry in catalog],
@@ -301,13 +423,60 @@ class GatewayMetaDiscoveryTests(unittest.TestCase):
                 ]}
             )
 
-        cfg = self._meta_config(meta_models="muse-spark-1.3")
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
+        with patch.dict(os.environ, {"MUSE_GATEWAY_MODELS": "meta/muse-spark-1.3"}):
+            cfg = self._meta_config()
+        with patch("muse_gateway._credentialed_urlopen", new=fake_urlopen):
             catalog = provider_model_catalog(cfg, "meta")
         self.assertEqual(
             [(entry["model_id"], entry["context_limit"]) for entry in catalog],
             [("meta/muse-spark-1.3", 2000000)],
         )
+
+    def test_wonder_output_is_user_approved_not_documented(self):
+        cfg = self._meta_config()
+        with patch("muse_gateway._credentialed_urlopen", return_value=_ModelsResponse(
+            {"data": [{"id": "muse-wonder-1.0"}, {"id": "muse-spark-1.3"}]},
+        )):
+            catalog = provider_model_catalog(cfg, "meta")
+        rows = {entry["model_id"]: entry for entry in catalog}
+        self.assertEqual(
+            (rows["meta/muse-wonder-1.0"]["context_limit"],
+             rows["meta/muse-wonder-1.0"]["output_limit"]),
+            (1048576, 128000),
+        )
+        self.assertEqual(rows["meta/muse-wonder-1.0"]["output_source"], "user-approved")
+        self.assertNotIn("approved docs", rows["meta/muse-wonder-1.0"]["description"])
+        self.assertEqual(rows["meta/muse-spark-1.3"]["output_source"], "unverified-fallback")
+
+
+class KiroMetadataTests(unittest.TestCase):
+    """Kiro discovery names use only exact registry metadata."""
+
+    def _catalog(self, models):
+        cfg = config(provider="auto", upstream=None, kiro_api_key="test-proxy-key")
+        with patch("muse_gateway.muse_kiro.discover_models", return_value=models.split(",")):
+            return provider_model_catalog(cfg, "kiro")
+
+    def test_approved_map_budgets_and_sources(self):
+        catalog = self._catalog("gpt-5.6-luna,deepseek-3.2,auto-kiro")
+        self.assertEqual(
+            {row["model_id"]: (row["context_limit"], row["output_limit"]) for row in catalog},
+            {
+                "kiro/gpt-5.6-luna": (1000000, 128000),
+                "kiro/deepseek-3.2": (128000, 4000),
+                "kiro/auto-kiro": (200000, 64000),
+            },
+        )
+        self.assertEqual([row["output_source"] for row in catalog], ["documented", "user-approved", "documented"])
+        self.assertTrue(all(not row["limits_verified"] for row in catalog))
+
+    def test_unmapped_and_similar_ids_are_omitted_not_inherited(self):
+        with redirect_stderr(io.StringIO()) as output:
+            rows = self._catalog("future-model,gpt-5.6-luna-custom,glm-5")
+        self.assertEqual([row["model_id"] for row in rows], ["kiro/glm-5"])
+        self.assertEqual((rows[0]["context_limit"], rows[0]["output_limit"]), (204800, 131072))
+        self.assertIn("missing capacity metadata", output.getvalue())
+        self.assertIn("kiro/gpt-5.6-luna-custom", output.getvalue())
 
 
 class _ModelsResponse:
@@ -342,35 +511,44 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
         payload = {"data": [{"id": "x", "max_input_tokens": 999, "max_output_tokens": 111, "supports_vision": True},
                              {"id": "bad", "max_input_tokens": "nope", "max_output_tokens": -5},
                              {"id": "unlisted", "max_input_tokens": 1, "max_output_tokens": 1}]}
-        with patch("muse_gateway.urllib.request.urlopen", return_value=_ModelsResponse(payload)):
-            catalog = provider_model_catalog(self._local_config(local_models="x,bad,missing"), "local")
+        with patch.dict(os.environ, {"MUSE_GATEWAY_MODELS": "local/missing,local/bad,local/x"}), patch(
+            "muse_gateway._credentialed_urlopen", return_value=_ModelsResponse(payload),
+        ), redirect_stderr(io.StringIO()) as diagnostics:
+            cfg = self._local_config()
+            catalog = provider_model_catalog(cfg, "local")
         self.assertEqual({entry["model_id"]: (entry["context_limit"], entry["output_limit"]) for entry in catalog},
-                         {"local/x": (999, 111), "local/bad": (128000, 32768), "local/missing": (128000, 32768)})
+                         {"local/x": (999, 111)})
+        self.assertEqual(set(cfg._raw_model_rosters["local"]), {"x", "bad", "unlisted"})
+        self.assertIn("local/missing", diagnostics.getvalue())
+        self.assertIn("missing capacity metadata", diagnostics.getvalue())
         wire = muse_catalog_response(catalog)["data"]
         self.assertEqual({entry["id"]: entry["metadata"]["muse-code"]["modalities"]["input"] for entry in wire},
-                         {"local/x": ["text", "image"], "local/bad": ["text"], "local/missing": ["text"]})
+                         {"local/x": ["text", "image"]})
         self.assertTrue(catalog[0]["limits_verified"])
         self.assertTrue(all(not entry["limits_verified"] for entry in catalog[1:]))
+        from muse_gateway import _credential_status
+        cfg.menu_models = ["meta/muse-spark-1.3"]
+        self.assertEqual(provider_model_catalog(cfg, "local"), [])
+        ready, detail = _credential_status(cfg, "local")
+        self.assertTrue(ready, detail)
+        self.assertEqual(cfg.resolve_model("x"), ("local", "x"))
 
-    def test_explicit_list_keeps_defaults_when_discovery_down(self):
+    def test_allowlist_never_fabricates_rows_when_discovery_down(self):
         def fail_urlopen(request, timeout=None):
             raise urllib.error.URLError("down")
 
-        cfg = self._local_config(local_models="x")
-        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
-            catalog = provider_model_catalog(cfg, "local")
-        self.assertEqual(
-            [(entry["model_id"], entry["context_limit"])
-             for entry in catalog],
-            [("local/x", 128000)],
-        )
+        with patch.dict(os.environ, {"MUSE_GATEWAY_MODELS": "local/x"}):
+            cfg = self._local_config()
+        with patch("muse_gateway._credentialed_urlopen", new=fail_urlopen), redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(provider_model_catalog(cfg, "local"), [])
+        self.assertIn("unresolved MUSE_GATEWAY_MODELS", output.getvalue())
 
     def test_no_model_discovery_flag_disables(self):
         def fail_urlopen(request, timeout=None):
             raise AssertionError("discovery must honor the flag")
 
         cfg = self._local_config(model_discovery=False)
-        with patch("muse_gateway.urllib.request.urlopen", new=fail_urlopen):
+        with patch("muse_gateway._credentialed_urlopen", new=fail_urlopen):
             self.assertEqual(provider_model_catalog(cfg, "local"), [])
 
     def test_ollama_tags_answer_when_models_is_empty(self):
@@ -382,40 +560,34 @@ class GatewayLocalDiscoveryTests(unittest.TestCase):
                 return _ModelsResponse({"models": [{"name": "qwen:32b"}]})
             return _ModelsResponse({"data": []})
 
-        with patch("muse_gateway.urllib.request.urlopen", new=fake_urlopen):
-            catalog = provider_model_catalog(self._local_config(), "local")
+        cfg = self._local_config()
+        with patch("muse_gateway._credentialed_urlopen", new=fake_urlopen):
+            catalog = provider_model_catalog(cfg, "local")
         self.assertEqual(
             seen,
             ["http://127.0.0.1:9/v1/models", "http://127.0.0.1:9/api/tags"],
         )
-        self.assertEqual(
-            [entry["model_id"] for entry in catalog], ["local/qwen:32b"]
-        )
-        self.assertFalse(catalog[0]["limits_verified"])
+        self.assertEqual(catalog, [])
+        self.assertIn("qwen:32b", cfg._raw_model_rosters["local"])
+        self.assertEqual(cfg.resolve_model("qwen:32b"), ("local", "qwen:32b"))
 
 
 class KiroConfigurationTests(unittest.TestCase):
-    def test_env_legacy_and_cli_precedence_and_single_provider_upstream(self):
+    def test_current_env_and_cli_precedence_and_single_provider_upstream(self):
         with patch.dict(os.environ, {
-            "MUSE_SHIM_KIRO_API_KEY": "legacy-proxy-key",
-            "MUSE_SHIM_KIRO_MODELS": "legacy-model",
             "MUSE_GATEWAY_KIRO_UPSTREAM": "http://127.0.0.1:1/v1/messages",
             "MUSE_GATEWAY_KIRO_API_KEY": "current-proxy-key",
-            "MUSE_GATEWAY_KIRO_CONTEXT_LIMIT": "32768",
-            "MUSE_GATEWAY_KIRO_OUTPUT_LIMIT": "4096",
         }, clear=True):
-            cfg = Config(parse_args(["kiro", "--kiro-models", "cli-model", "--no-model-discovery"]))
+            cfg = Config(parse_args(["kiro", "--no-model-discovery"]))
             self.assertEqual(cfg.kiro_api_key, "current-proxy-key")
-            self.assertEqual(cfg.kiro_models, ["cli-model"])
-            self.assertEqual((cfg.kiro_context_limit, cfg.kiro_output_limit), (32768, 4096))
             self.assertEqual(cfg.provider_url("kiro"), "http://127.0.0.1:1/v1/messages")
             self.assertIn("current-proxy-key", cfg.secret_values())
             override = Config(parse_args([
                 "kiro", "--upstream", "http://127.0.0.1:2", "--no-model-discovery",
             ]))
             self.assertEqual(override.provider_url(), "http://127.0.0.1:2/v1/messages")
-            del os.environ["MUSE_GATEWAY_KIRO_API_KEY"]
-            self.assertEqual(Config(parse_args(["auto"])).kiro_api_key, "legacy-proxy-key")
+            override = Config(parse_args(["auto", "--kiro-api-key", "flag-proxy-key"]))
+            self.assertEqual(override.kiro_api_key, "flag-proxy-key")
 
     def test_invalid_kiro_settings_fail_before_serving(self):
         for flags in (
@@ -593,7 +765,8 @@ class KiroPublicRoutingTests(unittest.TestCase):
                 with patch("muse_gateway.time.time", return_value=time.time() + MODEL_CATALOG_RETRY_SECONDS + 1):
                     with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as response:
                         ids = [row["id"] for row in json.load(response)["data"]]
-                self.assertIn("kiro/auto", ids)
+                self.assertIn("kiro/claude-haiku-4.5", ids)
+                self.assertNotIn("kiro/auto", ids, "Unknown capacity must not become a guessed menu entry")
                 self.assertEqual(len(peer.observed), 2)
 
     def test_pre_forward_rejection_marks_capture_failed(self):
@@ -834,20 +1007,22 @@ class KiroPublicRoutingTests(unittest.TestCase):
                     self.assertIn("kiro_response_body_incomplete", manifest["capture_errors"])
 
     def test_authenticated_catalog_curates_names_and_never_invents_verified_capabilities(self):
-        with self._servers(provider="kiro", kiro_api_key="synthetic-proxy-key", kiro_models="auto",
-                           model="kiro/auto", max_output_tokens=123) as (cfg, base, peer):
+        with self._servers(provider="kiro", kiro_api_key="synthetic-proxy-key",
+                           model="kiro/claude-haiku-4.5") as (cfg, base, peer):
             cfg.model_discovery = True
             rows = provider_model_catalog(cfg, "kiro")
-            self.assertEqual([row["model_id"] for row in rows], ["kiro/auto"])
+            self.assertEqual([row["model_id"] for row in rows], ["kiro/claude-haiku-4.5"])
+            self.assertIn("auto", cfg._raw_model_rosters["kiro"])
             self.assertEqual([(path, auth) for path, auth, _ in peer.observed], [
                 ("/v1/models", "Bearer synthetic-proxy-key"),
             ])
-            self.assertEqual((rows[0]["context_limit"], rows[0]["output_limit"]), (65536, 123))
+            self.assertEqual((rows[0]["context_limit"], rows[0]["output_limit"]), (200000, 64000))
             with urllib.request.urlopen(base + "/muse-code/models", timeout=5) as response:
                 row = json.load(response)["data"][0]
-            self.assertEqual(row["metadata"]["muse-code"]["limit"], {"context": 65536, "output": 123})
-            self.assertIn("unverified", row["metadata"]["muse-code"]["description"])
+            self.assertEqual(row["metadata"]["muse-code"]["limit"], {"context": 200000, "output": 64000})
+            self.assertIn("not live-verified", row["metadata"]["muse-code"]["description"])
             self.assertFalse(rows[0]["limits_verified"])
+            self.assertEqual(rows[0]["limit_source"], "documented")
             self.assertFalse(rows[0]["supports_images"])
             self.assertFalse(rows[0].get("reasoning_efforts"))
             out = io.StringIO()
@@ -857,6 +1032,28 @@ class KiroPublicRoutingTests(unittest.TestCase):
             self.assertIn("inference not validated", out.getvalue())
             self.assertNotIn("synthetic-proxy-key", out.getvalue())
             self.assertEqual(len(peer.observed), 1, "doctor must use cached catalog, not inference")
+
+
+class ModuleAliasTests(unittest.TestCase):
+    """P2-05 (inverts R18's second half): muse_shim is muse_gateway."""
+
+    def test_alias_level_patch_reaches_the_live_implementation(self):
+        import subprocess
+        import sys
+
+        import muse_gateway
+        import muse_shim
+
+        self.assertIs(muse_shim, muse_gateway)
+        sentinel = object()
+        with patch("muse_shim.resolve_codex_credentials", return_value=sentinel):
+            self.assertIs(muse_gateway.resolve_codex_credentials(None), sentinel)
+        root = Path(__file__).resolve().parent
+        result = subprocess.run([sys.executable, "-m", "muse_shim", "--help"], cwd=root,
+                                capture_output=True, text=True, timeout=60,
+                                env={**os.environ, "HOME": tempfile.gettempdir()})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("muse-gateway", result.stdout)
 
 
 if __name__ == "__main__":

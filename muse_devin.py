@@ -1,28 +1,27 @@
 """Devin (Codeium Cascade) provider for muse-gateway.
 
 Native provider speaking the Connect/protobuf wire protocol directly
-(``muse_devin_wire``), following OMP at pinned rev 818dd42 action by action.
-Rule 2 applies throughout: match OMP where mechanically sound; our own
-mechanisms are additive only. Deviations and junie-audit adoptions are
-marked inline. Native signed-reasoning replay is not implemented: no
+(``muse_devin_wire``). Protocol adaptations from oh-my-pi at pinned rev
+818dd42 are attributed in THIRD_PARTY_NOTICES; no upstream auth integration
+is used. Native signed-reasoning replay is not implemented: no
 caller-supplied signature is treated as trusted provider state.
 
 Layout:
-  credentials ......... OMP SQLite store (read-only) + env token + selection
+  credentials ......... explicit token or ordinary Devin CLI login
   discovery ........... GetCliModelConfigs normalization, lanes, fusion filter
   chat ................ history/tools translation, assign-before-chat, stream
 """
 
-import base64
 import copy
 import hashlib
 from http.client import HTTPException
 import json
 import os
 import re
-import sqlite3
 import struct
+import sys
 import time
+import urllib.parse
 import uuid
 
 from muse_devin_wire import (
@@ -36,6 +35,8 @@ from muse_devin_wire import (
     DevinHttpError,
     DevinTrailerError,
     DevinWireError,
+    INTERNAL_MODEL_DISPLAYS,
+    LARGE_HISTORY_RECOVERY_BYTES,
     decode_unary,
     discovery_metadata,
     iter_chat_frames,
@@ -51,10 +52,12 @@ from muse_devin_wire import (
 
 import devin_pb2
 from muse_capture import current_capture
+from muse_models import provider_catalog, resolve_limits
+from muse_providers import ProviderError, _allocate_item_id, _input_items, _responses_function_id, request_tool_policy, set_response_idle_timeout
 
 
 class DevinCredentialError(DevinWireError):
-    """No usable Devin credential (unconfigured/expired/not-found)."""
+    """No usable Devin credential (unconfigured or quarantined)."""
 
 
 class DevinDiscoveryError(DevinWireError):
@@ -70,51 +73,24 @@ class DevinChatError(DevinWireError):
 
 
 # ---------------------------------------------------------------------------
-# Credentials (OMP auth/sqlite-credential-store.ts, registry/engine/common.ts)
+# Credentials (read-only Devin CLI login or explicit session token)
 # ---------------------------------------------------------------------------
 
-OMP_PROVIDER_KEY = "devin"
-OAUTH_CREDENTIAL_TYPE = "oauth"
-# KDL fallback when the token carries no usable exp claim.
-OAUTH_EXPIRY_FALLBACK_MS = 365 * 24 * 60 * 60 * 1000
-# B1: clamp absurd exp claims (float overflow would never expire).
-MAX_SANE_EXP_S = 4102444800  # 2100-01-01
-
-
-def _default_auth_db_candidates():
-    """Candidate agent.db paths, best-effort mirror of OMP dirs.ts.
-
-    ``~/.omp/agent/agent.db`` by default, honoring PI_CONFIG_DIR for the
-    config root name plus the XDG data-home flattening on non-Windows.
-    """
-    home = os.path.expanduser("~")
-    root_name = os.environ.get("PI_CONFIG_DIR", ".omp") or ".omp"
-    candidates = [os.path.join(home, root_name, "agent", "agent.db")]
-    xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg and os.name != "nt":
-        candidates.append(os.path.join(xdg, "omp", "agent.db"))
-    return candidates
-
-
-def resolve_auth_db(explicit_path=None):
-    """Resolve the credential database: explicit path or first candidate."""
-    if explicit_path:
-        return explicit_path
-    for candidate in _default_auth_db_candidates():
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
 def _cli_credentials_candidates():
-    """Default Devin CLI credentials.toml locations (keys only, never logged)."""
+    """Default Devin CLI credentials.toml locations (keys only, never logged).
+
+    The CLI's canonical home is the XDG data directory (``devin auth
+    status`` reports ``~/.local/share/devin/credentials.toml`` when
+    XDG_DATA_HOME is unset); config-home locations stay as fallbacks.
+    """
     if os.name == "nt":
         appdata = os.environ.get("APPDATA") or os.path.join(
             os.path.expanduser("~"), "AppData", "Roaming"
         )
         return [os.path.join(appdata, "devin", "credentials.toml")]
     home = os.path.expanduser("~")
-    candidates = []
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+    candidates = [os.path.join(data_home, "devin", "credentials.toml")]
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg:
         candidates.append(os.path.join(xdg, "devin", "credentials.toml"))
@@ -176,134 +152,8 @@ def read_cli_token(explicit_path=None):
     return None, None
 
 
-def _jwt_expiry_ms(token):
-    """Decode a JWT exp claim without verifying (OMP decodeJwtPayload).
-
-    Returns None when the token is not a JWT or carries no numeric exp.
-    """
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
-        payload = parts[1]
-        payload += "=" * (-len(payload) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-    except (ValueError, TypeError, UnicodeDecodeError):
-        return None
-    if not isinstance(claims, dict):
-        return None
-    exp = claims.get("exp")
-    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
-        return None
-    if exp > MAX_SANE_EXP_S:  # B1: overflow guard, fall through to fallback
-        return None
-    return int(exp * 1000)
-
-
-def _credential_expiry_ms(access_token):
-    expiry = _jwt_expiry_ms(access_token or "")
-    if expiry is None:
-        return int(time.time() * 1000) + OAUTH_EXPIRY_FALLBACK_MS
-    return expiry
-
-
-def read_store_credentials(auth_db_path):
-    """Read active devin rows from OMP's store. Read-only; never migrates.
-
-    Returns ``(active, disabled)`` row dicts: id/identity_key/access/refresh/
-    expires_at/email/disabled_cause. Malformed rows are silently skipped,
-    matching OMP. Missing file/table means no credentials, not an error.
-    """
-    active, disabled = [], []
-    if not auth_db_path or not os.path.isfile(auth_db_path):
-        return active, disabled
-    try:
-        connection = sqlite3.connect(
-            f"file:{auth_db_path}?mode=ro", uri=True, timeout=2.0
-        )
-    except sqlite3.Error:
-        return active, disabled
-    try:
-        try:
-            rows = connection.execute(
-                "SELECT id, credential_type, data, disabled_cause,"
-                " identity_key FROM auth_credentials"
-                " WHERE provider = ? ORDER BY id ASC",
-                (OMP_PROVIDER_KEY,),
-            ).fetchall()
-        except sqlite3.Error:
-            return active, disabled
-        for row_id, cred_type, data, cause, identity in rows:
-            try:
-                payload = json.loads(data)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            record = {
-                "id": row_id,
-                "credential_type": cred_type,
-                "identity_key": identity,
-                "access": payload.get("access") or "",
-                "refresh": payload.get("refresh") or "",
-                "email": payload.get("email"),
-                "disabled_cause": cause,
-            }
-            if cause is not None:
-                disabled.append(record)
-                continue
-            if cred_type != OAUTH_CREDENTIAL_TYPE or not record["access"]:
-                continue
-            record["expires_at"] = payload.get("expires")
-            if not isinstance(record["expires_at"], (int, float)):
-                record["expires_at"] = _credential_expiry_ms(record["access"])
-            else:
-                record["expires_at"] = int(record["expires_at"])
-            active.append(record)
-    finally:
-        connection.close()
-    return active, disabled
-
-
-def select_credential(active_rows, credential_id=None):
-    """Pick one credential row.
-
-    An explicit id (row id or identity key) wins exactly. Without one, the
-    first usable row in store order is selected (not expired, not
-    401-quarantined); ``--devin-credential-id`` overrides the pick. When no
-    row is usable the first row is returned so diagnostics report the real
-    state (expired/auth-failed) instead of ambiguity.
-    """
-    if not active_rows:
-        raise DevinCredentialError(
-            "no active Devin credential: log in via the Devin CLI or set a token"
-        )
-    if credential_id is not None:
-        wanted = str(credential_id)
-        for row in active_rows:
-            if str(row["id"]) == wanted or (row["identity_key"] or "") == wanted:
-                return row
-        raise DevinCredentialError(
-            f"Devin credential {credential_id!r} not found among"
-            f" {len(active_rows)} active row(s)"
-        )
-    if len(active_rows) == 1:
-        return active_rows[0]
-    now_ms = int(time.time() * 1000)
-    for row in active_rows:
-        if _row_usable(row, now_ms):
-            return row
-    return active_rows[0]
-
-
-# Both reference clients refuse to *use* a token within its last 60 s
-# (OMP OAUTH_REFRESH_SKEW_MS; junie lease_expiry_is_usable). Do not invent a
-# larger cushion: 60 s is the ratified cross-client bound.
-EXPIRY_USE_SKEW_MS = 60_000
-
-# In-memory auth-failure marks, keyed by token fingerprint: junie's
-# ReauthRequired quarantine without touching OMP's store (read-only by
-# design). A re-login mints new token bytes, which unmarks naturally.
+# In-memory quarantine only. A re-login mints new token bytes, which unmarks
+# naturally; neither explicit tokens nor CLI login files are ever written.
 _AUTH_FAILURE_MARKS = {}
 
 
@@ -317,6 +167,8 @@ def mark_auth_failure(access_token, detail=""):
         "at": int(time.time() * 1000),
         "detail": detail,
     }
+    while len(_AUTH_FAILURE_MARKS) > 64:  # P3-04: bounded; evict the oldest
+        _AUTH_FAILURE_MARKS.pop(next(iter(_AUTH_FAILURE_MARKS)))
 
 
 def auth_failure_mark(access_token):
@@ -324,179 +176,42 @@ def auth_failure_mark(access_token):
     return _AUTH_FAILURE_MARKS.get(_token_fingerprint(access_token))
 
 
-def _row_usable(row, now_ms):
-    """A stored row is usable when not expired and not 401-quarantined.
+def credential_state(api_key=None):
+    """Resolve an explicit token, else the ordinary Devin CLI login.
 
-    Rows without a numeric expiry (hand-built or legacy) count as usable:
-    absence of evidence is not evidence of expiry.
-    """
-    expires_at = row.get("expires_at")
-    if (
-        isinstance(expires_at, (int, float))
-        and not isinstance(expires_at, bool)
-        and int(expires_at) <= now_ms + EXPIRY_USE_SKEW_MS
-    ):
-        return False
-    return auth_failure_mark(row.get("access") or "") is None
-
-
-def credential_state(auth_db_path=None, credential_id=None, api_key=None):
-    """Resolve credentials into a status dict for diagnostics.
-
-    States: ``ready`` | ``unconfigured`` | ``expired`` | ``not-found`` |
-    ``auth-failed``. Never raises for credential problems. Multiple active
-    rows auto-select the first usable one (see ``select_credential``).
+    States are ``ready``, ``unconfigured`` or ``auth-failed``. Expiry remains
+    unchecked for both sources; a rejected token requires signing in again.
+    No credential or preference is written.
     """
     if api_key:
-        mark = auth_failure_mark(api_key)
-        if mark is not None:
-            return {
-                "state": "auth-failed",
-                "source": "explicit",
-                "credential_id": None,
-                "identity": None,
-                "note": (
-                    "Devin account requires sign-in again (auth failed;"
-                    " explicit token quarantined)"
-                ),
-            }
+        token, source, path = api_key, "explicit", None
+    else:
+        token, path = read_cli_token()
+        source = "devin-cli"
+    if not token:
         return {
-            "state": "ready",
-            "source": "explicit",
-            "credential_id": None,
-            "identity": None,
-            "expires_at": None,
-            "note": "explicit token; expiry unchecked",
+            "state": "unconfigured", "source": None,
+            "note": "no Devin token; run `devin auth login` or set an explicit token",
         }
-    if credential_id is None:
-        # The Devin CLI's own login wins over the OMP-compatible store: it is
-        # the user's primary login. An explicit credential id skips it and
-        # targets store rows below.
-        cli_token, cli_path = read_cli_token()
-        if cli_token is not None:
-            if auth_failure_mark(cli_token) is not None:
-                return {
-                    "state": "auth-failed",
-                    "source": "devin-cli",
-                    "path": cli_path,
-                    "note": (
-                        "Devin account requires sign-in again (run"
-                        " `devin auth login`)"
-                    ),
-                }
-            return {
-                "state": "ready",
-                "source": "devin-cli",
-                "path": cli_path,
-                "access_token": cli_token,
-                "expires_at": None,
-                "note": "Devin CLI login; expiry unchecked",
-            }
-    resolved = resolve_auth_db(auth_db_path)
-    if resolved is None:
-        return {"state": "unconfigured", "source": None}
-    active, disabled = read_store_credentials(resolved)
-    try:
-        row = select_credential(active, credential_id)
-    except DevinCredentialError as error:
-        text = str(error)
-        if "not found" in text:
-            return {
-                "state": "not-found",
-                "source": "store",
-                "path": resolved,
-                "note": text,
-            }
+    if auth_failure_mark(token) is not None:
         return {
-            "state": "unconfigured",
-            "source": "store",
-            "path": resolved,
-            "disabled": len(disabled),
-        }
-    now_ms = int(time.time() * 1000)
-    if row["expires_at"] <= now_ms + EXPIRY_USE_SKEW_MS:
-        return {
-            "state": "expired",
-            "source": "store",
-            "path": resolved,
-            "credential_id": row["id"],
-            "identity": row["identity_key"] or row["email"],
-            "note": "log in again via the Devin CLI (no refresh grant exists)",
-        }
-    mark = auth_failure_mark(row["access"])
-    if mark is not None:
-        return {
-            "state": "auth-failed",
-            "source": "store",
-            "path": resolved,
-            "credential_id": row["id"],
-            "identity": row["identity_key"] or row["email"],
-            "note": (
-                "Devin account requires sign-in again (GetUserJwt keeps"
-                " returning 401 for this token)"
-            ),
+            "state": "auth-failed", "source": source, "path": path,
+            "note": "Devin account requires sign-in again (token quarantined; run `devin auth login`)",
         }
     return {
-        "state": "ready",
-        "source": "store",
-        "path": resolved,
-        "credential_id": row["id"],
-        "identity": row["identity_key"] or row["email"],
-        "access_token": row["access"],
-        "expires_at": row["expires_at"],
+        "state": "ready", "source": source, "path": path,
+        "access_token": token, "expires_at": None,
+        "note": "Devin CLI login; expiry unchecked" if path else "explicit token; expiry unchecked",
     }
 
 
-def resolve_access_token(auth_db_path=None, credential_id=None, api_key=None):
+def resolve_access_token(api_key=None):
     """Return ``(access_token, credential_identity)`` or raise."""
-    if api_key:
-        state = credential_state(api_key=api_key)
-        if state["state"] != "ready":
-            raise DevinCredentialError(state["note"])
-        return api_key, "explicit"
-    state = credential_state(auth_db_path, credential_id)
-    if state["state"] != "ready" or not state.get("access_token"):
-        raise DevinCredentialError(
-            state.get("note") or f"Devin credential {state['state']}"
-        )
-    # B15: bind downstream work (discovery cache, diagnostics) to the account.
-    identity = (
-        state.get("identity")
-        or (f"devin-cli:{state['path']}" if state.get("source") == "devin-cli" else None)
-        or f"id:{state.get('credential_id')}"
-    )
+    state = credential_state(api_key=api_key)
+    if state["state"] != "ready":
+        raise DevinCredentialError(state["note"])
+    identity = "explicit" if state["source"] == "explicit" else f"devin-cli:{state['path']}"
     return state["access_token"], identity
-
-
-def list_store_credentials(auth_db_path=None):
-    """Token-free summary of active stored rows for diagnostics.
-
-    Returns ``(path, rows)`` where ``path`` is the resolved database (None
-    when none resolves) and each row carries id/identity_key/email/
-    expires_at/expired/auth_failed. Never includes token bytes.
-    """
-    resolved = resolve_auth_db(auth_db_path)
-    if resolved is None:
-        return None, []
-    active, _disabled = read_store_credentials(resolved)
-    now_ms = int(time.time() * 1000)
-    summaries = []
-    for row in active:
-        expires_at = row.get("expires_at")
-        expired = (
-            isinstance(expires_at, (int, float))
-            and not isinstance(expires_at, bool)
-            and int(expires_at) <= now_ms + EXPIRY_USE_SKEW_MS
-        )
-        summaries.append({
-            "id": row.get("id"),
-            "identity_key": row.get("identity_key"),
-            "email": row.get("email"),
-            "expires_at": expires_at,
-            "expired": expired,
-            "auth_failed": auth_failure_mark(row.get("access") or "") is not None,
-        })
-    return resolved, summaries
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +219,11 @@ def list_store_credentials(auth_db_path=None):
 # ---------------------------------------------------------------------------
 
 THINKING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
-IMAGE_BLIND_UIDS = frozenset({"swe-1-6", "swe-1-6-fast"})
+IMAGE_BLIND_UIDS = frozenset(
+    uid for uid, record in provider_catalog("devin")["models"].items()
+    if record.get("supports_images") is False
+)
+# Native/legacy discovery selection policy, not the configurable fallback roster.
 SEED_IDS = frozenset({"swe-1-6", "swe-1-6-fast"})
 
 # Family-lane axes (devin.ts:150-168).
@@ -526,31 +245,14 @@ _FAMILY_EFFORT_BY_NAME = {
     "nothinking": "off",
 }
 
-# Curated seeds, the entire bundled surface (providers/devin.kdl). Discovery
-# replaces them; the account default wins over the seed default.
-SEEDS = (
-    {
-        "uid": "swe-1-6-fast",
-        "label": "SWE-1.6 Fast",
-        "reasoning": True,
-        "supports_tools": True,
-        "supports_images": False,
-        "supports_parallel": True,
-        "context_limit": 200000,
-        "output_limit": 128000,
-        "is_default": False,
-    },
-    {
-        "uid": "swe-1-6",
-        "label": "SWE-1.6",
-        "reasoning": True,
-        "supports_tools": True,
-        "supports_images": False,
-        "supports_parallel": True,
-        "context_limit": 200000,
-        "output_limit": 128000,
-        "is_default": True,
-    },
+# Only the explicit fallback roster becomes seeds. Supplemental metadata
+# does not add members to a successful credential-scoped live roster.
+SEEDS = tuple(
+    {"uid": uid, **{key: record[key] for key in (
+        "label", "reasoning", "supports_tools", "supports_images", "supports_parallel", "is_default"
+    )}}
+    for uid in provider_catalog("devin")["fallbacks"]
+    for record in (provider_catalog("devin")["models"][uid],)
 )
 
 
@@ -575,6 +277,8 @@ class DevinModel:
         is_default=False,
         base_url=None,
         unverified=False,
+        context_source=None,
+        output_source=None,
     ):
         self.uid = uid
         self.logical_id = logical_id
@@ -591,7 +295,9 @@ class DevinModel:
         self.effort_routing = dict(effort_routing or {})
         self.is_default = is_default
         self.base_url = base_url
-        self.unverified = unverified
+        self.context_source = context_source or ("bundled-seed" if unverified else "live")
+        self.output_source = output_source or ("bundled-seed" if unverified else "live")
+        self.unverified = self.context_source != "live" or self.output_source != "live"
 
     def wire_uid(self, effort=None):
         """Resolve the chat uid for an effort tier (lane routing or self)."""
@@ -741,10 +447,8 @@ def _spec_from_config(config, uid, base_url, is_router):
         "is_new": bool(config.is_new),
         "is_beta": bool(config.is_beta),
         "is_recommended": bool(config.is_recommended),
-        "context_limit": max_tokens if max_tokens > 0 else 200000,
-        "output_limit": int(info.max_output_tokens)
-        if info is not None and info.max_output_tokens > 0
-        else 64000,
+        **resolve_limits("devin/" + uid, max_tokens,
+                         info.max_output_tokens if info is not None else None),
         "supports_tools": tools,
         "supports_images": images,
         "supports_parallel": parallel,
@@ -778,7 +482,7 @@ def normalize_configs(response, base_url):
             continue
         info = _model_info(config)
         display = info.display_option if info is not None else 0
-        if display in (4, 6):  # QUICK_REVIEW + INTERNAL_DEFAULT
+        if display in INTERNAL_MODEL_DISPLAYS:  # QUICK_REVIEW + INTERNAL_DEFAULT
             continue
         uid = (config.model_uid or "").strip()
         if not uid or uid in seen:
@@ -826,6 +530,8 @@ def normalize_configs(response, base_url):
                 label=lane["name"],
                 context_limit=first["context_limit"],
                 output_limit=first["output_limit"],
+                context_source=first["context_source"],
+                output_source=first["output_source"],
                 supports_tools=first["supports_tools"],
                 supports_images=first["supports_images"],
                 supports_parallel=first["supports_parallel"],
@@ -850,6 +556,8 @@ def normalize_configs(response, base_url):
                 label=spec["label"],
                 context_limit=spec["context_limit"],
                 output_limit=spec["output_limit"],
+                context_source=spec["context_source"],
+                output_source=spec["output_source"],
                 supports_tools=spec["supports_tools"],
                 supports_images=spec["supports_images"],
                 supports_parallel=spec["supports_parallel"],
@@ -871,14 +579,14 @@ def normalize_configs(response, base_url):
 
 
 def seed_models(base_url=None):
-    """Bundled fallback seeds (KDL). Discovery replaces these when possible."""
+    """Bundled JSON fallback roster, replaced by successful live discovery."""
     return [
         DevinModel(
             uid=seed["uid"],
             logical_id=seed["uid"],
             label=seed["label"],
-            context_limit=seed["context_limit"],
-            output_limit=seed["output_limit"],
+            context_limit=resolve_limits("devin/" + seed["uid"])["context_limit"],
+            output_limit=resolve_limits("devin/" + seed["uid"])["output_limit"],
             supports_tools=seed["supports_tools"],
             supports_images=seed["supports_images"],
             supports_parallel=seed["supports_parallel"],
@@ -1132,6 +840,8 @@ def normalize_schema_for_google(schema):
                 out["nullable"] = True
             elif len(members) == 1:
                 out["type"] = members[0]
+                if had_null:
+                    out["nullable"] = True  # P2-03: keep ["T","null"] nullability
             else:
                 raise DevinChatError(
                     f"tool schema type array {node_type!r} is not representable"
@@ -1177,15 +887,8 @@ def is_gemini_uid(uid):
     return text.startswith("MODEL_GOOGLE") or "gemini" in text.lower()
 
 
-def _input_items(body):
-    value = body.get("input")
-    if value is None:
-        value = body.get("messages", [])
-    if isinstance(value, str):
-        return [{"role": "user", "content": value}]
-    if isinstance(value, dict):
-        return [value]
-    return value if isinstance(value, list) else []
+# _input_items lives in muse_providers (canonical, P2-07); this module
+# imports it. The local copy was byte-identical in behavior.
 
 
 def _text_and_images(content):
@@ -1254,10 +957,23 @@ def history_to_prompts(body, cascade_id):
             prompts.append(open_calls)
         open_calls = None
 
-    for raw in _input_items(body):
-        if not isinstance(raw, dict):
-            continue
+    items = [raw for raw in _input_items(body) if isinstance(raw, dict)]
+    inline_ids = {
+        raw["id"] for raw in items
+        if raw.get("type") != "item_reference" and isinstance(raw.get("id"), str) and raw["id"]
+    }
+    for raw in items:
         item_type = str(raw.get("type") or "").strip()
+        if item_type == "item_reference":
+            # P2-04, mirroring kiro_unresolved_reference: a resolvable
+            # reference names content already inline; anything else is
+            # rejected, never silently dropped.
+            if not isinstance(raw.get("id"), str) or raw["id"] not in inline_ids:
+                raise DevinChatError(
+                    "Devin cannot resolve a required item reference; resend its inline content.",
+                    code="devin_unresolved_reference",
+                )
+            continue
         if item_type == "function_call":
             original = str(raw.get("call_id") or raw.get("id") or "").strip()
             if not original:
@@ -1439,6 +1155,22 @@ def fround(value):
     return struct.unpack("d", struct.pack("d", struct.unpack("f", struct.pack("f", float(value)))[0]))[0]
 
 
+_BASE_OVERRIDES_LOGGED = set()
+
+
+def _log_base_override_once(configured, effective):
+    """Say once per process when the auth server redirects chat traffic."""
+    key = (configured, effective)
+    if key in _BASE_OVERRIDES_LOGGED:
+        return
+    _BASE_OVERRIDES_LOGGED.add(key)
+    print(f"muse-gateway: Devin auth server directed chat traffic to {effective} "
+          f"(configured {configured}).", file=sys.stderr, flush=True)
+    capture = current_capture()
+    if capture is not None:
+        capture.event("devin.base_override", configured=configured, effective=effective)
+
+
 def fetch_auth(api_key, base_url, timeout=30.0):
     """Per-turn JWT: prefixed credential first, unprefixed on 401 only.
 
@@ -1476,6 +1208,16 @@ def fetch_auth(api_key, base_url, timeout=30.0):
         custom = (decoded.custom_api_server_url or "").strip()
         if custom:
             effective = normalize_base_url(custom)
+            # P2-09: a server-directed base receives the token, JWT and full
+            # history, so it must be HTTPS unless it is loopback.
+            parsed_custom = urllib.parse.urlsplit(effective)
+            host = (parsed_custom.hostname or "").lower()
+            if parsed_custom.scheme != "https" and host not in {"127.0.0.1", "::1", "localhost"}:
+                raise DevinAuthError(
+                    "Devin auth server returned an insecure non-loopback custom_api_server_url"
+                )
+            if effective != resolved_base:
+                _log_base_override_once(resolved_base, effective)
         return attempt, decoded.user_jwt, effective
     raise DevinAuthError(str(last_error) if last_error else "Devin auth error: GetUserJwt failed")
 
@@ -1516,7 +1258,8 @@ def assign_if_router(model, wire_api_key, cascade_id, staged, base_url, timeout=
             base_url, ASSIGN_MODEL_PATH, request.SerializeToString(), timeout=timeout
         )
     except DevinHttpError as error:
-        raise DevinChatError(f"Devin AssignModel error: {error}") from error
+        # Client-facing text stays categorical; upstream prose is capture-only (P1-08).
+        raise DevinChatError(f"Devin AssignModel error: HTTP {error.status}") from error
     decoded = decode_unary(devin_pb2.AssignModelResponse, body)
     assignment = decoded.assignment if decoded is not None else None
     if assignment is None or not assignment.assignment_jwt or not assignment.model_uid:
@@ -1538,6 +1281,45 @@ def _body_int(body, name, default):
         return max(1, int(value))
     except (TypeError, ValueError):
         return default
+
+
+REQUEST_POLICY_CODES = {
+    "devin_unsupported_tool_choice", "devin_invalid_request", "invalid_output_limit",
+    "devin_unresolved_reference",
+}
+
+
+def validate_request_policy(body, tool_names):
+    """P1-05 request policy; raises before any upstream call.
+
+    "none" sends no tools (no new wire value). "required" has no verified
+    ChatToolChoice spelling (Q3), so it is rejected by name, not guessed.
+    """
+    try:
+        choice, tool_name, serial = request_tool_policy(body, route="devin")
+    except ProviderError as error:
+        raise DevinChatError(str(error), code=error.code) from error
+    if choice == "required":
+        raise DevinChatError(
+            "Devin cannot enforce tool_choice=required; use auto, none, or a named function.",
+            code="devin_unsupported_tool_choice",
+        )
+    if choice == "named" and tool_name not in set(tool_names):
+        raise DevinChatError(
+            f"tool_choice names {tool_name!r}, which is not in tools.",
+            code="devin_unsupported_tool_choice",
+        )
+    raw_limit = body.get("max_output_tokens")
+    if raw_limit is not None:
+        try:
+            positive = not isinstance(raw_limit, bool) and int(raw_limit) > 0
+        except (TypeError, ValueError):
+            positive = False
+        if not positive:
+            raise DevinChatError(
+                "max_output_tokens must be a positive integer.", code="invalid_output_limit"
+            )
+    return choice, tool_name, serial
 
 
 def build_chat_request(
@@ -1566,21 +1348,28 @@ def build_chat_request(
     request.planner_mode = devin_pb2.ConversationalPlannerMode.Value(
         "CONVERSATIONAL_PLANNER_MODE_DEFAULT"
     )
-    request.tool_choice.option_name = "auto"
+    choice, tool_name, serial = validate_request_policy(body, [tool.name for tool in tools])
+    if choice == "none":
+        tools = []
+    if choice == "named":
+        request.tool_choice.tool_name = tool_name
+    else:
+        request.tool_choice.option_name = "auto"
     request.system_prompt_cache_options.type = devin_pb2.CacheControlType.Value(
         "CACHE_CONTROL_TYPE_EPHEMERAL"
     )
-    request.disable_parallel_tool_calls = not model.supports_parallel
+    request.disable_parallel_tool_calls = (not model.supports_parallel) or serial
     request.cascade_id = cascade_id
     request.execution_id = str(uuid.uuid4())
     configuration = request.configuration
     configuration.num_completions = 1
-    configuration.max_tokens = _body_int(body, "max_output_tokens", model.output_limit or 64000)
+    requested = _body_int(body, "max_output_tokens", model.output_limit or 64000)
+    configuration.max_tokens = min(requested, model.output_limit) if model.output_limit else requested
     configuration.max_newlines = 400
     configuration.temperature = _body_number(body, "temperature", 1.0)
     configuration.top_k = 40
     configuration.top_p = fround(_body_number(body, "top_p", 0.95))
-    stops = body.get("stop", [])
+    stops = body.get("stop") or body.get("stop_sequences") or []
     if isinstance(stops, str):
         stops = [stops]
     for stop in stops if isinstance(stops, list) else []:
@@ -1595,27 +1384,18 @@ def build_chat_request(
 # ---------------------------------------------------------------------------
 
 
-def _responses_function_id(raw_id, call_id):
-    candidate = str(raw_id or "")
-    if candidate.startswith("fc_") and re.fullmatch(r"[A-Za-z0-9_-]+", candidate):
-        return candidate
-    if call_id.startswith("call_"):
-        return "fc_" + call_id[len("call_") :]
-    digest = hashlib.sha256((candidate or call_id).encode("utf-8")).hexdigest()[:24]
-    return "fc_" + digest
-
-
-def _finalize_tool_arguments(accumulated, invalid_fallback=""):
-    """Authoritative final parse with repair-or-mark (E8, ratified OMP)."""
-    for candidate in (accumulated, invalid_fallback):
+def _finalize_tool_arguments(accumulated, concat_candidate="", invalid_fallback=""):
+    """Authoritative final parse: prefer valid JSON object; None on unrecoverable corruption."""
+    for candidate in (concat_candidate, accumulated, invalid_fallback):
         if not candidate:
             continue
         try:
-            json.loads(candidate)
+            parsed = json.loads(candidate)
         except ValueError:
             continue
-        return candidate
-    return json.dumps({"__parseError": accumulated}, ensure_ascii=False)
+        if isinstance(parsed, dict):
+            return candidate
+    return None
 
 
 class DevinStreamState:
@@ -1645,6 +1425,7 @@ class DevinStreamState:
         self.finished = False
         self.started = False
         self.sequence_number = 0
+        self._used_item_ids = set()
 
     def _number_events(self, events):
         for event_name, payload in events:
@@ -1680,7 +1461,8 @@ class DevinStreamState:
 
     def _message_item_id(self):
         seed = f"{self.response_id}:{len(self.output)}"
-        return "msg_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+        candidate = "msg_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+        return _allocate_item_id(candidate, self._used_item_ids)
 
     def _ensure_text_block(self):
         if self.text_block is not None:
@@ -1718,7 +1500,9 @@ class DevinStreamState:
                 block["name"] = name
                 block["item"]["name"] = name
             return []
-        item_id = _responses_function_id(wire_id, wire_id)
+        item_id = _allocate_item_id(
+            _responses_function_id(wire_id, wire_id), self._used_item_ids
+        )
         item = {
             "type": "function_call",
             "id": item_id,
@@ -1729,12 +1513,13 @@ class DevinStreamState:
         }
         self.tool_blocks[wire_id] = {
             "item": item, "name": name or "", "arguments": "",
-            "invalid": "",
+            "concat_arguments": "", "invalid": "",
         }
         self.tool_order.append(wire_id)
-        self.output.append(item)
         # HTTP deltas cannot be replaced after argument repair or late naming.
         # Release finalized tool events together; text still streams normally.
+        # The item joins output only when released, so output_index never
+        # runs backwards in the event stream (P2-04).
         return []
 
     def feed(self, message):
@@ -1786,6 +1571,10 @@ class DevinStreamState:
             block = self.tool_blocks[wire_id]
             if call.arguments_json:
                 previous = block["arguments"]
+                block["concat_arguments"] = block.get("concat_arguments", "") + call.arguments_json
+                # Per-block cap mirrors muse_kiro._BLOCK_LIMIT (8 MiB).
+                if len(block["concat_arguments"]) > 8 * 1024 * 1024 or len(previous) > 8 * 1024 * 1024:
+                    raise DevinChatError("Devin tool arguments exceeded the safety size limit")
                 block["arguments"] = (
                     call.arguments_json if call.arguments_json.startswith(previous)
                     else previous + call.arguments_json
@@ -1846,8 +1635,13 @@ class DevinStreamState:
             block = self.tool_blocks[wire_id]
             item = block["item"]
             arguments = _finalize_tool_arguments(
-                block["arguments"], block["invalid"]
+                block["arguments"], block.get("concat_arguments", ""), block["invalid"]
             )
+            if arguments is None:
+                if self.stop_reason == 3:
+                    continue
+                return events, "invalid_tool_arguments"
+            self.output.append(item)
             index = self.output.index(item)
             added = copy.deepcopy(item)
             added["arguments"] = ""
@@ -1870,21 +1664,40 @@ class DevinStreamState:
                 "type": "response.output_item.done",
                 "output_index": index, "item": copy.deepcopy(item),
             }))
-        return events
+        return events, None
 
     def finish(self):
-        """Emit done + terminal events. Done mapping: toolUse > length > stop."""
+        """Emit done + terminal events with the explicit stop-reason map."""
         if self.finished:
             return []
         if self.stop_reason in (1, 9):
             return self.fail("Devin stream ended before a completion signal", "upstream_error")
+        _STOP_NAMES = {
+            7: "STOP_REASON_NONFINITE_LOGIT_OR_PROB",
+            11: "STOP_REASON_CONTENT_FILTER",
+            13: "STOP_REASON_ERROR",
+        }
+        if self.stop_reason in _STOP_NAMES:
+            return self.fail(
+                f"Devin turn stopped with reason {_STOP_NAMES[self.stop_reason]}",
+                _STOP_NAMES[self.stop_reason],
+            )
+        if (
+            isinstance(self.stop_reason, int)
+            and self.stop_reason not in (0, 2, 3, 4, 5, 6, 8, 10, 12)
+        ):
+            return self.fail(
+                f"Devin turn stopped with unrecognized reason {self.stop_reason}",
+                f"stop_reason_{self.stop_reason}",
+            )
         if any(not block["name"] for block in self.tool_blocks.values()):
             return self.fail("Devin returned a tool call without a name", "invalid_tool_call")
         events = self._ensure_started()
-        events.extend(self._finish_items())
-        if self.tool_blocks:
-            status = "completed"
-        elif self.stop_reason == 3:  # STOP_REASON_MAX_TOKENS
+        item_events, tool_error = self._finish_items()
+        if tool_error is not None:
+            return self.fail("Devin tool arguments were not valid JSON", tool_error)
+        events.extend(item_events)
+        if self.stop_reason in (3, 4, 5, 6, 8, 12):
             status = "incomplete"
         else:
             status = "completed"
@@ -1936,6 +1749,12 @@ def _shrinkable_history_bytes(history_protos, staged):
                 break
             tail += 1
     shrinkable = history_protos[: len(history_protos) - tail] if tail else history_protos
+    # P3-04: the classifier only cares about >= 512 KiB. A cheap upper bound
+    # (payload + <= 8 bytes of tag/length per prompt) below that threshold is
+    # returned as-is, skipping the second full serialization.
+    bound = sum(prompt.ByteSize() for prompt in shrinkable) + 8 * len(shrinkable)
+    if bound < LARGE_HISTORY_RECOVERY_BYTES:
+        return bound
     probe = devin_pb2.GetChatMessageRequest()
     probe.chat_message_prompts.extend(shrinkable)
     return len(probe.SerializeToString())
@@ -1948,7 +1767,7 @@ def _classify_trailer(trailer_error, had_output, history_bytes):
         not had_output
         and trailer_error.code.lower() == "invalid_argument"
         and re.search(r"\binternal error\b", trailer_error.message, re.IGNORECASE)
-        and history_bytes >= 512 * 1024
+        and history_bytes >= LARGE_HISTORY_RECOVERY_BYTES
     ):
         return "overflow"
     return None
@@ -1963,12 +1782,13 @@ def run_turn_events(
     effort=None,
     timeout=300.0,
     conversation_id=None,
+    idle_timeout=None,
 ):
     """Bound upstream connection failures before the first event as well."""
     try:
         yield from _run_turn_events(
             body, flat_tools, model, access_token, base_url, effort,
-            timeout, conversation_id,
+            timeout, conversation_id, idle_timeout,
         )
     except (HTTPException, ConnectionError) as error:
         raise DevinChatError("Devin upstream connection failed before a response") from error
@@ -1983,6 +1803,7 @@ def _run_turn_events(
     effort=None,
     timeout=300.0,
     conversation_id=None,
+    idle_timeout=None,
 ):
     """Run one Devin turn, yielding (event_type, payload) tuples.
 
@@ -1999,6 +1820,9 @@ def _run_turn_events(
         raise DevinChatError("The selected Devin model does not support images")
     if not model.supports_tools and flat_tools:
         raise DevinChatError("The selected Devin model does not support tools")
+    validate_request_policy(body, [
+        str(tool.get("name") or "").strip() for tool in flat_tools or [] if isinstance(tool, dict)
+    ])
     wire_uid = model.wire_uid(effort)
     wire_api_key, user_jwt, chat_base = fetch_auth(access_token, resolved_base, timeout=min(timeout, 30.0))
     assignment_jwt = None
@@ -2018,9 +1842,14 @@ def _run_turn_events(
     state = DevinStreamState(f"devin/{model.logical_id}")
     history_bytes = _shrinkable_history_bytes(history_protos, staged)
     response = open_chat_stream(chat_base, request.SerializeToString(), timeout=timeout)
+    if idle_timeout:
+        # After headers the read budget is idle time, not total time (P1-09).
+        set_response_idle_timeout(response, idle_timeout)
     saw_end_stream = False
     try:
         for flags, payload in iter_chat_frames(response):
+            if saw_end_stream:
+                raise DevinChatError("Devin stream sent trailing frame after end-stream envelope")
             if flags & CONNECT_END_STREAM_FLAG:
                 saw_end_stream = True
                 raw = payload
@@ -2052,7 +1881,7 @@ def _run_turn_events(
                 yield event
         if not state.had_output:
             raise DevinChatError("Devin stream ended without model output")
-        if state.stop_reason in (1, 9) or (not saw_end_stream and state.stop_reason is None):
+        if state.stop_reason in (1, 9) or not saw_end_stream:
             raise DevinChatError("Devin stream ended before a completion signal")
     except (DevinWireError, OSError, EOFError, HTTPException) as error:
         if not state.started:
@@ -2072,12 +1901,18 @@ def _run_turn_events(
 
 def run_turn_final(
     body, flat_tools, model, access_token, base_url=None, effort=None, timeout=300.0,
-    conversation_id=None,
+    conversation_id=None, idle_timeout=None,
 ):
-    """Non-streaming turn: consume the same stream, return the final object."""
+    """Non-streaming turn: consume the same stream, return the final object.
+
+    A failed or incomplete turn is still returned as a 200 Responses object
+    carrying its status (Responses-legal); the gateway marks the request
+    failed for diagnostics instead of switching to a 502 (P2-13).
+    """
     final = None
     for event_type, payload in run_turn_events(
-        body, flat_tools, model, access_token, base_url, effort, timeout, conversation_id
+        body, flat_tools, model, access_token, base_url, effort, timeout, conversation_id,
+        idle_timeout,
     ):
         if event_type in {"response.completed", "response.failed", "response.incomplete"}:
             final = payload.get("response")

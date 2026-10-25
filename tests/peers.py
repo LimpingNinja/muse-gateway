@@ -220,6 +220,7 @@ def gateway(directory, peer, **settings):
         options = dict(provider="auto", devin_upstream=upstream, meta_upstream=upstream,
                        codex_upstream=upstream, devin_api_key="fixture-devin-token",
                        meta_api_key="fixture-meta-token", model_discovery=False,
+                       allow_oauth_host_override=True,
                        log_file=str(Path(directory) / "gateway.log"), timeout=4)
         options.update(settings)
         if options["provider"] in {"devin", "claude"}:
@@ -229,7 +230,8 @@ def gateway(directory, peer, **settings):
             options.setdefault("kiro_api_key", "fixture-kiro-proxy-token")
             options["upstream"] = options["kiro_upstream"]
         config = Config(argparse.Namespace(**options))
-        # Config's auto route has no codex_upstream constructor override.
+        # Auto mode builds codex/claude upstreams from defaults, not from the
+        # options above, so point both at the peer after construction.
         config.codex_upstream = upstream
         config.claude_upstream = upstream
         try:

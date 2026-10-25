@@ -15,8 +15,11 @@
 # `codex login`. Install once with `python3 -m pip install .` from the checkout;
 # protobuf is installed with the package. A virtual environment is optional.
 # Local-backend config comes from flags, environment
-# (MUSE_GATEWAY_LOCAL_UPSTREAM, MUSE_GATEWAY_LOCAL_API_KEY,
-# MUSE_GATEWAY_LOCAL_MODELS; the MUSE_SHIM_* spellings still work), or a
+# (MUSE_GATEWAY_LOCAL_UPSTREAM, optional MUSE_GATEWAY_LOCAL_API_KEY), or a
+# config file. MUSE_GATEWAY_MODELS filters exact provider/model menu IDs.
+# Retired settings warn and are ignored; conflicts and retired flags fail.
+# An unset local upstream disables local. No incoming Muse bearer is borrowed.
+# Use an existing
 # `.env` file next to this script; flags win over env, env wins over
 # the file. Run with -h for launcher help.
 #
@@ -34,7 +37,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if command -v python3 >/dev/null 2>&1; then
+if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+  PYTHON="$SCRIPT_DIR/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
   PYTHON=python3
 elif command -v python >/dev/null 2>&1; then
   PYTHON=python
@@ -43,4 +48,12 @@ else
   exit 1
 fi
 
-exec "$PYTHON" "$SCRIPT_DIR/muse_gateway.py" launch --env-file "$SCRIPT_DIR/.env" "$@"
+ENV_FILE_ARGS=()
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  ENV_FILE_ARGS=(--env-file "$SCRIPT_DIR/.env")
+fi
+
+if [[ "${1:-}" == "--models" ]]; then
+  exec "$PYTHON" "$SCRIPT_DIR/muse_gateway.py" ${ENV_FILE_ARGS[@]+"${ENV_FILE_ARGS[@]}"} "$@"
+fi
+exec "$PYTHON" "$SCRIPT_DIR/muse_gateway.py" launch ${ENV_FILE_ARGS[@]+"${ENV_FILE_ARGS[@]}"} "$@"

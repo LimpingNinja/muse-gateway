@@ -47,8 +47,8 @@ vulnerabilities. Please do not send provider account-abuse reports here.
 - Do not use `--allow-oauth-host-override` unless you intend to trust the
   replacement host with credentials. Codex/Claude's native host allowlists do
   not cover arbitrary Meta, Devin, local, or generic endpoints.
-- Treat Codex/Claude credentials, Devin CLI credentials, OMP's `agent.db`, API
-  keys, and any external gateway's credentials like passwords. Provider login
+- Treat Codex/Claude credentials, Devin CLI credentials, API keys, and any
+  external gateway's credentials like passwords. Provider login
   files can be updated during OAuth refresh; Devin logins are not refreshed
   by this integration.
 - Kiro Gateway is a separate service with its own login/refresh lifecycle.
@@ -59,10 +59,10 @@ vulnerabilities. Please do not send provider account-abuse reports here.
 - Kiro endpoints must use verified HTTPS unless they are loopback HTTP.
   Kiro catalog and inference requests reject redirects. The native
   `--allow-oauth-host-override` escape hatch does not relax these rules.
-- Meta, local, and generic routes can forward incoming authorization when no
-  route key is configured. Only configure upstream URLs you trust; use a
-  dedicated local API key rather than forwarding a Muse subscription token to
-  a third-party server. Custom Meta/local URLs are not protected by the native
+- Meta and explicit generic mode can forward incoming authorization when no
+  route key is configured. Only configure upstream URLs you trust. Local uses
+  only its own optional key and never forwards incoming Muse authorization or
+  generic credentials. Custom Meta/local URLs are not protected by the native
   Codex/Claude OAuth host allowlists.
 - Prefer TLS for non-loopback upstreams. Plain HTTP sends prompts and credentials
   unencrypted, even when the endpoint is on a private network.
@@ -78,7 +78,7 @@ vulnerabilities. Please do not send provider account-abuse reports here.
   but correlation IDs and parameter names can still be sensitive. They are
   evidence supplied by the configured service, not trusted instructions or
   proof of which underlying account or model produced an error.
-- `--capture-dir` / `MUSE_GATEWAY_CAPTURE_DIR` is a separate, opt-in debugging
+- `--capture-dir` (CLI flag only) is a separate, opt-in debugging
   mode that saves conversation bodies and wire evidence. Captures are private
   local files with authentication credentials scrubbed; prompts, file contents,
   tool output, and model responses can still contain sensitive information.

@@ -18,17 +18,17 @@
   `codex login`. Install once with `python -m pip install .` from the checkout;
   protobuf is installed with the package. A virtual environment is optional.
 
-  Local-backend config comes from flags (-LocalUpstream, -LocalApiKey,
-  -LocalModels), environment (MUSE_GATEWAY_LOCAL_UPSTREAM,
-  MUSE_GATEWAY_LOCAL_API_KEY, MUSE_GATEWAY_LOCAL_MODELS; the MUSE_SHIM_*
-  spellings still work), or a `.env` file next to this script (copy
-  `.env.example` to start; override with -EnvFile); flags win over env, env
-  wins over the file. Without a key the launcher warns and continues.
+  Local config uses -LocalUpstream / -LocalApiKey or current
+  MUSE_GATEWAY_LOCAL_UPSTREAM / MUSE_GATEWAY_LOCAL_API_KEY settings.
+  Unset upstream disables local; its key is optional, never borrowed.
+  MUSE_GATEWAY_MODELS filters exact provider/model IDs, not entitlement.
+  Flags win over current environment, then the existing file (-EnvFile).
+  Removed settings warn; conflicting aliases and removed flags fail.
   -LogFile and -MuseBin map to --log-file and --muse-bin; -Port is only
   forwarded when explicitly supplied.
 
-  Kiro Gateway is a separate service. -KiroUpstream, -KiroApiKey, -KiroModels,
-  -KiroContextLimit and -KiroOutputLimit map to the corresponding --kiro-*
+  Kiro Gateway is a separate service. -KiroUpstream, -KiroApiKey,
+  -KiroServerDir and -KiroAutostart map to the corresponding --kiro-*
   launcher options. Prefer a private env file for the proxy key.
 
 .EXAMPLE
@@ -60,14 +60,16 @@
 param(
     [int]$Port = 8787,
     [switch]$CheckOnly,
+    [switch]$Models,
     [string]$LocalUpstream = "",
     [string]$LocalApiKey = "",
-    [string]$LocalModels = "",
     [string]$KiroUpstream = "",
     [string]$KiroApiKey = "",
-    [string]$KiroModels = "",
-    [int]$KiroContextLimit,
-    [int]$KiroOutputLimit,
+    [string]$KiroServerDir = "",
+    [switch]$KiroAutostart,
+    [string]$DevinUpstream = "",
+    [string]$DevinApiKey = "",
+    [string]$ModelsProvider = "",
     [string]$LogFile = "",
     [string]$MuseBin = "",
     [string]$EnvFile = "",
@@ -76,30 +78,56 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$GatewayScript = Join-Path $PSScriptRoot "muse_gateway.py"
-if (-not $EnvFile) { $EnvFile = Join-Path $PSScriptRoot ".env" }
-
-$Python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $Python) {
-    $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
-    if (-not $PyLauncher) { throw "python not found on PATH (tried 'python' and 'py')" }
-    $PythonCommand = @($PyLauncher.Source, "-3")
-} else {
-    $PythonCommand = @($Python.Source)
+foreach ($arg in $MuseArgs) {
+    $name = ($arg -split "[=:]", 2)[0]
+    if ($name -match '^-(MetaModels|CodexModels|ClaudeModels|DevinModels|KiroModels|LocalModels)$') {
+        throw "Removed gateway option $name; use MUSE_GATEWAY_MODELS with exact provider/model IDs (filter only)."
+    }
+    if ($name -match '^-(MetaBaseUrl|CodexBaseUrl|ClaudeBaseUrl|DevinBaseUrl|KiroBaseUrl|LocalBaseUrl)$') {
+        throw "Removed gateway option $name; use the corresponding -*Upstream option."
+    }
+    if ($name -match '^-(DevinAuthDb|DevinCredentialId|DevinDefaultFile)$') {
+        throw "Removed Devin credential selection option $name; use devin auth login or DEVIN_API_KEY."
+    }
+    if ($name -match '^-(KiroContextLimit|KiroOutputLimit|KiroModelBudgets|MaxOutputTokens|RefreshSkew)$') {
+        throw "Removed gateway option $name; remove the budget/timing override. Per-request max_output_tokens remains supported."
+    }
 }
-$launchArgs = @("launch", "--env-file", $EnvFile)
+if ($Models -and $CheckOnly) { throw "Use -Models or -CheckOnly, not both." }
+$GatewayScript = Join-Path $PSScriptRoot "muse_gateway.py"
+$EnvFileBound = $PSBoundParameters.ContainsKey("EnvFile")
+if (-not $EnvFileBound) { $EnvFile = Join-Path $PSScriptRoot ".env" }
+
+$VenvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (Test-Path $VenvPython) {
+    $PythonCommand = @($VenvPython)
+} else {
+    $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($PyLauncher) {
+        $PythonCommand = @($PyLauncher.Source, "-3")
+    } else {
+        $Python = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $Python) { throw "python not found on PATH (tried 'py' and 'python')" }
+        $PythonCommand = @($Python.Source)
+    }
+}
+$launchArgs = @("launch")
+if ($Models) { $launchArgs = @("--models") }
+if ($EnvFileBound) { $launchArgs += "--env-file=$EnvFile" }
+elseif (Test-Path $EnvFile) { $launchArgs += "--env-file=$EnvFile" }
 if ($PSBoundParameters.ContainsKey("Port")) { $launchArgs += "--port", "$Port" }
-if ($LogFile) { $launchArgs += "--log-file", $LogFile }
+if ($PSBoundParameters.ContainsKey("LogFile")) { $launchArgs += "--log-file=$LogFile" }
 if ($CheckOnly) { $launchArgs += "--check-only" }
-if ($LocalUpstream) { $launchArgs += "--local-upstream", $LocalUpstream }
-if ($LocalApiKey) { $launchArgs += "--local-api-key", $LocalApiKey }
-if ($LocalModels) { $launchArgs += "--local-models", $LocalModels }
-if ($KiroUpstream) { $launchArgs += "--kiro-upstream", $KiroUpstream }
-if ($KiroApiKey) { $launchArgs += "--kiro-api-key", $KiroApiKey }
-if ($KiroModels) { $launchArgs += "--kiro-models", $KiroModels }
-if ($PSBoundParameters.ContainsKey("KiroContextLimit")) { $launchArgs += "--kiro-context-limit", "$KiroContextLimit" }
-if ($PSBoundParameters.ContainsKey("KiroOutputLimit")) { $launchArgs += "--kiro-output-limit", "$KiroOutputLimit" }
-if ($MuseBin) { $launchArgs += "--muse-bin", $MuseBin }
+if ($PSBoundParameters.ContainsKey("LocalUpstream")) { $launchArgs += "--local-upstream=$LocalUpstream" }
+if ($PSBoundParameters.ContainsKey("LocalApiKey")) { $launchArgs += "--local-api-key=$LocalApiKey" }
+if ($PSBoundParameters.ContainsKey("KiroUpstream")) { $launchArgs += "--kiro-upstream=$KiroUpstream" }
+if ($PSBoundParameters.ContainsKey("KiroApiKey")) { $launchArgs += "--kiro-api-key=$KiroApiKey" }
+if ($PSBoundParameters.ContainsKey("KiroServerDir")) { $launchArgs += "--kiro-server-dir=$KiroServerDir" }
+if ($PSBoundParameters.ContainsKey("DevinUpstream")) { $launchArgs += "--devin-upstream=$DevinUpstream" }
+if ($PSBoundParameters.ContainsKey("DevinApiKey")) { $launchArgs += "--devin-api-key=$DevinApiKey" }
+if ($PSBoundParameters.ContainsKey("ModelsProvider")) { $launchArgs += "--models-provider=$ModelsProvider" }
+if ($KiroAutostart) { $launchArgs += "--kiro-autostart" }
+if ($PSBoundParameters.ContainsKey("MuseBin")) { $launchArgs += "--muse-bin=$MuseBin" }
 if ($PythonCommand.Count -gt 1) {
     & $PythonCommand[0] $PythonCommand[1] $GatewayScript @launchArgs @MuseArgs
 } else {

@@ -9,6 +9,7 @@ import hashlib
 import heapq
 import io
 import importlib.metadata
+import importlib.resources
 import json
 import os
 from pathlib import Path
@@ -47,7 +48,7 @@ def _secret_field(name):
             "authorization", "authentication", "credential", "password",
             "passwd", "secret", "cookie", "apikey", "accesstoken",
             "refreshtoken", "authtoken", "bearertoken", "sessiontoken",
-            "identitytoken", "idtoken", "userjwt", "assignmentjwt",
+            "identitytoken", "idtoken", "userjwt", "assignmentjwt", "accountid",
         ))
         or normalized.endswith(("token", "jwt"))
     )
@@ -150,14 +151,38 @@ def _private_directory(path):
         )
 
 
-def _source_identity():
+_SOURCE_FILES = ("muse_gateway.py", "muse_providers.py", "muse_devin.py",
+                 "muse_devin_wire.py", "devin_pb2.py", "muse_capture.py", "muse_kiro.py",
+                 "muse_models.py", "muse_shim.py")
+
+
+def _source_files():
+    """Hashes of the runtime sources and provider catalogs (P2-08)."""
     root = Path(__file__).resolve().parent
     files = {}
-    for name in ("muse_gateway.py", "muse_providers.py", "muse_devin.py",
-                 "muse_devin_wire.py", "devin_pb2.py", "muse_capture.py", "muse_kiro.py"):
+    for name in _SOURCE_FILES:
         path = root / name
         if path.is_file():
             files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        catalogs = importlib.resources.files("providers")
+        entries = sorted((entry for entry in catalogs.iterdir() if entry.name.endswith(".json")),
+                         key=lambda entry: entry.name)
+    except (ModuleNotFoundError, OSError, TypeError):
+        entries = []
+    for entry in entries:
+        files[f"providers/{entry.name}"] = hashlib.sha256(entry.read_bytes()).hexdigest()
+    return root, files
+
+
+def source_fingerprint():
+    """Stable fingerprint of the running sources; no subprocess (P1-15)."""
+    _root, files = _source_files()
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
+def _source_identity():
+    root, files = _source_files()
     revision = None
     try:
         revision = subprocess.check_output(
@@ -188,7 +213,7 @@ class CaptureSession:
 
     def _save(self, name, value):
         path = self.directory / name
-        with open(path, "x", encoding="utf-8") as handle:
+        with os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w", encoding="utf-8") as handle:
             json.dump(value, handle, indent=2)
         os.chmod(path, 0o600)
 
@@ -316,6 +341,8 @@ class RequestCapture:
                         selected = scrubbed
                     else:
                         selected = selected[:start - stats["captured_bytes"]] + scrubbed
+            if offset is None and not path.exists():
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
             with open(path, "r+b" if offset is not None and path.exists() else "ab") as handle:
                 if offset is not None:
                     handle.seek(offset)

@@ -40,7 +40,7 @@ FAULTS = (
         'payload["sequence_number"] = self.sequence_number', 'payload.pop("sequence_number", None)'),),
         "test_text_and_nonstream_have_equivalent_complete_output", "STREAM_SEQUENCE"),
     Fault("subtract context fallback", "muse_devin.py", ((
-        'max_tokens if max_tokens > 0 else 200000', 'max(0, max_tokens - 200000)'),),
+        'resolve_limits("devin/" + uid, max_tokens,', 'resolve_limits("devin/" + uid, max(0, max_tokens - 200000),'),),
         "test_catalog_has_usable_context_not_context_minus_fallback", "CATALOG_CONTEXT"),
     Fault("lose omitted tool ID", "muse_devin.py", ((
         'wire_id = call.id or self.active_tool_id', 'wire_id = call.id'),),
@@ -62,10 +62,10 @@ FAULTS = (
         'for event in state.finish():', 'for event in []:'),),
         "test_text_and_nonstream_have_equivalent_complete_output", "TERMINAL"),
     Fault("accept premature EOF", "muse_devin.py", ((
-        '(not saw_end_stream and state.stop_reason is None)', 'False'),),
+        'not saw_end_stream', 'False'),),
         "test_incomplete_transport_or_provider_error_never_claims_success", "FAILURE_SURFACE"),
     Fault("error-code collision drops HTTP response", "muse_gateway.py", ((
-        'extra["upstream_code"] = extra.pop("code")', 'extra["upstream_code"] = extra["code"]'),),
+        'upstream=extra,', '**extra,'),),
         "test_codex_400_is_readable_even_when_error_has_its_own_code", "HTTP_ERROR_RESPONSE"),
     Fault("Claude missing sequence numbers", "muse_providers.py", ((
         'numbered = {**payload, "sequence_number": sequence}', 'numbered = dict(payload)'),),
@@ -110,7 +110,7 @@ FAULTS = (
         '"category": category, "transient": transient', '"category": "unknown", "transient": transient'),),
         "test_http_error_evidence_survives_the_public_boundary_without_retry", "'unknown'", KIRO_PREFIX),
     Fault("Kiro omits the downstream Retry-After header", "muse_gateway.py", ((
-        'headers={"Retry-After": retry["value"]} if retry else None,', 'headers=None,'),),
+        'headers={"Retry-After": retry_value} if retry_value else None,', 'headers=None,'),),
         "test_retry_after_dates_and_rejected_metadata_are_passive", "AssertionError: None !=", KIRO_PREFIX),
 )
 
@@ -148,10 +148,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="gateway-faults-") as directory:
         copy = Path(directory)
         for name in ("muse_gateway.py", "muse_providers.py", "muse_devin.py", "muse_devin_wire.py",
-                     "muse_capture.py", "devin_pb2.py", "muse_shim.py", "muse_kiro.py", "test_kiro.py",
+                     "muse_capture.py", "devin_pb2.py", "muse_shim.py", "muse_kiro.py", "muse_models.py", "test_kiro.py",
                      "test_launchers.py", "muse-gateway.ps1", "muse-gateway"):
             shutil.copy2(source / name, copy / name)
         shutil.copytree(source / "tests", copy / "tests", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(source / "providers", copy / "providers", ignore=shutil.ignore_patterns("__pycache__"))
         originals = {fault.module: (copy / fault.module).read_text(encoding="utf-8") for fault in FAULTS}
         baseline = invoke(copy, names)
         if not usable(baseline) or baseline["failures"] or baseline["run"] != len(names):

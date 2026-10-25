@@ -24,8 +24,11 @@ import sys
 import urllib.error
 import urllib.request
 
+import http.client
+
 import devin_pb2
 from muse_capture import current_capture
+from muse_providers import build_gateway_opener
 
 
 # ---------------------------------------------------------------------------
@@ -38,10 +41,11 @@ class DevinWireError(Exception):
 
 
 class DevinHttpError(DevinWireError):
-    def __init__(self, operation, status, detail=None):
+    def __init__(self, operation, status, detail=None, headers=None):
         self.operation = operation
         self.status = status
         self.detail = detail
+        self.headers = headers
         message = f"Devin {operation} error {status}"
         if detail:
             message += f": {detail}"
@@ -240,6 +244,11 @@ class ConnectFrameDecoder:
         self._buffer = bytearray()
         self._max_payload_bytes = max_payload_bytes
 
+    @property
+    def pending_bytes(self):
+        """Bytes buffered toward an incomplete frame."""
+        return len(self._buffer)
+
     def decode(self, chunk=None):
         """Buffer ``chunk`` (if any) and yield ``(flags, payload)`` tuples."""
         if chunk:
@@ -251,6 +260,12 @@ class ConnectFrameDecoder:
         while size - offset >= CONNECT_HEADER_BYTES:
             (length,) = struct.unpack_from(">I", view, offset + 1)
             if length > self._max_payload_bytes:
+                if frames:
+                    # Return the valid prefix first; the cap error surfaces on
+                    # the next call (P2-04). Release before resizing the buffer.
+                    view.release()
+                    del self._buffer[:offset]
+                    return frames
                 raise DevinFrameError(
                     f"Devin Connect frame length {length} exceeds "
                     f"{self._max_payload_bytes}-byte cap"
@@ -342,26 +357,28 @@ def summarize_trailer_details(details):
 def parse_trailer_error(text):
     """Parse a Connect end-of-stream JSON trailer into a DevinTrailerError.
 
-    Returns None for empty text, malformed JSON, or shapes without
-    ``{error: {code, message}}`` — callers treat None as clean EOF.
-    """
-    if not text:
-        return None
+    Returns None only for a valid trailer object without an error (incl.
+    ``{}``). Empty text, malformed JSON, or a non-object ``error`` field
+    raise :class:`DevinFrameError`."""
+    if not text or not text.strip():
+        raise DevinFrameError("Devin end-stream trailer was empty")
     try:
         parsed = json.loads(text)
-    except ValueError:
-        return None
-    if not isinstance(parsed, dict) or "error" not in parsed:
+    except ValueError as error:
+        raise DevinFrameError("Devin end-stream trailer is not valid JSON") from error
+    if not isinstance(parsed, dict):
+        raise DevinFrameError("Devin end-stream trailer must be a JSON object")
+    if "error" not in parsed or parsed["error"] is None:
         return None
     error = parsed["error"]
     if not isinstance(error, dict):
-        return None
+        raise DevinFrameError("Devin end-stream trailer error field must be an object")
     code = error.get("code")
     code = code if isinstance(code, str) else ""
     message = error.get("message")
     message = message if isinstance(message, str) else ""
     if not code and not message:
-        return None
+        raise DevinFrameError("Devin end-stream trailer error object has no code or message")
     formatted = f"Devin stream error{f' {code}' if code else ''}: {message}"
     detail = None
     if "details" in error:
@@ -447,7 +464,7 @@ def _post(url, body, headers, timeout):
     if capture is not None:
         capture.event("devin.rpc.open", url=url, request_bytes=len(body))
     try:
-        response = urllib.request.urlopen(request, timeout=timeout)
+        response = build_gateway_opener(url).open(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         try:
             payload = error.read()
@@ -467,6 +484,7 @@ def _post(url, body, headers, timeout):
                 error.headers.get("Content-Type", "") if error.headers else "",
                 payload,
             ),
+            headers=error.headers,
         ) from error
     if capture is not None:
         capture.json(capture.label("devin.rpc.response"), {"status": response.getcode(), "headers": dict(response.headers)})
@@ -496,7 +514,10 @@ def unary_rpc(base_url, path, request_bytes, timeout=30.0):
     try:
         status = response.getcode()
         content_type = response.headers.get("Content-Type", "")
-        body = response.read()
+        try:
+            body = response.read()
+        except (OSError, http.client.HTTPException) as error:
+            raise DevinHttpError("request", status, "response body truncated") from error
         if capture is not None and label is not None:
             decoded = decode_unary(classes[path][1], body)
             if decoded is not None:
@@ -507,7 +528,8 @@ def unary_rpc(base_url, path, request_bytes, timeout=30.0):
         response.close()
     if not 200 <= status < 300:
         raise DevinHttpError(
-            "request", status, http_error_detail(content_type, body)
+            "request", status, http_error_detail(content_type, body),
+            headers=getattr(response, "headers", None),
         )
     return status, content_type, body
 
@@ -535,7 +557,8 @@ def open_chat_stream(base_url, request_bytes, timeout=60.0):
         finally:
             response.close()
         raise DevinHttpError(
-            "API", status, http_error_detail(content_type, body)
+            "API", status, http_error_detail(content_type, body),
+            headers=getattr(response, "headers", None),
         )
     return response
 
@@ -553,8 +576,8 @@ def iter_chat_frames(response, chunk_bytes=65536):
             capture.event("devin.chat.read_end", bytes=len(chunk))
         if not chunk:
             if capture is not None:
-                capture.event("devin.chat.eof", pending_frame_bytes=len(decoder._buffer))
-            if decoder._buffer:
+                capture.event("devin.chat.eof", pending_frame_bytes=decoder.pending_bytes)
+            if decoder.pending_bytes:
                 raise DevinFrameError("Devin stream ended inside a Connect frame")
             break
         items = decoder.decode(chunk)

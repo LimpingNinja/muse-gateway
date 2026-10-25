@@ -89,14 +89,14 @@ prompt, then try a file read or another tool call.
 
 Meta is listed for subscription forwarding. Codex and Devin entries need local
 credentials; Claude needs its CLI or HTTP credentials. Local entries appear
-when you configure a local endpoint or model list. Kiro entries need a Kiro
-Gateway proxy key and discovery or an explicit model list. These checks make
+when you configure a local endpoint with complete per-model capacities. Kiro
+entries need a Kiro Gateway proxy key, discovery, and exact model metadata. These checks make
 the menu useful, but an entry is not a guarantee of account access or a
 successful turn.
 
 Warnings about an unconfigured provider do not mean you must install it. In
-particular, the launcher warns when no local API key is set and skips that
-route's preflight; you can still use your other providers.
+particular, an unset local upstream disables local routing. Local keys are
+optional; an unset local key sends no Authorization header.
 
 ## Provider support
 
@@ -107,15 +107,16 @@ needed: Muse sends its authorization header to the gateway, which forwards it
 to `https://api.meta.ai/v1` for `meta/<model-id>` requests.
 
 Meta's namespace tools, reasoning, and cache fields are preserved. The routing
-prefix is removed, and an explicitly configured output-token cap still applies.
-The launcher deliberately clears static Meta API-key settings so that this path
-uses subscription authentication.
+prefix is removed. Per-request `max_output_tokens` is bounded by known model
+output metadata on supported routes; there is no gateway-wide output cap.
+The subscription launcher rejects `META_API_KEY` or `--meta-api-key` rather
+than silently changing billing or clearing your configuration.
 
 The catalog can use a static key or the bearer on a Muse catalog request to
 discover Meta models. Subscription discovery reuses that bearer only with the
 default Meta upstream. If discovery is unavailable, the bundled list remains.
 For API-key billing instead, use the [manual setup](#manual-server-setup).
-`MUSE_GATEWAY_META_UPSTREAM` overrides the endpoint, but any replacement must
+`--meta-upstream` overrides the endpoint, but any replacement must
 accept Meta's native payloads and be trusted with its authorization.
 
 ### Claude
@@ -123,23 +124,30 @@ accept Meta's native payloads and be trusted with its authorization.
 Install [Claude Code](https://code.claude.com/docs/en/overview), sign in through
 its normal login flow, and make sure `claude` is available in the same terminal
 as the gateway. Then launch the gateway and select a `claude/<model-id>` entry.
-You can set `MUSE_GATEWAY_CLAUDE_CLI` if the executable has a different path.
+Use `--claude-cli` if the executable has a different path.
 
 By default the gateway invokes the official `claude -p` command. Claude's own
 tools and session persistence are disabled for these calls; requested tool
 calls come back to Muse to execute. Output arrives after each subprocess
 finishes, not token by token, and this transport advertises text-only input.
+Time to first token therefore equals the whole generation time, and
+cancelling waits for the subprocess (bounded by `--timeout`). The gateway does
+not fake token pacing. Use `--claude-transport http` when you need streaming.
 
 For direct Anthropic Messages requests instead, set
 `MUSE_GATEWAY_CLAUDE_TRANSPORT=http`. That mode reads HTTP credentials from
 supported Claude credential storage or the environment, including
-`ANTHROPIC_API_KEY` for API-key billing. Set
-`MUSE_GATEWAY_CLAUDE_CREDENTIALS` to use an explicit credential file. HTTP mode
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_REFRESH_TOKEN`, and `ANTHROPIC_API_KEY`
+for API-key billing. Use `--claude-credentials` for an explicit credential file. HTTP mode
 does not require the CLI for inference, and supports credential refresh where
 the stored login provides it.
 
 Claude does not support restoring turns with `previous_response_id`; send the
-conversation history inline. Native signed-thinking replay is not supported.
+conversation history inline. A `previous_response_id` that is null or empty is
+ignored; one sent beside complete inline history is dropped and logged as
+`previous_response_id_dropped`; an ID with only a new prompt is rejected with
+`claude_previous_response_unsupported`. Native signed-thinking replay is not
+supported.
 
 ### Codex
 
@@ -152,11 +160,19 @@ codex login
 The gateway reads the existing credentials and lists `codex/<model-id>` entries.
 It uses the native Codex Responses backend directly, with OAuth refresh
 support; it does not start the Codex CLI for inference. `CODEX_HOME` or
-`MUSE_GATEWAY_CODEX_AUTH` can point it at another credential location.
+`--codex-auth-path` can point it at another credential location; for Claude,
+`CLAUDE_CONFIG_DIR` or `CLAUDE_CODE_CREDENTIALS_PATH` (or
+`--claude-credentials`) does the same. Native token
+injection via environment is retired; use CLI auth storage or `--access-token`.
+Codex drops the unsupported request `max_output_tokens` field; no output-cap
+guarantee is claimed for that route. Reserve/review slugs stay hidden from the
+menu; reserve quota retry and explicit routing remain available.
 
 Codex requests are stateless (`store=False`). When complete history is present,
 the gateway drops an unresolvable `previous_response_id` and sends that history
-instead. It also normalises Muse's replay item IDs without changing the IDs
+instead. An ID sent with only a new prompt (delta-only chaining) is rejected
+with `codex_previous_response_unsupported` rather than answered without
+context; Claude, Devin, and Kiro apply the same rule. It also normalises Muse's replay item IDs without changing the IDs
 that pair tool calls with their results, and folds text system messages into
 `instructions`.
 
@@ -178,18 +194,24 @@ devin auth login
 The gateway speaks Devin's Connect/protobuf API directly. The CLI is a source
 of credentials, not the process used for inference. Credential lookup uses:
 
-1. `MUSE_GATEWAY_DEVIN_API_KEY` (or `DEVIN_API_KEY`) for an explicit session token.
+1. `--devin-api-key` or standard `DEVIN_API_KEY` for an explicit session token.
 2. Your existing Devin CLI login.
-3. Your OMP login, normally in `~/.omp/agent/agent.db`.
+3. No authentication when neither is available.
 
-Use `MUSE_GATEWAY_DEVIN_AUTH_DB` for another OMP database and
-`MUSE_GATEWAY_DEVIN_CREDENTIAL_ID` to select a particular stored credential.
-Without an explicit ID the first usable stored row wins (expired and
-rejected logins are skipped); an explicit credential ID targets the store
-instead of the CLI login. `doctor --doctor-provider devin` lists every
-active row with its id, identity, and expiry so you can pick one.
-There is no refresh grant in this integration; an expired or rejected login
-means signing in again.
+`doctor --doctor-provider devin` reports readiness without showing tokens.
+Credentials are read-only. The gateway does not read credential databases,
+select stored rows, or read/write a saved credential preference.
+Retired database, credential-ID, and default-file options now fail with a
+value-free diagnostic; remove them from flags and environment/config files.
+Existing saved preferences are unused and are not modified.
+There is no refresh grant in this integration; a rejected login requires
+signing in again. A rejected explicit token is not silently replaced by the
+CLI login.
+
+If Devin's auth response directs chat traffic to another server
+(`custom_api_server_url`), that server must use HTTPS unless it is loopback;
+the gateway logs the redirect once. A `--devin-upstream http://…` on a
+non-loopback host is allowed for on-premises setups but warns at startup.
 
 Select a `devin/<model-id>` entry. Discovery uses the active credential and
 includes directly servable models, routers, and supported effort lanes. Fusion
@@ -230,11 +252,29 @@ Then launch from the project you want Muse to work in:
 python -m muse_gateway launch --env-file /path/to/private.env --port 8791
 ```
 
-Keep Kiro Gateway running; our launcher does not start or stop it. The
+Keep Kiro Gateway running; our launcher does not start or stop it unless
+you opt into autostart below. The
 muse-gateway port must be free: Kiro-configured launches do not attach to an
 existing gateway, whose proxy settings might differ. For local use, bind the
 separate Kiro Gateway service to loopback too (`SERVER_HOST=127.0.0.1` in its
 configuration). Remote Kiro endpoints require verified HTTPS.
+
+#### Auto-start (optional)
+
+`launch` can start the checkout for you when its loopback service is down:
+
+```bash
+python -m muse_gateway launch --kiro-autostart --kiro-server-dir ~/kiro-gateway
+```
+
+(Autostart and its checkout are CLI flags only — `--kiro-autostart` and
+`--kiro-server-dir`; no environment or file setting enables them.) Only
+loopback upstreams are autostarted; the checkout's `.venv` python runs
+`main.py --port <upstream-port>`, its output goes to `autostart.log` in the
+checkout (appended, never rotated; delete it by hand if it grows), and the
+service stops when `launch` exits. The startup line reports
+`service already running`, `service autostarted (pid N)`, or the failure
+reason. Bare `run`/serve mode never autostarts.
 
 #### Models
 
@@ -242,12 +282,29 @@ Choose a `kiro/<model-id>` entry in `/model`. The prefix is removed before
 forwarding; `kiro:` also works. In auto mode, an unprefixed Claude name still
 uses the native Claude route.
 
-Models come from the service's authenticated `/v1/models` endpoint. Optional
-`MUSE_GATEWAY_KIRO_MODELS` curates that list; `--kiro-models` takes precedence.
-An explicit list stays restricted after an account upgrade. You can supply
-current IDs if the service's catalog is stale, or when discovery is disabled.
-Listed IDs are not proof of account access or tested capabilities. Without a
-proxy key, there are no automatic Kiro entries or discovery calls.
+Models come from the service's authenticated `/v1/models` endpoint.
+`MUSE_GATEWAY_MODELS` optionally filters exact IDs such as
+`kiro/claude-haiku-4.5`; it cannot supply new rows or establish entitlement.
+Discovery names lacking exact capacity metadata stay internally known and
+directly routable, but are omitted from the numeric menu with a diagnostic.
+Without a proxy key, there are no automatic Kiro entries or discovery calls.
+
+Some upstream Kiro Gateway development revisions skip discovery for runtime
+endpoints and serve a bundled static list. Two Kiro-side options are provided:
+
+- **Native autodiscovery:** apply [kiro-model-discovery.patch](errata/kiro-model-discovery.patch)
+  to the pinned clean upstream base. It restores discovery through the native
+  management API without changing inference or web-search endpoints.
+- **Static configuration:** copy the `FALLBACK_MODELS` declaration from
+  [models.py.example](errata/models.py.example) into Kiro Gateway's existing
+  `kiro/config.py`. This one-time working-catalog snapshot needs no loader or
+  discovery patch. Do not replace the whole configuration file.
+
+See [Kiro discovery errata](errata/kiro-model-discovery.md) for the base revision,
+application instructions, upstream PR attribution, and limitations. Restart
+Kiro after applying either option. Muse still autodiscovers from Kiro; no
+model-list override is needed. The patch is separately licensed
+under [Kiro's AGPL license](errata/KIRO-LICENSE), not Muse Gateway's MIT license.
 
 #### Behavior and caveats
 
@@ -273,10 +330,12 @@ proxy key, there are no automatic Kiro entries or discovery calls.
   thinking/search tools, recovery turns, and history trimming. These are not
   muse-gateway settings; per-request thinking does not override every global
   service setting. Our adapter adds no history trimming or inference retries.
-- **Budgets:** `MUSE_GATEWAY_KIRO_CONTEXT_LIMIT` (65,536) and
-  `MUSE_GATEWAY_KIRO_OUTPUT_LIMIT` (8,192) are configurable, **unverified**
-  planning hints, not measured capacity or backend-enforced caps. The separate
-  service also has a payload byte-size limit.
+- **Capacities:** exact registry fields preserve the approved values, with
+  documented and user-approved provenance distinguished. Unknown IDs receive
+  no provider-wide capacity guesses. Budget overrides and the global output
+  cap were removed. Per-request output is translated to `max_tokens`, bounded
+  by known output metadata; Kiro Gateway does not guarantee a hard cap.
+  The separate service also has a payload byte-size limit.
 
 For errors, retry hints, and cancellation limits, see [Logs and doctor](#logs-and-doctor).
 Muse may label a Kiro 401 as a Meta-key error; check the gateway's route and
@@ -298,8 +357,8 @@ settings, and edit them for your endpoint:
 ```dotenv
 MUSE_GATEWAY_LOCAL_UPSTREAM=http://127.0.0.1:4000/v1
 MUSE_GATEWAY_LOCAL_API_KEY=replace-with-your-upstream-key
-# Optional: restrict the menu to these upstream IDs.
-# MUSE_GATEWAY_LOCAL_MODELS=my-coder,my-reasoner
+# Optional: filter the menu by exact IDs, without inventing models.
+# MUSE_GATEWAY_MODELS=local/my-coder,meta/muse-spark-1.3
 ```
 
 Run from your working project, giving the config file's location explicitly:
@@ -308,21 +367,22 @@ Run from your working project, giving the config file's location explicitly:
 python -m muse_gateway launch --env-file /path/to/muse-gateway/.env
 ```
 
-The gateway discovers IDs from the upstream's `GET /models`. An explicit model
-list curates those names. Discovery reads advertised context/output limits and
-image-input capabilities; missing local limits fall back to 128,000 context
-and 32,768 output tokens, labelled **limits unverified**. Without image
-evidence, entries advertise text input only. For an Ollama URL ending in `/v1`,
-`/api/tags` is a discovery fallback.
+The gateway discovers IDs, context/output capacities, and image-input
+capabilities from the upstream's `GET /models`. `MUSE_GATEWAY_MODELS` filters
+those entries without creating models or changing capacities. Models missing
+required capacity metadata are reported and omitted from the numeric menu;
+there is no provider-wide capacity guess. Without image evidence, entries
+advertise text input only. For an Ollama URL ending in `/v1`, `/api/tags` can
+discover names, but those names still need capacity metadata to appear.
 
 Local requests flatten namespace tools and rewrite qualified historical call
 names to match. Tools must arrive as structured function calls; XML-like tool
 syntax in ordinary response text is not converted.
 
-A local API key enables launcher preflight. A keyless server can still be
-configured, but preflight is skipped and the gateway may forward Muse's bearer
-when no dedicated route key is set. Use a dedicated upstream key where possible;
-see [security](#security).
+A configured local upstream enables preflight whether or not it needs a key.
+The gateway sends only `MUSE_GATEWAY_LOCAL_API_KEY` when set. A keyless local
+server receives no Authorization header; Muse's subscription credential and
+other providers' keys are never borrowed. See [security](#security).
 
 For a single Responses endpoint without the combined menu, the separate
 `generic` (also `http`) server mode is available. Its default upstream is
@@ -330,15 +390,28 @@ OpenRouter; it is not another route in auto mode.
 
 ## Configuration and launch options
 
-Settings use `MUSE_GATEWAY_*`. The older `MUSE_SHIM_*` names remain fallbacks;
-the newer spelling wins when both are set. Flags override environment values,
-and the launcher loads nonempty `.env` values only where the same environment
-variable is not already set. Use the newer names consistently to avoid mixing
-aliases across configuration sources.
+Connection and diagnostic settings use `MUSE_GATEWAY_*`. Provider credentials
+use their standard names (`DEVIN_API_KEY`, `META_API_KEY`, and the supported
+Claude variables). Flags override the current environment, which overrides
+file values; an explicitly blank environment value is preserved.
+
+Removed settings and `MUSE_SHIM_*` names are not read as aliases. They produce
+migration guidance without exposing values; conflicting old/new settings fail.
+Removed gateway flags fail before they can be forwarded to Muse.
+
+Commonly needed flags that otherwise appear only in `--help`: `--models`
+(print the catalog and exit; put it first with the Bash wrapper),
+`--log-file PATH` (diagnostic log location), and the per-provider
+`--meta-upstream`, `--codex-upstream`, `--claude-upstream`, `--devin-upstream`,
+`--kiro-upstream`, and `--local-upstream` spellings (there are no
+`--*-base-url` flags).
 
 Use `--env-file PATH` after `launch` to choose a file. Otherwise it looks beside
-`muse_gateway.py`, then in the current directory. The source wrappers explicitly
-use `.env` beside the scripts. Installing the package does not copy your source
+`muse_gateway.py` only — the current directory's `.env` is never loaded
+implicitly, because the working directory is the (untrusted) project under edit.
+A named `--env-file` that does not exist is an error. Startup prints a
+`config:` line naming the file loaded (or `config: no env file`). The source
+wrappers pass `.env` beside the scripts only when that file exists. Installing the package does not copy your source
 checkout's `.env`, and no launcher creates one automatically. Environment
 changes do not reconfigure an already running gateway that a launcher reuses.
 
@@ -346,21 +419,51 @@ Common settings (the provider sections above explain authentication):
 
 | Setting | Purpose |
 | --- | --- |
-| `MUSE_GATEWAY_HOST`, `MUSE_GATEWAY_PORT` | Listener; defaults to `127.0.0.1:8787` |
-| `MUSE_GATEWAY_PROVIDER` | Low-level server mode; `launch` always uses `auto` |
-| `MUSE_GATEWAY_META_MODELS` | Curate Meta model IDs; discovery enriches their limits |
-| `MUSE_GATEWAY_CODEX_MODELS`, `MUSE_GATEWAY_CLAUDE_MODELS` | Set fallback model IDs; discovery can add models |
-| `MUSE_GATEWAY_DEVIN_MODELS` | Restrict Devin discovery to selected IDs |
-| `MUSE_GATEWAY_KIRO_UPSTREAM`, `MUSE_GATEWAY_KIRO_API_KEY`, `MUSE_GATEWAY_KIRO_MODELS` | Separate Kiro Gateway endpoint, proxy key, and optional curated IDs |
-| `MUSE_GATEWAY_KIRO_CONTEXT_LIMIT`, `MUSE_GATEWAY_KIRO_OUTPUT_LIMIT` | Unverified positive Muse planning budgets; not backend-enforced capacities |
-| `MUSE_GATEWAY_LOCAL_UPSTREAM`, `MUSE_GATEWAY_LOCAL_API_KEY`, `MUSE_GATEWAY_LOCAL_MODELS` | Local endpoint, key, and model list |
-| `MUSE_GATEWAY_UPSTREAM`, `MUSE_GATEWAY_API_KEY` | Generic endpoint/key; the generic key is also a fallback for local requests |
-| `MUSE_GATEWAY_NO_MODEL_DISCOVERY=1` | Disable discovery and use configured/bundled models |
-| `MUSE_GATEWAY_MAX_OUTPUT_TOKENS` | Cap requested output tokens; backend enforcement depends on the route (not enforced by Kiro Gateway) |
-| `MUSE_GATEWAY_PORTABLE=1` | Remove reasoning/cache fields on non-Meta routes |
-| `MUSE_GATEWAY_TIMEOUT` | Upstream timeout in seconds; default 600 |
-| `MUSE_GATEWAY_LOG_FILE`, `MUSE_GATEWAY_VERBOSE=1` | Log path and extra HTTP access events |
-| `MUSE_GATEWAY_CAPTURE_DIR` | Opt-in private wire captures; contains conversation content |
+| `MUSE_GATEWAY_PORT` | Listener port; default 8787 on loopback |
+| `MUSE_GATEWAY_TIMEOUT` | Upstream I/O timeout; default 600 seconds |
+| `MUSE_GATEWAY_LOG_FILE` | Rotating diagnostics; default working-directory log |
+| `--capture-dir` (CLI flag only) | Opt-in private captures; off by default |
+| `MUSE_GATEWAY_MODELS` | Optional exact provider/model menu allowlist; unset/blank shows all available |
+| `MUSE_GATEWAY_LOCAL_UPSTREAM` | Local Responses service; unset disables local routing |
+| `MUSE_GATEWAY_LOCAL_API_KEY` | Optional local-only credential; unset sends no Authorization header |
+| `MUSE_GATEWAY_CLAUDE_TRANSPORT` | `cli` (default) or direct Messages `http` |
+| `MUSE_GATEWAY_CLAUDE_CLI_PASSTHROUGH` / `--claude-cli-passthrough` | Which Claude credential vars the `claude -p` child may inherit: `oauth` (default), `api-key`, `all`, `none`. Server-side policy of the serving gateway |
+| `MUSE_GATEWAY_KIRO_UPSTREAM` | Separate Kiro Gateway; default loopback port 8000, `/v1` |
+| `MUSE_GATEWAY_KIRO_API_KEY` | Kiro Gateway proxy key only |
+| `--kiro-autostart` (CLI flag only) | Start the configured local checkout if needed; off by default |
+| `--kiro-server-dir` (CLI flag only) | Checkout for autostart; default `~/kiro-gateway` |
+
+`MUSE_GATEWAY_MODELS` only filters the menu. It preserves backend ordering,
+never fabricates models, and does not block direct requests or remove internal
+capability metadata. Unresolved IDs produce a diagnostic.
+
+Model capacities resolve each field independently: positive backend metadata,
+then the exact routed-model fallback in the packaged [provider catalogs](providers/),
+otherwise missing. Context/output sources are recorded separately. There are
+no global or provider-wide capacity overrides or global response-length setting.
+
+Each provider has a JSON catalog: [Meta](providers/meta.json),
+[Codex](providers/codex.json), [Claude](providers/claude.json),
+[Kiro](providers/kiro.json), [Devin](providers/devin.json), and
+[local](providers/local.json). These contain exact model IDs, capacity fallbacks,
+per-field provenance, and ordered fallback rosters. Meta also supplies its
+fallback effort metadata; Devin supplies its fallback labels/capabilities.
+The local catalog is deliberately empty: no capacities are invented.
+
+Backend values win. Catalog membership never grants account access, and
+successful Devin discovery replaces the fallback roster rather than adding
+absent supplemental models. Fallback rosters apply only when discovery is
+unavailable or disabled. Catalogs are packaged with the application, validated
+once at startup, and loaded independently of the working directory. In a
+source checkout or editable install, update fallback data by editing the relevant
+JSON catalog; no Python edits or new environment settings are needed. A regular
+`pip install` copies the catalogs into site-packages, so edits there are
+overwritten on upgrade. Invalid data fails clearly instead of silently disappearing.
+
+Advanced operations stay CLI-only: `--host`, `--provider`, `--model`,
+`--no-model-discovery`, `--portable` (local/generic only), `--max-body-bytes`,
+`--insecure-upstream`, `--verbose`, credential/executable paths, and guarded
+native endpoint overrides. See `python -m muse_gateway --help`.
 
 Use the installed command or the matching Python module form:
 
@@ -393,10 +496,9 @@ bash ./muse-gateway resume <session-id>
 
 You can invoke those scripts by absolute path from another project. The
 PowerShell wrapper also accepts `-EnvFile`, `-MuseBin`, `-LogFile`,
-`-LocalUpstream`, `-LocalApiKey`, and `-LocalModels`. Prefer config/environment
-settings to command-line secrets. Kiro options are `-KiroUpstream`, `-KiroApiKey`,
-`-KiroModels`, `-KiroContextLimit`, and `-KiroOutputLimit`, corresponding to the
-same `--kiro-*` launch flags. With `powershell -File`, omit the `--`
+`-LocalUpstream` and `-LocalApiKey`. Prefer environment settings to command-line
+secrets. Kiro options are `-KiroUpstream`, `-KiroApiKey`, `-KiroServerDir`, and
+`-KiroAutostart`, corresponding to the same `--kiro-*` launch flags. With `powershell -File`, omit the `--`
 separator and pass Muse arguments directly.
 
 ### Manual server setup
@@ -408,15 +510,17 @@ server's environment, then start:
 python -m muse_gateway auto
 ```
 
-The low-level server does **not** load `.env`. In your working project, run
-Muse with `META_API_KEY` unset for subscription authentication:
+Server, doctor, model listing, and launch use the same `--env-file` loading
+rules. In your working project, run Muse with `META_API_KEY` unset for
+subscription authentication:
 
 ```bash
 muse --provider meta --base-url http://127.0.0.1:8787
 ```
 
-For Meta API-key billing, set `MUSE_GATEWAY_META_API_KEY` on the server and the
-appropriate `META_API_KEY` for Muse instead of using the subscription launcher.
+For Meta API-key billing, set standard `META_API_KEY` on the server (or use
+`--meta-api-key`) and the appropriate `META_API_KEY` for Muse instead of using
+the subscription launcher.
 
 `python -m muse_gateway --help` lists server flags and modes, including `devin`
 and `kiro`.
@@ -442,9 +546,9 @@ Health and catalog checks confirm the listener and model listing, not inference.
   Successful discovery is cached for an hour; failed/empty discovery retries
   after a minute. Restart to refresh immediately, or fetch the catalog with
   `Cache-Control: no-cache`.
-- **Local startup fails:** verify the endpoint/key and its model listing, or
-  configure an explicit local model list. Explicit IDs bypass discovery checks,
-  not inference requirements.
+- **Local startup fails:** verify the endpoint, optional key, and its model
+  metadata. The menu requires context and output capacities; a menu allowlist
+  cannot substitute for missing metadata or create an available model.
 - **Devin authentication fails:** sign in again; the gateway does not refresh
   that login. A token rejected during this gateway process is quarantined in
   memory, so restart after replacing a bad token if needed.
@@ -472,6 +576,12 @@ be writable; startup fails if logging cannot be opened. Use distinct paths for
 separate gateway processes. If a launcher reuses a server, inspect that
 server's log, not a newly chosen path in the attaching terminal.
 
+Under WSL or with more than one home directory (for example a Windows and a
+Linux login), the gateway reads credentials from the home of the process that
+runs it. If `doctor` reports a credential as not found, check that the CLI
+login lives in that same home; a symlinked credential file is followed like any
+other path.
+
 Records contain request IDs, routes/models, recognised effort, item counts,
 HTTP status, and error categories. Ordinary logs exclude prompts, tool
 arguments/results, response text, authorization headers, and raw error bodies.
@@ -496,8 +606,8 @@ default). Do not assume immediate upstream cancellation or stopped billing
 when closing the client. A forced-disconnect check does not establish how
 Muse's Escape-key cancellation behaves.
 
-Doctor reads the environment, not `.env`, and checks configuration/credential
-availability rather than running an inference request:
+Doctor loads the same configuration file and environment as the other entry
+points. It checks configuration/credential availability, not inference:
 
 ```bash
 python -m muse_gateway doctor --doctor-provider codex
@@ -509,9 +619,9 @@ python -m muse_gateway doctor --doctor-provider local
 
 Bare `doctor` checks the default routes and configured local/Kiro routes. It can
 report Meta as not ready without a static key even when subscription forwarding
-will work once Muse sends its bearer. For local models, keyless setups or
-unusable discovery can also make doctor report not ready; that is a preflight
-result, not an attempted model turn.
+will work once Muse sends its bearer. For local models, unusable discovery or
+missing capacities make doctor report not ready; an optional missing key alone
+does not. These are preflight results, not attempted model turns.
 
 Kiro preflight distinguishes a configured proxy key from an authenticated
 catalog response. Neither means inference has been validated. It does not
@@ -535,7 +645,7 @@ a private destination outside the repository:
 python -m muse_gateway --capture-dir "$env:TEMP\muse-gateway-captures" launch --port 8791
 ```
 
-`MUSE_GATEWAY_CAPTURE_DIR` enables the same mode. `/health` identifies the
+Capture is enabled only by the `--capture-dir` CLI flag. `/health` identifies the
 capture session as well as the process/source. Each gateway request gets its
 own directory containing request transforms, outgoing bytes, upstream headers
 and error bodies, downstream HTTP/SSE bytes, and a monotonic read/frame/write
@@ -552,6 +662,9 @@ data, capture errors, byte counts, and terminal events. Even a complete capture
 is transport evidence: correlate it with Muse's completion or decoder error.
 See [SECURITY.md](SECURITY.md) before sharing any files.
 
+Captures are operator-owned forensic data. The gateway never deletes or
+rotates them; remove capture directories by hand when the diagnosis is done.
+
 ## Compatibility
 
 Muse's protocol can change between releases. Re-run consumer compatibility
@@ -560,9 +673,9 @@ checks after updating Muse; they are specific to the executable being tested.
 and which account/TUI workflows still need verification.
 
 Advertised model limits are discovery data or fallbacks, not measurements.
-Local/Meta, Kiro planning budgets, and undiscovered Devin limits are marked
-unverified; legacy native fallback labels are not proof of live-verified limits
-either. Model quality,
+Each capacity field is labeled by source: live backend evidence, documented
+fallback, user-approved fallback, or bundled seed. Verification means the
+backend supplied both limits; nothing else is proof of live-verified limits. Model quality,
 tool reliability, and features such as signed reasoning remain provider-specific.
 Switching providers does not make their opaque reasoning state interchangeable.
 
@@ -571,11 +684,12 @@ Switching providers does not make their opaque reasoning state interchangeable.
 Keep the listener on loopback. There is no client authentication or multi-tenant
 isolation; `--allow-non-loopback` requires your own access controls.
 
-Only configure upstreams you trust. Local requests use the local key, then the
-generic gateway key, then incoming authorization. Meta uses its static route
-key or incoming authorization. Without a dedicated key, your configured server
-may receive Muse's subscription bearer. A custom Meta URL also receives native
-Meta payloads; an OpenAI-compatible label alone does not establish support.
+Only configure upstreams you trust. Local requests use only the optional local
+key; without one they send no Authorization header. Generic keys and Muse's
+subscription credential are never forwarded to the local service. Meta uses
+its explicit API key or incoming Muse authorization. A custom Meta URL receives
+that authorization and native Meta payloads; an OpenAI-compatible label alone
+does not establish support.
 
 The Kiro route requires its own proxy key and never forwards Muse's bearer or
 native Claude credentials. Plain HTTP is allowed only for loopback Kiro
@@ -601,6 +715,7 @@ attribution. Devin protocol adaptations also retain the upstream notices in
 Kiro Gateway remains a separate service under its own license. Its source is
 not bundled or copied into this project.
 
-The `muse_shim` module, `muse-shim` console command and wrapper, `MUSE_SHIM_*`
-settings, older health-service identifiers, and `shim_error` wire type remain
-for compatibility. The project name is **muse-gateway**.
+The `muse_shim` module, `muse-shim` console command and wrapper, older
+health-service identifiers, and `shim_error` wire type remain for compatibility.
+`MUSE_SHIM_*` settings are retired and produce migration guidance, not aliases.
+The project name is **muse-gateway**.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import http.client
 import datetime as _datetime
 import hashlib
 import json
@@ -21,6 +22,7 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -386,7 +388,7 @@ def _walk_path(data: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any] | 
 def _file_source_label(provider: str, path: Path, configured: bool = False) -> str:
     if provider == "codex":
         return "CODEX_HOME/auth.json" if configured else "~/.codex/auth.json"
-    return "CLAUDE_CODE_CREDENTIALS" if configured else "~/.claude/.credentials.json"
+    return "CLAUDE_CODE_CREDENTIALS_PATH or CLAUDE_CONFIG_DIR" if configured else "~/.claude/.credentials.json"
 
 
 def _candidate_codex_paths(config: Any) -> list[tuple[Path, bool]]:
@@ -411,8 +413,6 @@ def _candidate_codex_paths(config: Any) -> list[tuple[Path, bool]]:
 def _candidate_claude_paths(config: Any) -> list[tuple[Path, bool]]:
     explicit = str(
         getattr(config, "claude_credentials", "")
-        or os.environ.get("MUSE_GATEWAY_CLAUDE_CREDENTIALS", "")
-        or os.environ.get("MUSE_SHIM_CLAUDE_CREDENTIALS", "")
         or os.environ.get("CLAUDE_CODE_CREDENTIALS_PATH", "")
     ).strip()
     config_dir = str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip()
@@ -466,42 +466,11 @@ def _state_from_file(
     )
 
 
-def _env_first(names: Iterable[str]) -> tuple[str, str] | tuple[None, None]:
-    for name in names:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return name, value
-    return None, None
-
-
 def discover_codex_credentials(config: Any) -> CredentialState | None:
-    env_name, access = _env_first(
-        (
-            "MUSE_GATEWAY_CODEX_ACCESS_TOKEN",
-            "MUSE_SHIM_CODEX_ACCESS_TOKEN",
-            "CODEX_ACCESS_TOKEN",
-            "OPENAI_CODEX_ACCESS_TOKEN",
-        )
-    )
-    if not access:
-        access = str(getattr(config, "access_token", "") or "").strip()
-        env_name = "command line" if access else None
+    access = str(getattr(config, "access_token", "") or "").strip()
     if access:
-        _, refresh = _env_first(
-            (
-                "MUSE_GATEWAY_CODEX_REFRESH_TOKEN",
-                "MUSE_SHIM_CODEX_REFRESH_TOKEN",
-                "CODEX_REFRESH_TOKEN",
-            )
-        )
-        return CredentialState(
-            provider="codex",
-            access_token=access,
-            refresh_token=refresh or None,
-            expires_at=token_expiry(access),
-            source=env_name or "environment",
-            path=None,
-        )
+        return CredentialState(provider="codex", access_token=access,
+                               expires_at=token_expiry(access), source="command line")
 
     for path, configured in _candidate_codex_paths(config):
         if not _credential_file_is_readable(path):
@@ -567,25 +536,11 @@ def _read_claude_keychain() -> CredentialState | None:
 
 
 def discover_claude_credentials(config: Any) -> CredentialState | None:
-    env_name, token = _env_first(
-        (
-            "MUSE_GATEWAY_CLAUDE_ACCESS_TOKEN",
-            "MUSE_SHIM_CLAUDE_ACCESS_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "ANTHROPIC_TOKEN",
-        )
-    )
-    if not token:
-        token = str(getattr(config, "access_token", "") or "").strip()
-        env_name = "command line" if token else None
+    token = str(getattr(config, "access_token", "") or "").strip()
+    env_name = "command line" if token else "CLAUDE_CODE_OAUTH_TOKEN"
+    token = token or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if token:
-        refresh_name, refresh = _env_first(
-            (
-                "MUSE_GATEWAY_CLAUDE_REFRESH_TOKEN",
-                "MUSE_SHIM_CLAUDE_REFRESH_TOKEN",
-                "CLAUDE_CODE_REFRESH_TOKEN",
-            )
-        )
+        refresh = os.environ.get("CLAUDE_CODE_REFRESH_TOKEN", "").strip()
         if not _is_oauth_token(token):
             return CredentialState(
                 provider="claude",
@@ -602,7 +557,8 @@ def discover_claude_credentials(config: Any) -> CredentialState | None:
         )
 
     api_key = str(
-        getattr(config, "api_key", "") or os.environ.get("ANTHROPIC_API_KEY", "")
+        (getattr(config, "api_key", "") if getattr(config, "provider", None) == "claude" else "")
+        or os.environ.get("ANTHROPIC_API_KEY", "")
     ).strip()
     if api_key:
         if _is_oauth_token(api_key):
@@ -662,6 +618,82 @@ def discover_claude_credentials(config: Any) -> CredentialState | None:
     return _read_claude_keychain()
 
 
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """This scoped opener never follows a redirect to another origin."""
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int] | None:
+        try:
+            parts = urllib.parse.urlsplit(url)
+            scheme, host, port = parts.scheme.lower(), parts.hostname, parts.port
+        except ValueError:
+            return None
+        if scheme not in {"http", "https"} or not host:
+            return None
+        if port is None:
+            port = 443 if scheme == "https" else 80
+        return scheme, host.lower(), port
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        src, dst = self._origin(req.full_url), self._origin(newurl)
+        if src is None or dst is None or src != dst:
+            raise urllib.error.HTTPError(
+                req.full_url, code, "refusing cross-origin or malformed redirect",
+                headers, fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        try:
+            return super().http_error_302(req, fp, code, msg, headers)
+        except ValueError as error:
+            raise urllib.error.HTTPError(
+                req.full_url, code, "refusing malformed redirect", headers, fp,
+            ) from error
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def _is_loopback_host(host: str) -> bool:
+    value = (host or "").strip().lower().rstrip(".")
+    if value in {"localhost", "::1", "[::1]"}:
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def build_gateway_opener(
+    url: str | None = None,
+    *,
+    ssl_context: Any = None,
+    loopback_proxy_bypass: bool = False,
+) -> urllib.request.OpenerDirector:
+    """Scoped opener for credentialed calls: same-origin redirects only.
+
+    Loopback destinations (or an explicit ``loopback_proxy_bypass``) get an
+    empty ``ProxyHandler`` so an environment proxy never sees a credentialed
+    loopback request.
+    """
+    handlers: list[Any] = [
+        _SameOriginRedirectHandler(),
+        urllib.request.HTTPSHandler(context=ssl_context),
+    ]
+    bypass = loopback_proxy_bypass
+    if url:
+        try:
+            host = urllib.parse.urlsplit(url).hostname or ""
+        except ValueError:
+            host = ""
+        bypass = bypass or _is_loopback_host(host)
+    if bypass:
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
+
+
 def _urlopen(
     request: urllib.request.Request,
     *,
@@ -669,8 +701,11 @@ def _urlopen(
     opener: Callable[..., Any] | None = None,
 ) -> Any:
     if opener is not None:
+        open_method = getattr(opener, "open", None)
+        if callable(open_method):
+            return open_method(request, timeout=timeout)
         return opener(request, timeout=timeout)
-    return urllib.request.urlopen(request, timeout=timeout)
+    return build_gateway_opener(request.full_url).open(request, timeout=timeout)
 
 
 def _http_status(error: BaseException) -> int | None:
@@ -681,7 +716,7 @@ def _http_status(error: BaseException) -> int | None:
 def _json_response(response: Any) -> dict[str, Any]:
     try:
         value = json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError) as exc:
+    except (OSError, http.client.HTTPException, UnicodeError, json.JSONDecodeError, AttributeError) as exc:
         raise ProviderError("OAuth endpoint returned invalid JSON.", status=502, code="oauth_invalid_json") from exc
     if not isinstance(value, dict):
         raise ProviderError("OAuth endpoint returned an invalid response.", status=502, code="oauth_invalid_response")
@@ -736,7 +771,7 @@ def refresh_codex_oauth(
             f"Codex OAuth refresh failed (HTTP {status}). Run `codex login` and try again.",
             code="codex_refresh_failed",
         ) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
         raise ProviderError("Codex OAuth refresh could not reach the token service.", status=502, code="codex_refresh_unreachable") from exc
 
     access = payload.get("access_token") or payload.get("accessToken")
@@ -802,7 +837,7 @@ def refresh_claude_oauth(
         try:
             with _urlopen(request, timeout=timeout, opener=opener) as response:
                 payload = _json_response(response)
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
             last_error = exc
             continue
         access = payload.get("access_token") or payload.get("accessToken")
@@ -833,42 +868,93 @@ def refresh_claude_oauth(
     ) from last_error
 
 
-@contextmanager
-def _credential_refresh_lock(path: Path) -> Iterator[None]:
-    """Serialize file-backed refreshes when POSIX locking is available.
+_REFRESH_LOCKS: dict[str, threading.Lock] = {}
+_REFRESH_LOCKS_GUARD = threading.Lock()
+_RETAINED_FILELESS: dict[str, CredentialState] = {}
+_RETAINED_GUARD = threading.Lock()
 
-    The lock is advisory and only coordinates processes that use this gateway's
-    lock file. Provider CLIs that ignore it remain outside that coordination.
+
+def _refresh_thread_lock(key: str) -> threading.Lock:
+    with _REFRESH_LOCKS_GUARD:
+        return _REFRESH_LOCKS.setdefault(key, threading.Lock())
+
+
+def _fileless_key(state: CredentialState) -> str:
+    return f"fileless:{state.provider}:{state.source}"
+
+
+def _retained_fileless_state(state: CredentialState) -> CredentialState | None:
+    with _RETAINED_GUARD:
+        retained = _RETAINED_FILELESS.get(_fileless_key(state))
+        return copy.copy(retained) if retained is not None else None
+
+
+def _retain_fileless_state(state: CredentialState) -> None:
+    with _RETAINED_GUARD:
+        _RETAINED_FILELESS[_fileless_key(state)] = copy.copy(state)
+
+
+@contextmanager
+def _credential_refresh_lock(path_or_key, *, path: Path | None = None) -> Iterator[None]:
+    """Serialize refreshes per credential source on every platform.
+
+    A per-source threading.Lock always serializes this process; a bounded
+    POSIX flock (or msvcrt byte lock on Windows) additionally coordinates
+    processes that use this gateway's lock file. The file lock is advisory:
+    provider CLIs that ignore it remain outside that coordination.
     """
-    if fcntl is None:
-        yield
-        return
-    lock_path = path.with_name(path.name + ".lock")
-    fd: int | None = None
-    try:
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(lock_path, flags, stat.S_IRUSR | stat.S_IWUSR)
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    except OSError as exc:
-        raise ProviderError(
-            "Could not lock the provider credential file safely.",
-            status=500,
-            code="credential_lock_failed",
-        ) from exc
-    finally:
-        if fd is not None:
+    key = str(path if path is not None else path_or_key)
+    with _refresh_thread_lock(key):
+        if path is None:
+            yield
+            return
+        lock_path = path.with_name(path.name + ".lock")
+        fd: int | None = None
+        try:
+            flags = os.O_CREAT | os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(lock_path, flags, stat.S_IRUSR | stat.S_IWUSR)
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
+                os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+            except (AttributeError, OSError):
                 pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:  # Windows byte-range lock (advisory, same contract)
+                        import msvcrt
+
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.1)
+            yield
+        except OSError as exc:
+            raise ProviderError(
+                "Could not lock the provider credential file safely.",
+                status=500,
+                code="credential_lock_failed",
+            ) from exc
+        finally:
+            if fd is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    else:
+                        import msvcrt
+
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except (OSError, ImportError):
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def _ensure_safe_credential_target(path: Path) -> None:
@@ -1052,12 +1138,11 @@ def resolve_codex_credentials(
         allow_override = bool(getattr(config, "allow_oauth_host_override", False))
         token_url = str(
             getattr(config, "codex_token_url", "")
-            or os.environ.get("MUSE_GATEWAY_CODEX_TOKEN_URL", "")
-            or os.environ.get("MUSE_SHIM_CODEX_TOKEN_URL", "")
             or DEFAULT_CODEX_TOKEN_URL
         )
-        if state.path is not None:
-            with _credential_refresh_lock(state.path):
+        lock_key = str(state.path) if state.path is not None else _fileless_key(state)
+        with _credential_refresh_lock(lock_key, path=state.path):
+            if state.path is not None:
                 latest = _reload_file_state(state)
                 if latest is None or not latest.access_token:
                     raise AuthError(
@@ -1070,27 +1155,32 @@ def resolve_codex_credentials(
                 ):
                     return latest
                 state = latest
-                if not state.refresh_token:
-                    raise AuthError(
-                        "Codex credentials have no refresh token. Run `codex login` and try again.",
-                        code="codex_missing_refresh_token",
-                    )
-                refreshed = refresh_codex_oauth(
-                    state.refresh_token,
-                    token_url=token_url,
-                    timeout=float(getattr(config, "timeout", 20.0) or 20.0),
-                    opener=opener,
-                    allow_host_override=allow_override,
+            else:
+                retained = _retained_fileless_state(state)
+                if retained is not None:
+                    if (
+                        retained.access_token != state.access_token
+                        and not force_refresh
+                        and not token_is_expiring(retained.access_token, retained.expires_at, skew_seconds=skew)
+                    ):
+                        return retained
+                    state = retained
+            if not state.refresh_token:
+                raise AuthError(
+                    "Codex credentials have no refresh token. Run `codex login` and try again.",
+                    code="codex_missing_refresh_token",
                 )
-                return _set_refreshed_state(state, refreshed)
-        refreshed = refresh_codex_oauth(
-            state.refresh_token,
-            token_url=token_url,
-            timeout=float(getattr(config, "timeout", 20.0) or 20.0),
-            opener=opener,
-            allow_host_override=allow_override,
-        )
-        return _set_refreshed_state(state, refreshed)
+            refreshed = refresh_codex_oauth(
+                state.refresh_token,
+                token_url=token_url,
+                timeout=min(20.0, float(getattr(config, "timeout", 20.0) or 20.0)),
+                opener=opener,
+                allow_host_override=allow_override,
+            )
+            result = _set_refreshed_state(state, refreshed)
+            if result.path is None:
+                _retain_fileless_state(result)
+            return result
     elif should_refresh and (
         force_refresh or (state.expires_at is not None and state.expires_at <= _now())
     ):
@@ -1124,14 +1214,11 @@ def resolve_claude_credentials(
     should_refresh = force_refresh or token_is_expiring(state.access_token, state.expires_at, skew_seconds=skew)
     if should_refresh and state.refresh_token:
         allow_override = bool(getattr(config, "allow_oauth_host_override", False))
-        urls = str(
-            getattr(config, "claude_token_url", "")
-            or os.environ.get("MUSE_GATEWAY_CLAUDE_TOKEN_URL", "")
-            or os.environ.get("MUSE_SHIM_CLAUDE_TOKEN_URL", "")
-        ).strip()
+        urls = str(getattr(config, "claude_token_url", None) or "").strip()
         token_urls = (urls,) if urls else CLAUDE_TOKEN_URLS
-        if state.path is not None:
-            with _credential_refresh_lock(state.path):
+        lock_key = str(state.path) if state.path is not None else _fileless_key(state)
+        with _credential_refresh_lock(lock_key, path=state.path):
+            if state.path is not None:
                 latest = _reload_file_state(state)
                 if latest is None or not latest.access_token:
                     raise AuthError(
@@ -1144,27 +1231,32 @@ def resolve_claude_credentials(
                 ):
                     return latest
                 state = latest
-                if not state.refresh_token:
-                    raise AuthError(
-                        "Claude credentials have no refresh token. Run `claude setup-token` or `claude login`.",
-                        code="claude_missing_refresh_token",
-                    )
-                refreshed = refresh_claude_oauth(
-                    state.refresh_token,
-                    token_urls=token_urls,
-                    timeout=float(getattr(config, "timeout", 20.0) or 20.0),
-                    opener=opener,
-                    allow_host_override=allow_override,
+            else:
+                retained = _retained_fileless_state(state)
+                if retained is not None:
+                    if (
+                        retained.access_token != state.access_token
+                        and not force_refresh
+                        and not token_is_expiring(retained.access_token, retained.expires_at, skew_seconds=skew)
+                    ):
+                        return retained
+                    state = retained
+            if not state.refresh_token:
+                raise AuthError(
+                    "Claude credentials have no refresh token. Run `claude setup-token` or `claude login`.",
+                    code="claude_missing_refresh_token",
                 )
-                return _set_refreshed_state(state, refreshed)
-        refreshed = refresh_claude_oauth(
-            state.refresh_token,
-            token_urls=token_urls,
-            timeout=float(getattr(config, "timeout", 20.0) or 20.0),
-            opener=opener,
-            allow_host_override=allow_override,
-        )
-        return _set_refreshed_state(state, refreshed)
+            refreshed = refresh_claude_oauth(
+                state.refresh_token,
+                token_urls=token_urls,
+                timeout=min(20.0, float(getattr(config, "timeout", 20.0) or 20.0)),
+                opener=opener,
+                allow_host_override=allow_override,
+            )
+            result = _set_refreshed_state(state, refreshed)
+            if result.path is None:
+                _retain_fileless_state(result)
+            return result
     elif should_refresh and (
         force_refresh or (state.expires_at is not None and state.expires_at <= _now())
     ):
@@ -1320,21 +1412,12 @@ def prepare_codex_request(body: Mapping[str, Any]) -> dict[str, Any]:
             prefix = f"{prior}\n\n" if prior else ""
             payload["instructions"] = f"{prefix}{system_text}"
     if payload.get("previous_response_id"):
-        # store=False keeps no server-side state, so a chained ID can never
-        # resolve upstream and forwarding it only produces an opaque 400.
-        # Observed Muse traffic carries the full conversation inline, so the
-        # ID is redundant: drop it and proceed with the complete turn. The
-        # drop is logged by the caller (never silent). Only a turn with no
-        # input at all is rejected, since there is nothing to forward.
-        if payload.get("input"):
-            payload.pop("previous_response_id", None)
-        else:
-            raise ProviderError(
-                "Codex response chaining is not supported by this stateless "
-                "gateway, and this turn carries no input to send instead. "
-                "Retry as a fresh turn with complete conversation input.",
-                code="codex_previous_response_unsupported",
-            )
+        # store=False keeps no server-side state (P1-06): drop only when the
+        # inline history is complete; reject delta-only chaining. The drop
+        # is logged by the caller (never silent).
+        payload = drop_or_reject_previous_response_id(
+            payload, code="codex_previous_response_unsupported"
+        )
     payload.pop("previous_response_id", None)
     history = payload.get("input")
     if isinstance(history, list):
@@ -1433,6 +1516,31 @@ def _flatten_tools(tools: Any) -> list[Any]:
     return result
 
 
+def response_socket(response: Any) -> Any:
+    """The socket under an http.client response, or None if not exposed."""
+    try:
+        sock = response.fp.raw._sock
+    except AttributeError:
+        return None
+    return sock if hasattr(sock, "settimeout") else None
+
+
+def set_response_idle_timeout(response: Any, seconds: float) -> bool:
+    """Switch an open http.client response socket to an idle budget (P1-09).
+
+    Returns False when this Python does not expose the socket; the caller
+    then keeps the connect timeout.
+    """
+    sock = response_socket(response)
+    if sock is None:
+        return False
+    try:
+        sock.settimeout(float(seconds))
+    except OSError:
+        return False
+    return True
+
+
 def _wire_tool_name(name: str, oauth: bool) -> str:
     if not oauth:
         return name
@@ -1468,6 +1576,12 @@ class ToolNameMap:
         if name in self.original_to_wire:
             return self.original_to_wire[name]
         wire = _wire_tool_name(name, self.oauth)
+        if wire in self.wire_to_original and self.wire_to_original[wire] != name:
+            wire = f"{wire}_{hashlib.sha256(name.encode()).hexdigest()[:8]}"
+            counter = 2
+            while wire in self.wire_to_original and self.wire_to_original[wire] != name:
+                wire = f"{wire}_{counter}"
+                counter += 1
         self.original_to_wire[name] = wire
         self.wire_to_original[wire] = name
         return wire
@@ -1625,6 +1739,124 @@ def _input_items(body: Mapping[str, Any]) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def drop_or_reject_previous_response_id(
+    body: Mapping[str, Any], *, code: str
+) -> dict[str, Any]:
+    """One previous_response_id policy for stateless routes (P1-06).
+
+    Falsy (None/""/absent) proceeds with the key stripped. Truthy with a
+    complete inline history drops the key (caller logs the drop). Truthy
+    with delta-only input is rejected. "Complete" is Kiro's predicate:
+    inline items include both a user/tool-output item and an
+    assistant/function-call item.
+    """
+    result = dict(body)
+    previous_id = result.pop("previous_response_id", None)
+    if previous_id is None or previous_id == "":
+        return result
+    items = [item for item in _input_items(result) if isinstance(item, dict)]
+    actual = [item for item in items if item.get("type") != "item_reference"]
+    has_user = any(
+        item.get("role") == "user" or item.get("type") == "function_call_output"
+        for item in actual
+    )
+    has_assistant = any(
+        item.get("role") == "assistant"
+        or item.get("type") == "function_call"
+        or (item.get("type") == "message" and item.get("role") is None)
+        for item in actual
+    )
+    if not isinstance(previous_id, str) or not has_user or not has_assistant:
+        raise ProviderError(
+            "This gateway has no durable response-state store; send complete "
+            "inline conversation input or start a fresh turn instead of "
+            "ID-only chaining.",
+            status=400,
+            code=code,
+        )
+    return result
+
+
+def request_tool_policy(body: Mapping[str, Any], *, route: str) -> tuple[str, str | None, bool]:
+    """Normalize request tool policy (P1-05): (choice, tool_name, serial).
+
+    choice is auto/none/required/named. Shapes this gateway cannot
+    represent are rejected by name, never silently treated as auto.
+    """
+    choice = body.get("tool_choice", "auto")
+    name: str | None = None
+    if isinstance(choice, dict):
+        kind = choice.get("type")
+        if kind in {"auto", "none", "required"}:
+            choice = kind
+        elif kind in {"function", "tool"}:
+            name = choice.get("name")
+            if not isinstance(name, str) and isinstance(choice.get("function"), dict):
+                name = choice["function"].get("name")
+            choice = "named"
+        else:
+            choice = "invalid"
+    elif isinstance(choice, str) and choice not in {"auto", "none", "required"}:
+        name, choice = choice, "named"
+    if choice is None:
+        choice = "auto"
+    if choice == "named" and (not isinstance(name, str) or not name.strip()):
+        choice = "invalid"
+    if choice not in {"auto", "none", "required", "named"}:
+        raise ProviderError(
+            "tool_choice must be auto, none, required, or a named function.",
+            code=f"{route}_unsupported_tool_choice",
+        )
+    parallel = body.get("parallel_tool_calls")
+    if parallel is not None and not isinstance(parallel, bool):
+        raise ProviderError(
+            "parallel_tool_calls must be a boolean when supplied.",
+            code=f"{route}_invalid_request",
+        )
+    return choice, name.strip() if isinstance(name, str) else None, parallel is False
+
+
+def _wire_call_id(original_call_id: str) -> str:
+    """Sanitize a history call ID into Anthropic's charset, injectively.
+
+    The muse_call_ namespace is reserved for encoded forms: literals already
+    inside it are themselves encoded, so a sanitized ID can never collide
+    with a passthrough ID.
+    """
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", original_call_id) and not original_call_id.startswith("muse_call_"):
+        return original_call_id
+    encoded = "muse_call_" + base64.urlsafe_b64encode(
+        original_call_id.encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    if len(encoded) > 64:
+        encoded = "muse_call_" + hashlib.sha256(
+            original_call_id.encode("utf-8")
+        ).hexdigest()[:48]
+    return encoded
+
+
+def _summary_text(summary: Any) -> str:
+    """Visible reasoning-summary text from str or summary_text arrays."""
+    if isinstance(summary, str):
+        return summary
+    if isinstance(summary, list):
+        return "\n".join(
+            part["text"] for part in summary
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _allocate_item_id(candidate: str, used: set) -> str:
+    allocated = candidate
+    counter = 2
+    while allocated in used:
+        allocated = f"{candidate}_{counter}"
+        counter += 1
+    used.add(allocated)
+    return allocated
+
+
 def _reasoning_config(body: Mapping[str, Any]) -> tuple[bool, str]:
     value = body.get("reasoning")
     if isinstance(value, dict):
@@ -1688,14 +1920,11 @@ def responses_to_anthropic(
     model_override: str | None = None,
     max_output_tokens: int | None = None,
 ) -> tuple[dict[str, Any], ToolNameMap]:
-    if "previous_response_id" in body:
-        raise ProviderError(
-            "Claude mode does not support previous_response_id because the gateway has no durable response-state store.",
-            code="claude_previous_response_unsupported",
-        )
+    if body.get("previous_response_id"):
+        body = drop_or_reject_previous_response_id(body, code="claude_previous_response_unsupported")
     model = str(model_override or body.get("model") or "").strip()
     if not model:
-        raise ProviderError("request is missing model; set MUSE_GATEWAY_MODEL or send model.", code="model_missing")
+        raise ProviderError("request is missing model; send model or pin one with --model in a provider-specific server mode.", code="model_missing")
     anthropic_tools, tool_names = convert_tools_to_anthropic(body.get("tools"), oauth=oauth)
     system_parts: list[dict[str, Any]] = []
     instructions = body.get("instructions", body.get("system"))
@@ -1704,7 +1933,7 @@ def responses_to_anthropic(
     messages: list[dict[str, Any]] = []
     call_ids: dict[str, str] = {}
 
-    for raw in _input_items(body):
+    for position, raw in enumerate(_input_items(body)):
         if not isinstance(raw, dict):
             continue
         item_type = str(raw.get("type") or "").strip()
@@ -1712,17 +1941,9 @@ def responses_to_anthropic(
             original_call_id = str(raw.get("call_id") or raw.get("id") or "").strip()
             if not original_call_id:
                 original_call_id = "call_" + hashlib.sha256(
-                    str(raw.get("name") or "tool").encode("utf-8")
+                    f"{raw.get('name') or 'tool'}:{position}".encode("utf-8")
                 ).hexdigest()[:16]
-            wire_call_id = original_call_id
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", wire_call_id):
-                wire_call_id = "muse_call_" + base64.urlsafe_b64encode(
-                    original_call_id.encode("utf-8")
-                ).decode("ascii").rstrip("=")
-                if len(wire_call_id) > 64:
-                    wire_call_id = "muse_call_" + hashlib.sha256(
-                        original_call_id.encode("utf-8")
-                    ).hexdigest()[:48]
+            wire_call_id = _wire_call_id(original_call_id)
             call_ids[wire_call_id] = original_call_id
             name = str(raw.get("name") or "").strip()
             if not name:
@@ -1760,13 +1981,15 @@ def responses_to_anthropic(
             original_call_id = str(raw.get("call_id") or "").strip()
             wire_call_id = next(
                 (wire for wire, original in call_ids.items() if original == original_call_id),
-                original_call_id,
+                _wire_call_id(original_call_id) if original_call_id else original_call_id,
             )
             block = {
                 "type": "tool_result",
                 "tool_use_id": wire_call_id,
                 "content": _tool_result_content(raw.get("output", "")),
             }
+            if raw.get("is_error") is True or str(raw.get("status") or "").lower() in {"failed", "error"}:
+                block["is_error"] = True
             if messages and messages[-1].get("role") == "user":
                 content = messages[-1].setdefault("content", [])
                 if isinstance(content, list):
@@ -1780,8 +2003,8 @@ def responses_to_anthropic(
         if item_type == "reasoning":
             # OpenAI encrypted reasoning is endpoint-bound and cannot be
             # replayed to Anthropic. A visible summary, when supplied, is safe.
-            summary = raw.get("summary")
-            if isinstance(summary, str) and summary.strip():
+            summary = _summary_text(raw.get("summary"))
+            if summary.strip():
                 _append_message(messages, "assistant", [{"type": "text", "text": summary}])
             continue
 
@@ -1803,15 +2026,6 @@ def responses_to_anthropic(
     if oauth:
         prefix = {"type": "text", "text": CLAUDE_SYSTEM_PREFIX}
         system_parts.insert(0, prefix)
-        for part in system_parts:
-            if part.get("type") == "text":
-                text = str(part.get("text") or "")
-                part["text"] = (
-                    text.replace("Hermes Agent", "Claude Code")
-                    .replace("Hermes agent", "Claude Code")
-                    .replace("hermes-agent", "claude-code")
-                    .replace("Nous Research", "Anthropic")
-                )
         # History tool_use blocks are already wire-encoded where they are
         # built (original_to_wire lookup with a single-encode fallback), so
         # there is intentionally no second pass here: re-encoding a wire name
@@ -1842,29 +2056,23 @@ def responses_to_anthropic(
     }
     if system_parts:
         payload["system"] = system_parts
+    choice, requested_name, serial = request_tool_policy(body, route="claude")
     if anthropic_tools:
         payload["tools"] = anthropic_tools
-        choice = body.get("tool_choice", "auto")
-        if choice in (None, "auto"):
+        if choice == "auto":
             payload["tool_choice"] = {"type": "auto"}
         elif choice == "required":
             payload["tool_choice"] = {"type": "any"}
         elif choice == "none":
             payload.pop("tools", None)
-        elif isinstance(choice, dict):
-            requested_name = choice.get("name")
-            if not isinstance(requested_name, str) and isinstance(choice.get("function"), dict):
-                requested_name = choice["function"].get("name")
-            if choice.get("type") in {"function", "tool"} and isinstance(requested_name, str):
-                payload["tool_choice"] = {
-                    "type": "tool",
-                    "name": tool_names.original_to_wire.get(requested_name, _wire_tool_name(requested_name, oauth)),
-                }
-        elif isinstance(choice, str):
+        else:
             payload["tool_choice"] = {
                 "type": "tool",
-                "name": tool_names.original_to_wire.get(choice, _wire_tool_name(choice, oauth)),
+                "name": tool_names.original_to_wire.get(requested_name, _wire_tool_name(requested_name, oauth)),
             }
+        if serial and "tool_choice" in payload:
+            # Anthropic Messages: tool_choice.disable_parallel_tool_use.
+            payload["tool_choice"]["disable_parallel_tool_use"] = True
     for source, destination in (("temperature", "temperature"), ("top_p", "top_p")):
         value = body.get(source)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1889,9 +2097,15 @@ def _responses_function_id(raw_id: str, call_id: str) -> str:
     return "fc_" + digest
 
 
-def _anthropic_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
-    # Keep the caller's input total: Kiro may already have estimated it.
-    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens")) or 0
+def _anthropic_usage(usage: Mapping[str, Any], *, native: bool = False) -> dict[str, Any]:
+    if native:
+        # Native Anthropic reports cache reads/writes beside, not inside,
+        # input_tokens: the Responses total must sum all three.
+        input_tokens = (usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0) \
+            + (usage.get("cache_creation_input_tokens") or 0)
+    else:
+        # Keep the caller's input total: Kiro may already have estimated it.
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens")) or 0
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens")) or 0
     result = {
         "input_tokens": input_tokens,
@@ -1910,12 +2124,39 @@ def _anthropic_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+_ANTHROPIC_INCOMPLETE_STOPS = {"max_tokens", "model_context_window_exceeded"}
+_ANTHROPIC_FAILED_STOPS = {"error", "refusal", "sensitive"}
+_ANTHROPIC_COMPLETED_STOPS = {"end_turn", "stop_sequence", "tool_use", "pause_turn"}
+
+
+def _anthropic_terminal_status(stop_reason: Any) -> str:
+    """Shared Claude/Kiro stop map (P1-12); unknown non-empty reasons fail (Q1)."""
+    if stop_reason in _ANTHROPIC_INCOMPLETE_STOPS:
+        return "incomplete"
+    if stop_reason in _ANTHROPIC_FAILED_STOPS:
+        return "failed"
+    if stop_reason is None or stop_reason == "" or stop_reason in _ANTHROPIC_COMPLETED_STOPS:
+        return "completed"
+    return "failed"
+
+
+def _sse_block_index(data: Mapping[str, Any], default: int) -> int:
+    raw_index = data.get("index", default)
+    if not isinstance(raw_index, int) or isinstance(raw_index, bool) or raw_index < 0:
+        raise ProviderError(
+            "Claude SSE event has an invalid block index.", status=502,
+            code="claude_invalid_sse",
+        )
+    return raw_index
+
+
 def anthropic_json_to_responses(
     payload: Mapping[str, Any],
     *,
     model: str | None = None,
     tool_names: ToolNameMap | None = None,
     coalesce_text: bool = False,
+    native_usage: bool = False,
 ) -> dict[str, Any]:
     tool_names = tool_names or ToolNameMap(oauth=False)
     if payload.get("type") == "error":
@@ -1932,6 +2173,11 @@ def anthropic_json_to_responses(
                 "code": str(error.get("type") or "upstream_error"),
             },
         }
+    if payload.get("type") != "message" or not isinstance(payload.get("content"), list):
+        raise ProviderError(
+            "Claude returned an invalid response.", status=502,
+            code="claude_invalid_response",
+        )
     raw_response_id = str(payload.get("id") or "")
     response_id = (
         raw_response_id
@@ -1941,6 +2187,7 @@ def anthropic_json_to_responses(
     if not raw_response_id:
         response_id = "resp_" + secrets.token_hex(8)
     output: list[dict[str, Any]] = []
+    used_item_ids: set = set()
     text_message: dict[str, Any] | None = None
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     for index, block in enumerate(payload.get("content", []) if isinstance(payload.get("content"), list) else []):
@@ -1951,7 +2198,7 @@ def anthropic_json_to_responses(
             if text_message is None or (not coalesce_text and output[-1] is not text_message):
                 text_message = {
                     "type": "message",
-                    "id": "msg_" + hashlib.sha256(response_id.encode("utf-8")).hexdigest()[:20],
+                    "id": _allocate_item_id("msg_" + hashlib.sha256(f"{response_id}:{index}".encode("utf-8")).hexdigest()[:20], used_item_ids),
                     "role": "assistant",
                     "status": "completed",
                     "content": [],
@@ -1977,7 +2224,7 @@ def anthropic_json_to_responses(
             output.append(
                 {
                     "type": "function_call",
-                    "id": _responses_function_id(raw_id, call_id),
+                    "id": _allocate_item_id(_responses_function_id(raw_id, call_id), used_item_ids),
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments,
@@ -1985,7 +2232,7 @@ def anthropic_json_to_responses(
                 }
             )
     stop_reason = payload.get("stop_reason")
-    status = "incomplete" if stop_reason == "max_tokens" else "completed"
+    status = _anthropic_terminal_status(stop_reason)
     result: dict[str, Any] = {
         "id": response_id,
         "object": "response",
@@ -1994,9 +2241,15 @@ def anthropic_json_to_responses(
         "output": output,
     }
     if usage:
-        result["usage"] = _anthropic_usage(usage)
+        result["usage"] = _anthropic_usage(usage, native=native_usage)
     if status == "incomplete":
         result["incomplete_details"] = {"reason": "max_output_tokens"}
+    if status == "failed":
+        result["error"] = {
+            "message": f"Claude turn stopped with reason: {stop_reason}.",
+            "type": str(stop_reason or "upstream_error"),
+            "code": str(stop_reason or "upstream_error"),
+        }
     return result
 
 
@@ -2014,6 +2267,9 @@ class StreamState:
     started: bool = False
     finished: bool = False
     coalesce_text: bool = False
+    native_usage: bool = False
+    ignored_event_types: list[str] = field(default_factory=list)
+    _used_item_ids: set = field(default_factory=set, init=False, repr=False)
     _coalesced_text: dict[str, Any] | None = field(default=None, init=False, repr=False)
 
     def ensure_id(self, value: Any = None) -> None:
@@ -2035,7 +2291,7 @@ class StreamState:
             "output": copy.deepcopy(self.output),
         }
         if self.usage:
-            result["usage"] = _anthropic_usage(self.usage)
+            result["usage"] = _anthropic_usage(self.usage, native=self.native_usage)
         if status == "incomplete":
             result["incomplete_details"] = {"reason": "max_output_tokens"}
         if status == "failed" and self.error_message:
@@ -2092,6 +2348,24 @@ def convert_anthropic_event(
             )
         return events
     if not state.started:
+        _LIFECYCLE = {"content_block_start", "content_block_delta",
+                      "content_block_stop", "message_delta", "message_stop"}
+        if event_type in _LIFECYCLE:
+            state.error_message = f"Claude stream sent {event_type!r} before message_start."
+            state.error_type = "invalid_stream_lifecycle"
+            state.stop_reason = "error"
+            state.ensure_id()
+            state.started = True
+            events.append(("response.created", _event_payload("response.created", {"response": state.response()})))
+            events.append(("response.in_progress", _event_payload("response.in_progress", {"response": state.response()})))
+            final = state.response(status="failed")
+            events.append(("response.failed", _event_payload("response.failed", {"response": final})))
+            state.finished = True
+            return events
+        if event_type != "error":
+            # Benign extensions (ping, unknown types) are ignored, not fatal.
+            state.ignored_event_types.append(event_type)
+            return events
         state.ensure_id()
         state.started = True
         events.append(
@@ -2108,14 +2382,15 @@ def convert_anthropic_event(
         )
 
     if event_type == "content_block_start":
-        index = int(data.get("index", len(state.blocks)))
+        index = _sse_block_index(data, len(state.blocks))
         block = data.get("content_block") if isinstance(data.get("content_block"), dict) else {}
         block_type = block.get("type")
         if block_type == "text":
             if state.coalesce_text and state._coalesced_text is not None:
+                state._coalesced_text["closed"] = False
                 state.blocks[index] = state._coalesced_text
                 return events
-            item_id = "msg_" + hashlib.sha256(f"{state.response_id}:{index}".encode()).hexdigest()[:20]
+            item_id = _allocate_item_id("msg_" + hashlib.sha256(f"{state.response_id}:{index}".encode()).hexdigest()[:20], state._used_item_ids)
             item = {
                 "type": "message",
                 "id": item_id,
@@ -2123,7 +2398,7 @@ def convert_anthropic_event(
                 "status": "in_progress",
                 "content": [],
             }
-            state.blocks[index] = {"kind": "text", "item": item, "text": "", "content_index": 0}
+            state.blocks[index] = {"kind": "text", "item": item, "text": "", "content_index": 0, "closed": False}
             if state.coalesce_text:
                 state._coalesced_text = state.blocks[index]
             state.output.append(item)
@@ -2133,7 +2408,7 @@ def convert_anthropic_event(
             raw_id = str(block.get("id") or f"tool_{index}")
             call_id = state.tool_names.decode_call_id(raw_id)
             name = state.tool_names.decode(str(block.get("name") or ""))
-            item_id = _responses_function_id(raw_id, call_id)
+            item_id = _allocate_item_id(_responses_function_id(raw_id, call_id), state._used_item_ids)
             item = {
                 "type": "function_call",
                 "id": item_id,
@@ -2142,13 +2417,13 @@ def convert_anthropic_event(
                 "arguments": "",
                 "status": "in_progress",
             }
-            state.blocks[index] = {"kind": "tool", "item": item, "arguments": ""}
+            state.blocks[index] = {"kind": "tool", "item": item, "arguments": "", "closed": False}
             state.output.append(item)
             events.append(("response.output_item.added", _event_payload("response.output_item.added", {"output_index": len(state.output) - 1, "item": copy.deepcopy(item)})))
         return events
 
     if event_type == "content_block_delta":
-        index = int(data.get("index", 0))
+        index = _sse_block_index(data, 0)
         block = state.blocks.get(index)
         delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
         if block and block.get("kind") == "text" and delta.get("type") == "text_delta":
@@ -2170,10 +2445,19 @@ def convert_anthropic_event(
         return events
 
     if event_type == "content_block_stop":
-        index = int(data.get("index", 0))
+        index = _sse_block_index(data, 0)
         block = state.blocks.get(index)
         if not block:
             return events
+        block["closed"] = True
+        if block.get("kind") == "tool":
+            try:
+                json.loads(block.get("arguments") or "{}")
+            except ValueError:
+                state.stop_reason = "error"
+                state.error_type = "invalid_tool_arguments"
+                state.error_message = "Claude tool arguments were not valid JSON."
+                return events
         if state.coalesce_text and block.get("kind") == "text":
             return events  # This assistant message stays open until message_stop.
         item = block["item"]
@@ -2191,7 +2475,7 @@ def convert_anthropic_event(
 
     if event_type == "message_delta":
         delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
-        if delta.get("stop_reason") is not None:
+        if delta.get("stop_reason") is not None and state.stop_reason != "error":
             state.stop_reason = str(delta.get("stop_reason"))
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
@@ -2209,6 +2493,10 @@ def convert_anthropic_event(
         return events
 
     if event_type == "message_stop":
+        if any(not b.get("closed") for b in state.blocks.values()) or state.stop_reason is None:
+            state.stop_reason = "error"
+            state.error_message = state.error_message or "Claude stream ended with unclosed content blocks or missing stop_reason."
+            state.error_type = state.error_type or "truncated_stream"
         if state.coalesce_text and state._coalesced_text is not None:
             block = state._coalesced_text
             item = block["item"]
@@ -2221,13 +2509,10 @@ def convert_anthropic_event(
                 ("response.content_part.done", _event_payload("response.content_part.done", {"item_id": item["id"], "output_index": output_index, "content_index": 0, "part": copy.deepcopy(part)})),
                 ("response.output_item.done", _event_payload("response.output_item.done", {"output_index": output_index, "item": copy.deepcopy(item)})),
             ])
-        status = (
-            "incomplete"
-            if state.stop_reason == "max_tokens"
-            else "failed"
-            if state.stop_reason == "error"
-            else "completed"
-        )
+        status = _anthropic_terminal_status(state.stop_reason)
+        if status == "failed" and not state.error_message:
+            state.error_message = f"Claude turn stopped with reason: {state.stop_reason}."
+            state.error_type = str(state.stop_reason or "upstream_error")
         final = state.response(status=status)
         final_event = (
             "response.incomplete"
@@ -2246,9 +2531,14 @@ def _iter_sse_text(stream: Any) -> Iterator[tuple[str, dict[str, Any]]]:
     event_name = ""
     data_lines: list[str] = []
     while True:
-        line = stream.readline()
+        line = stream.readline(4 * 1024 * 1024 + 1)
         if not line:
             break
+        if len(line) > 4 * 1024 * 1024 and not line.endswith(b"\n" if isinstance(line, bytes) else "\n"):
+            raise ProviderError(
+                "Claude SSE line exceeded the safety size limit.", status=502,
+                code="upstream_protocol_error",
+            )
         if isinstance(line, bytes):
             line = line.decode("utf-8", errors="replace")
         line = line.rstrip("\r\n")
@@ -2258,6 +2548,7 @@ def _iter_sse_text(stream: Any) -> Iterator[tuple[str, dict[str, Any]]]:
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
+                    event_name = "error"
                     data = {"type": "error", "error": {"type": "invalid_sse", "message": "Claude returned invalid SSE data."}}
                 if isinstance(data, dict):
                     yield event_name or str(data.get("type") or ""), data
@@ -2274,6 +2565,7 @@ def _iter_sse_text(stream: Any) -> Iterator[tuple[str, dict[str, Any]]]:
         try:
             data = json.loads("\n".join(data_lines))
         except json.JSONDecodeError:
+            event_name = "error"
             data = {"type": "error", "error": {"type": "invalid_sse", "message": "Claude returned invalid SSE data."}}
         if isinstance(data, dict):
             yield event_name or str(data.get("type") or ""), data
@@ -2291,8 +2583,11 @@ def convert_anthropic_stream(
     *,
     model: str | None,
     tool_names: ToolNameMap,
+    coalesce_text: bool = False,
+    native_usage: bool = False,
 ) -> Iterator[bytes]:
-    state = StreamState(model=model, tool_names=tool_names)
+    state = StreamState(model=model, tool_names=tool_names,
+                        coalesce_text=coalesce_text, native_usage=native_usage)
     sequence = 0
 
     def encode_event(event_name, payload):
@@ -2303,9 +2598,18 @@ def convert_anthropic_stream(
         sequence += 1
         return response_sse_line(event_name, numbered)
 
-    for event_name, payload in _iter_sse_text(stream):
-        for output_event, output_payload in convert_anthropic_event(event_name, payload, state):
-            yield encode_event(output_event, output_payload)
+    try:
+        for event_name, payload in _iter_sse_text(stream):
+            for output_event, output_payload in convert_anthropic_event(event_name, payload, state):
+                yield encode_event(output_event, output_payload)
+            if state.finished:
+                break
+    except (OSError, http.client.HTTPException, ValueError, TypeError, ProviderError) as error:
+        if not state.started:
+            raise
+        state.stop_reason = "error"
+        state.error_message = state.error_message or "Claude stream failed mid-response."
+        state.error_type = getattr(error, "code", None) or "upstream_stream_error"
     if not state.finished:
         if not state.started:
             for output_event, output_payload in convert_anthropic_event(
@@ -2343,7 +2647,7 @@ def translate_anthropic_sse(
 
 def endpoint_for(base: str, suffix: str) -> str:
     value = str(base or "").rstrip("/")
-    if value.endswith("/" + suffix.lstrip("/")) or value.endswith(suffix.lstrip("/")):
+    if value.endswith("/" + suffix.lstrip("/")):
         return value
     return value + "/" + suffix.lstrip("/")
 
