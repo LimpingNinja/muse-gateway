@@ -80,6 +80,7 @@ from muse_providers import (
     demote_codex_encrypted_reasoning,
     drop_or_reject_previous_response_id,
     _flatten_tools,
+    _input_items,
     endpoint_for,
     prepare_codex_request,
     resolve_claude_credentials,
@@ -121,6 +122,22 @@ except ImportError as _devin_import_error:  # protobuf absent for this interpret
 
     muse_devin = _MissingDevin()  # type: ignore[assignment]
 import muse_kiro
+try:
+    from muse_images import _IMAGE_TYPES, normalize_request_images
+except ImportError:  # partial source copy without muse_images.py (same idiom as muse_devin above)
+    _IMAGE_TYPES = frozenset({"input_image", "image_url", "image"})
+
+    def normalize_request_images(  # type: ignore[misc]
+        body: dict[str, Any], *, route: str, supports_images: bool | None,
+        allow_files: bool, notify: Any = None,
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """Refuse image-bearing requests rather than forward unchecked images."""
+        if _count_image_parts(body):
+            raise ProviderError(
+                "Image input needs muse_images.py beside muse_gateway.py; reinstall the gateway.",
+                status=503, code="image_support_unavailable",
+            )
+        return body, {"count": 0, "data": 0, "url": 0, "file": 0, "bytes": 0}
 from muse_models import positive_int, provider_catalog, resolve_limits
 from muse_capture import CaptureSession, CapturingWriter, current_capture, encoded_secret_forms, source_fingerprint
 
@@ -417,6 +434,7 @@ class Config:
             getattr(args, "allow_oauth_host_override", False)
         )
         self.allow_non_loopback: bool = bool(getattr(args, "allow_non_loopback", False))
+        self.allow_image_files: bool = bool(getattr(args, "allow_image_files", False))
         self.verbose: bool = bool(getattr(args, "verbose", False))
         self.log_file: str = os.path.abspath(os.path.expanduser(
             getattr(args, "log_file", None) or "muse-gateway.log"
@@ -1371,6 +1389,30 @@ def _codex_model_efforts(config: Config, model: Any) -> list[str]:
     return []
 
 
+def _model_supports_images(
+    config: Config, provider: str, model: Any, *, authorization: str | None
+) -> bool | None:
+    """Image-input capability for one routed model; None means unknown.
+
+    Mirrors _codex_model_efforts: catalog problems degrade to the catalog's
+    own defaults instead of breaking forwarding.
+    """
+    if provider == "claude" and config.claude_transport == "cli":
+        return False
+    if provider == "kiro":
+        return False
+    if provider not in {"codex", "claude", "meta", "local"}:
+        return None
+    try:
+        provider_model_catalog(config, provider, authorization=authorization)
+        row = config._snapshot_raw(provider).get(str(model or ""))
+    except (ProviderError, ShimError, ValueError, OSError, KeyError, AttributeError):
+        row = None
+    if isinstance(row, dict) and "supports_images" in row:
+        return bool(row["supports_images"])
+    return provider in {"codex", "claude", "meta"}
+
+
 def _claude_cli_output_schema(
     tool_names: list[str], *, min_calls: int = 0, max_calls: int = 8
 ) -> dict[str, Any]:
@@ -1962,7 +2004,23 @@ def _request_diagnostic(body: dict[str, Any]) -> dict[str, Any]:
         "system_messages": sum(isinstance(i, dict) and i.get("role") == "system" for i in items),
         "tool_calls": sum(isinstance(i, dict) and i.get("type") == "function_call" for i in items),
         "tool_results": sum(isinstance(i, dict) and i.get("type") == "function_call_output" for i in items),
+        "image_parts": _count_image_parts(body),
     }
+
+
+def _count_image_parts(body: dict[str, Any]) -> int:
+    """Shape only: a superset of the parts the image normalizer inspects."""
+    def count(parts: Any) -> int:
+        if not isinstance(parts, list):
+            return 0
+        return sum(isinstance(part, dict) and str(part.get("type") or "").strip().lower() in _IMAGE_TYPES
+                   for part in parts)
+
+    total = count(body.get("instructions")) + count(body.get("system"))
+    for item in _input_items(body):
+        if isinstance(item, dict):
+            total += count(item.get("content")) + count(item.get("output"))
+    return total
 
 
 def _ssl_context(config: Config) -> ssl.SSLContext | None:
@@ -2624,6 +2682,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     "fingerprint": getattr(self.server, "source_fingerprint", None),
                     "provider": self.config.provider,
                     "claude_transport": self.config.claude_transport,
+                    "image_files": self.config.allow_image_files,
                     "supported_routes": {
                         "version": 1,
                         "providers": ["generic", "codex", "claude", "meta", "devin", "kiro", "local"],
@@ -2746,6 +2805,26 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 body, self.config, native=(provider == "meta")
             )
             transformed["model"] = upstream_model
+            if provider != "devin":
+                # Images become checked bytes before the request is forwarded.
+                # The catalog is consulted only when the request carries images.
+                image_route = (
+                    "claude-cli"
+                    if provider == "claude" and self.config.claude_transport == "cli"
+                    else provider
+                )
+                supports_images = (
+                    _model_supports_images(
+                        self.config, provider, upstream_model,
+                        authorization=self.headers.get("Authorization"),
+                    )
+                    if self._diagnostic.get("image_parts")
+                    else None
+                )
+                transformed, _image_stats = normalize_request_images(
+                    transformed, route=image_route, supports_images=supports_images,
+                    allow_files=self.config.allow_image_files, notify=self._log_event,
+                )
             limit = self.config.model_output_limit(provider, upstream_model)
             requested = transformed.get("max_output_tokens")
             # Devin resolves the credential-bound model later in forward_devin;
@@ -3103,6 +3182,10 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 f"unknown Devin model {logical_id!r}; see --models for the roster.",
                 code="devin_unknown_model",
             )
+        body, _image_stats = normalize_request_images(
+            body, route="devin", supports_images=model.supports_images,
+            allow_files=config.allow_image_files, notify=getattr(self, "_log_event", None),
+        )
         reasoning = body.get("reasoning")
         effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
         if not isinstance(effort, str) or not effort:
@@ -3897,6 +3980,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="allow binding beyond loopback (remote clients can reach this proxy)",
     )
     parser.add_argument(
+        "--allow-image-files",
+        action="store_true",
+        default=False,
+        help="accept file:// image references and send those files' bytes upstream "
+             "(CLI-only; off by default; absolute paths, no symlinks, images only)",
+    )
+    parser.add_argument(
         "--max-body-bytes",
         type=int,
         default=DEFAULT_MAX_BODY_BYTES,
@@ -4441,7 +4531,7 @@ Advanced server options go before `launch`. Removed gateway flags are rejected.
 """
 
 _LAUNCH_FLAG_OPTIONS = {"--no-model-discovery", "--portable", "--verbose", "--insecure-upstream",
-                        "--allow-oauth-host-override", "--allow-non-loopback"}
+                        "--allow-oauth-host-override", "--allow-non-loopback", "--allow-image-files"}
 _LAUNCH_VALUE_OPTIONS = {
     "--host": "host", "--timeout": "timeout", "--max-body-bytes": "max_body_bytes",
     "--capture-dir": "capture_dir", "--codex-auth-path": "codex_auth_path",
