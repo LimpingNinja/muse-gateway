@@ -26,7 +26,7 @@ jobs:
         run: python -m tests.check_regressions
       - name: Verify installed package outside the checkout
         working-directory: ${{ runner.temp }}
-        run: python -I -c "import muse_gateway, muse_devin, muse_devin_wire, muse_capture, muse_models, devin_pb2, providers; print('Installed runtime imports and provider catalogs OK')"
+        run: python -I -c "import muse_gateway, muse_devin, muse_devin_wire, muse_capture, muse_models, muse_images, devin_pb2, providers; print('Installed runtime imports and provider catalogs OK')"
       - name: Console-script smokes outside the checkout
         working-directory: ${{ runner.temp }}
         run: |

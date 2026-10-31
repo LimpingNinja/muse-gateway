@@ -110,6 +110,10 @@ Protocol references: [Connect](https://connectrpc.com/docs/protocol/),
 - `muse_kiro.py`: Kiro-specific history preparation, endpoint/response
   validation, and Messages stream lifecycle. Shared Anthropic codecs stay
   in `muse_providers.py`; native Claude authentication is not reused.
+- `muse_images.py`: image-part loading shared by every route (inline data,
+  remote URL, and opt-in `file://` sources), magic-byte format sniffing,
+  per-image/per-request size caps, and the public-address URL and
+  regular-file/no-symlink file policies.
 - `muse_devin.py`, `muse_devin_wire.py`: Devin credentials, catalog, history,
   stream conversion, and Connect transport. `devin.proto` and `devin_pb2.py`
   are the wire schema and generated bindings; do not hand-edit the bindings.

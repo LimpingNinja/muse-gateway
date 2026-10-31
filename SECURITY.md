@@ -40,6 +40,17 @@ unsafe host overrides, and sensitive logging/capture are especially relevant.
 `/health` exposes process/source information to clients that can reach the
 listener; this is another reason not to expose the port publicly.
 
+Image parts in requests can make the gateway itself fetch `https://` or
+`http://` image URLs. It fetches only hosts whose every DNS address is public,
+connects to the validated address, re-validates each of up to 3 redirects,
+verifies TLS for HTTPS independent of `--insecure-upstream`, sends no
+credentials or cookies, ignores proxy settings, and bounds each fetch by
+per-image/per-request size caps and connect/read/overall time budgets (DNS
+resolution uses the system resolver's own timeout). The image host sees the
+gateway machine's egress IP address. Local image file reads exist only behind
+the opt-in `--allow-image-files` flag. Bypasses of these checks (for example
+reaching non-public addresses or reading unintended files) are in scope.
+
 Third-party outages and client bugs unrelated to this gateway are not gateway
 vulnerabilities. Please do not send provider account-abuse reports here.
 
@@ -71,6 +82,14 @@ vulnerabilities. Please do not send provider account-abuse reports here.
   only its own optional key and never forwards incoming Muse authorization or
   generic credentials. Custom Meta/local URLs are not protected by the native
   Codex/Claude OAuth host allowlists.
+- `--allow-image-files` (CLI flag only) is off by default; without it,
+  `file://` image references are rejected. When enabled, the gateway reads
+  only absolute paths to regular files with no symbolic link in the path,
+  accepts only PNG, JPEG, GIF, or WebP identified by their leading bytes, and
+  sends the file bytes to the selected provider. Any client that can reach the
+  listener (and present the inbound token when `--require-inbound-token` is
+  enabled) can request such reads, so enable it only on a loopback listener
+  you control.
 - Prefer TLS for non-loopback upstreams. Plain HTTP sends prompts and credentials
   unencrypted, even when the endpoint is on a private network.
 - Review diagnostics before sharing: provider errors and request metadata may

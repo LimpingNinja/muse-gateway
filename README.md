@@ -393,6 +393,53 @@ For a single Responses endpoint without the combined menu, the separate
 `generic` (also `http`) server mode is available. Its default upstream is
 OpenRouter; it is not another route in auto mode.
 
+### Image input
+
+Image parts in user, developer, or tool-result content are loaded and checked
+once in the gateway, before the request is forwarded to the provider (the
+model catalog may be consulted first to check image support), and forwarded
+as inline base64.
+Accepted forms: `input_image`/`image_url` parts whose `image_url` is a string
+or `{"url": ...}`, and Anthropic-style `image` parts with a `base64` or `url`
+source. The URL may be a `data:...;base64,` URI, an `https://` or `http://`
+URL, or a `file:///absolute/path` reference. Malformed parts and images in
+system, assistant, or instruction content are rejected (`image_invalid`); no
+image is silently dropped.
+
+- Formats: PNG, JPEG, GIF, and WebP, identified by their leading bytes. The
+  declared media type, `Content-Type`, and file extension are never trusted;
+  SVG, BMP, TIFF, HEIC, AVIF, and PDF are rejected.
+- Size: 20 MiB per image (5 MiB on Claude HTTP), 24 MiB of decoded image data
+  per request, and at most 100 images per request (`image_too_large`).
+- Remote URLs: only hosts whose every DNS address is public are fetched;
+  loopback, private, link-local, and other non-global targets are rejected
+  (`image_url_rejected`), and each of up to 3 redirects is re-checked. No
+  credentials, cookies, or proxy are used: `HTTP(S)_PROXY` settings are
+  ignored, so networks that require a proxy cannot fetch image URLs. A fetch
+  that fails, times out, or does not return HTTP 200 is `image_url_unreachable`
+  (502). DNS resolution uses the system resolver's own timeout and is not
+  bounded by the fetch budget. There is no caching: replayed history fetches
+  each URL again.
+  Claude HTTP no longer forwards image URLs as URL sources; the gateway sends
+  the fetched bytes instead. A host with any non-public DNS record is rejected
+  even if other records are public.
+- Local files: off unless the server starts with `--allow-image-files`
+  (CLI flag only); otherwise `file://` parts fail with `image_file_rejected`.
+  Paths must be absolute, regular files with no symbolic link anywhere in the
+  path. On macOS `/tmp` and `/var` are symlinks, so pass `/private/tmp/...` or
+  `/private/var/...`. The file's bytes are sent to the selected provider, and
+  inbound client authentication is opt-in (`--require-inbound-token`, off by
+  default), so enable this only on a loopback listener you control.
+- Routes: Claude CLI transport and Kiro accept text only and reject images
+  (`claude_cli_images_unsupported`, `kiro_unsupported_input`). Local models
+  need image evidence from their catalog; otherwise `image_input_unsupported`.
+  Devin rejects images inside tool results (`image_input_unsupported`) rather
+  than dropping them. A Devin request whose history is 512 KiB or more (easily
+  reached with images) may treat an upstream `invalid_argument` "internal
+  error" as a context overflow.
+- Captures (`--capture-dir`) now contain fetched and file-loaded image bytes
+  as base64.
+
 ## Configuration and launch options
 
 Connection and diagnostic settings use `MUSE_GATEWAY_*`. Provider credentials
@@ -432,6 +479,7 @@ Common settings (the provider sections above explain authentication):
 | `MUSE_GATEWAY_MAX_CONCURRENT_REQUESTS` | Concurrent inference POST limit; default 8, excess requests receive 503 |
 | `MUSE_GATEWAY_LOG_FILE` | Rotating diagnostics; default working-directory log |
 | `--capture-dir` (CLI flag only) | Opt-in private captures; off by default |
+| `--allow-image-files` (CLI flag only) | Accept `file://` image references and send the file bytes upstream; off by default. See [image input](#image-input) |
 | `MUSE_GATEWAY_MODELS` | Optional exact provider/model menu allowlist; unset/blank shows all available |
 | `MUSE_GATEWAY_LOCAL_UPSTREAM` | Local Responses service; unset disables local routing |
 | `MUSE_GATEWAY_LOCAL_API_KEY` | Optional local-only credential; unset sends no Authorization header |

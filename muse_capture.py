@@ -162,7 +162,7 @@ def _private_directory(path):
 
 _SOURCE_FILES = ("muse_gateway.py", "muse_providers.py", "muse_devin.py",
                  "muse_devin_wire.py", "devin_pb2.py", "muse_capture.py", "muse_kiro.py",
-                 "muse_models.py", "muse_shim.py")
+                 "muse_models.py", "muse_shim.py", "muse_images.py")
 
 
 def _source_files():

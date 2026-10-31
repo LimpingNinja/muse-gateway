@@ -1102,7 +1102,8 @@ class LifecycleAndIdentityTests(unittest.TestCase):
             if (match := re.match(r"\s*#?\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line))
         }
         self.assertEqual(example_keys, {
-            "MUSE_GATEWAY_PORT", "MUSE_GATEWAY_TIMEOUT", "MUSE_GATEWAY_TURN_TIMEOUT",
+            "MUSE_GATEWAY_PORT", "MUSE_GATEWAY_TIMEOUT", "MUSE_GATEWAY_STREAM_IDLE_TIMEOUT",
+            "MUSE_GATEWAY_TURN_TIMEOUT",
             "MUSE_GATEWAY_MAX_CONCURRENT_REQUESTS", "MUSE_GATEWAY_LOG_FILE",
             "MUSE_GATEWAY_MODELS", "MUSE_GATEWAY_LOCAL_UPSTREAM", "MUSE_GATEWAY_LOCAL_API_KEY",
             "MUSE_GATEWAY_CLAUDE_TRANSPORT", "MUSE_GATEWAY_CLAUDE_CLI_PASSTHROUGH",
