@@ -338,6 +338,20 @@ class KiroContracts(unittest.TestCase):
                     self.assertNotIn("retry_after", error["metadata"])
                     self.assertIsNone(error["metadata"]["transient"])
             self.assertEqual(len(peer.requests), count)
+        self.assertEqual(
+            muse_kiro._retry_after({"Retry-After": "2147483647"}, ()),
+            {"value": "3600", "kind": "delay-seconds", "clamped": True},
+        )
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+        future = format_datetime(datetime.now(timezone.utc) + timedelta(days=2), usegmt=True)
+        self.assertEqual(
+            muse_kiro._retry_after({"Retry-After": future}, ()),
+            {"value": "3600", "kind": "delay-seconds", "clamped": True},
+        )
+        rejected = muse_kiro.error_metadata(
+            source="http", upstream_status=429, headers={"Retry-After": "NaN"})
+        self.assertEqual(rejected["retry_after_observation"], "rejected")
 
     def test_sse_and_json_typed_errors_preserve_category_and_observed_status(self):
         cases = [("authentication_error", "authentication", False), ("overloaded_error", "overload", True),

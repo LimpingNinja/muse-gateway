@@ -46,6 +46,60 @@ def post(base, body, headers=None):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_capture_helpers_receive_only_minimal_environment(self):
+        from muse_capture import _helper_environment
+        from unittest.mock import patch
+
+        environment = {
+            "PATH": "/usr/bin", "HOME": "/home/fixture", "SystemRoot": "C:/Windows",
+            "AWS_SECRET_ACCESS_KEY": "do-not-pass", "CUSTOM_TOKEN": "do-not-pass",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(_helper_environment(), {
+                "PATH": "/usr/bin", "HOME": "/home/fixture", "SystemRoot": "C:/Windows",
+            })
+
+    def test_artifacts_open_once_and_truncation_skips_expensive_work(self):
+        import muse_capture
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = CaptureSession(directory)
+            real_open = muse_capture.os.open
+            opened = []
+
+            def counting_open(path, *args, **kwargs):
+                opened.append(Path(path).name)
+                return real_open(path, *args, **kwargs)
+
+            with patch("muse_capture.os.open", side_effect=counting_open):
+                capture = session.request("opens")
+                try:
+                    for index in range(20):
+                        capture.event("tick", index=index)
+                        capture._append("stream", b"x")
+                finally:
+                    capture.finish()
+            self.assertEqual(opened.count("timeline.jsonl"), 1)
+            self.assertEqual(opened.count("stream"), 1)
+            self.assertEqual(capture._handles, {})
+
+            capture = session.request("after-truncation")
+            try:
+                capture.limit = capture.written + 4
+                capture._append("large", b"x" * 20)
+                self.assertTrue(capture.artifacts["large"]["truncated"])
+                with patch.object(capture, "redact", side_effect=AssertionError("redacted after truncation")):
+                    capture.bytes("large", b"more")
+                    capture.json("later", {"text": "x" * 10000})
+                    capture.event("later")
+                self.assertEqual(capture.streams["large"]["observed_bytes"], 4)
+                self.assertTrue(capture.artifacts["later.json"]["truncated"])
+                self.assertTrue(capture.artifacts["timeline.jsonl"]["truncated"])
+            finally:
+                capture.finish()
+            self.assertEqual(capture._handles, {})
+
     def test_split_json_serialized_secrets_cannot_be_decoded_from_evidence(self):
         key = 'serialized-quote"backslash\\secret-\u03bb'
         cases = []
@@ -233,7 +287,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(saved_keys, {"[REDACTED]": "partial", "safe": "unchanged"})
 
     def test_capture_preserves_socket_sse_bytes(self):
-        wire = b'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        wire = b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_capture","status":"completed"}}\n\n'
         with tempfile.TemporaryDirectory() as directory, serving(
             ThreadingHTTPServer(("127.0.0.1", 0), _fixed_handler(wire))
         ) as upstream:
@@ -247,15 +301,19 @@ class CaptureTests(unittest.TestCase):
                     outputs.append(post(base, {"model": "test", "input": "hello", "stream": True}))
                     if enabled:
                         with patch.object(server.capture_session, "request", side_effect=PermissionError("denied")):
-                            self.assertEqual(post(base, {"model": "test", "input": "hello", "stream": True}), wire)
+                            self.assertEqual(
+                                post(base, {"model": "test", "input": "hello", "stream": True}),
+                                outputs[-1],
+                            )
                 if enabled:
                     request_dir = next(path for path in server.capture_session.directory.iterdir() if path.is_dir())
-                    self.assertEqual((request_dir / "downstream.body").read_bytes(), wire)
+                    self.assertEqual((request_dir / "downstream.body").read_bytes(), outputs[-1])
                     self.assertEqual((request_dir / "upstream.body").read_bytes(), wire)
                     manifest = json.loads((request_dir / "manifest.json").read_text())
-                    self.assertEqual(manifest["first_events"]["downstream"], "response.completed")
+                    self.assertEqual(manifest["first_events"]["downstream"], "response.created")
                     self.assertEqual(manifest["terminal_events"]["downstream"], ["response.completed"])
-            self.assertEqual(outputs, [wire, wire])
+            self.assertEqual(outputs[0], outputs[1])
+            self.assertIn(b"response.completed", outputs[0])
 
     def test_structured_error_capture_redacts_credential_field_variants(self):
         value = {
@@ -579,7 +637,7 @@ class CaptureTests(unittest.TestCase):
             with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": token, "NO_PROXY": "127.0.0.1"}, clear=True), \
                     patch("muse_gateway.subprocess.Popen", side_effect=claude_only), \
                     gateway(directory, Peer([]), claude_transport="cli", capture_dir=str(captures)) as base:
-                post(base, {"model": "claude/claude-test", "input": "synthetic", "stream": True})
+                post(base, {"model": "claude/claude-test", "input": "incoming echo " + token, "stream": True})
             tree = b"".join(path.read_bytes() for path in captures.rglob("*") if path.is_file())
             self.assertIn(b"[REDACTED]", tree)
             self.assertNotIn(token.encode(), tree)

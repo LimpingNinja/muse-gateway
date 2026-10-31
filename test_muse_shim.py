@@ -221,7 +221,7 @@ class ProxyTests(unittest.TestCase):
                                 data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "Authorization": "Bearer incoming-key"})
                             with urllib.request.urlopen(req, timeout=5) as response:
                                 wire = response.read()
-                            self.assertEqual(wire, FakeUpstreamHandler.wire)
+                            self.assertEqual(consume(wire), consume(FakeUpstreamHandler.wire))
                             self.assertEqual(consume(wire)["output"][0]["content"][0]["text"], "FORWARDED")
                             self.assertEqual(FakeUpstreamHandler.path_seen, "/v1/responses")
                             self.assertEqual(FakeUpstreamHandler.authorization, "Bearer " + expected_key if expected_key else None)
@@ -390,8 +390,12 @@ class _ModelsResponse:
     def __exit__(self, *args):
         return False
 
-    def read(self):
-        return self._body
+    def read(self, amount=-1):
+        if amount is None or amount < 0:
+            body, self._body = self._body, b""
+            return body
+        body, self._body = self._body[:amount], self._body[amount:]
+        return body
 
 
 class GatewayLocalDiscoveryTests(unittest.TestCase):

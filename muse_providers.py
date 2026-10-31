@@ -160,22 +160,73 @@ def validate_claude_token_url(url: str, *, allow_host_override: bool = False) ->
     )
 
 
+CLIENT_ERROR_MESSAGE_LIMIT = 512
+CLIENT_ERROR_CODE_LIMIT = 128
+_SSE_LINE_LIMIT = 4 * 1024 * 1024
+_SSE_EVENT_LIMIT = 8 * 1024 * 1024
+_STREAM_BLOCK_LIMIT = 8 * 1024 * 1024
+_STREAM_RESPONSE_LIMIT = 64 * 1024 * 1024
+
+
+def _utf8_len(value: str) -> int:
+    return len(value.encode("utf-8", errors="surrogatepass"))
+
+
+def _truncate_utf8(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return text
+    suffix = "..."
+    return encoded[: max(0, limit - len(suffix))].decode("utf-8", errors="ignore") + suffix
+
+
+def bounded_client_error_text(value: Any, limit: int = CLIENT_ERROR_MESSAGE_LIMIT) -> str:
+    text = "".join(
+        char if char == "\t" or (ord(char) >= 32 and not 127 <= ord(char) <= 159) else " "
+        for char in str(value or "")
+    )
+    return _truncate_utf8(text, limit)
+
+
+def bounded_client_error_code(value: Any, fallback: str = "provider_error") -> str:
+    text = bounded_client_error_text(value, CLIENT_ERROR_CODE_LIMIT).strip()
+    return text or fallback
+
+
+def _bounded_client_metadata(value: Any, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return bounded_client_error_text(value)
+    if depth >= 4:
+        return bounded_client_error_text(value)
+    if isinstance(value, dict):
+        return {
+            bounded_client_error_code(key, "field"): _bounded_client_metadata(item, depth + 1)
+            for key, item in list(value.items())[:32]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_bounded_client_metadata(item, depth + 1) for item in list(value)[:32]]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return bounded_client_error_text(value)
+
+
 class ProviderError(Exception):
     """An error safe to expose to the local Muse client."""
 
     def __init__(self, message: str, *, status: int = 400, code: str = "provider_error",
-                 metadata: dict[str, Any] | None = None):
-        super().__init__(message)
+                 metadata: dict[str, Any] | None = None, headers: Any = None):
+        super().__init__(bounded_client_error_text(message))
         self.status = status
-        self.code = code
-        self.metadata = metadata
+        self.code = bounded_client_error_code(code)
+        self.metadata = _bounded_client_metadata(metadata) if metadata is not None else None
+        self.headers = headers
 
 
 class AuthError(ProviderError):
     """A local credential problem with an actionable next step."""
 
-    def __init__(self, message: str, *, code: str = "auth_error"):
-        super().__init__(message, status=401, code=code)
+    def __init__(self, message: str, *, code: str = "auth_error", headers: Any = None):
+        super().__init__(message, status=401, code=code, headers=headers)
 
 
 @dataclass
@@ -221,11 +272,14 @@ def _parse_expiry(value: Any) -> float | None:
         if numeric is not None and numeric > 0:
             return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
         try:
-            return _datetime.datetime.fromisoformat(
-                raw.replace("Z", "+00:00")
-            ).timestamp()
+            parsed = _datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             return None
+        if parsed.tzinfo is None:
+            # OAuth expiry timestamps are UTC by convention; never interpret a
+            # naive value in the gateway host's local timezone.
+            parsed = parsed.replace(tzinfo=_datetime.timezone.utc)
+        return parsed.timestamp()
     return None
 
 
@@ -321,6 +375,21 @@ def _credential_file_is_readable(path: Path) -> bool:
         return not path.is_symlink() and path.is_file() and os.access(path, os.R_OK)
     except OSError:
         return False
+
+
+def refused_symlink_credential_labels(config: Any, provider: str) -> list[str]:
+    """Paths (never contents) of candidate credential files refused as symlinks."""
+    candidates = (
+        _candidate_codex_paths(config) if provider == "codex" else _candidate_claude_paths(config)
+    )
+    labels = []
+    for path, _configured in candidates:
+        try:
+            if path.is_symlink():
+                labels.append(str(path))
+        except OSError:
+            continue
+    return labels
 
 
 def _read_json_object(path: Path) -> dict[str, Any] | None:
@@ -432,6 +501,64 @@ def _candidate_claude_paths(config: Any) -> list[tuple[Path, bool]]:
     return unique
 
 
+_CREDENTIAL_CACHE_LIMIT = 32
+_CREDENTIAL_CACHE: dict[tuple[Any, ...], CredentialState | None] = {}
+_CREDENTIAL_CACHE_LOCK = threading.Lock()
+_KEYCHAIN_CACHE_TTL_SECONDS = 30.0
+_KEYCHAIN_CACHE: tuple[tuple[Any, ...], float, CredentialState | None] | None = None
+
+
+def invalidate_credential_cache(provider: str | None = None) -> None:
+    """Drop cached credential discovery, e.g. after an upstream 401."""
+    global _KEYCHAIN_CACHE
+    with _CREDENTIAL_CACHE_LOCK:
+        if provider is None:
+            _CREDENTIAL_CACHE.clear()
+        else:
+            for key in [key for key in _CREDENTIAL_CACHE if key[0] == provider]:
+                _CREDENTIAL_CACHE.pop(key, None)
+        if provider in (None, "claude"):
+            _KEYCHAIN_CACHE = None
+
+
+def _candidate_fingerprint(candidates: list[tuple[Path, bool]]) -> tuple[Any, ...]:
+    fingerprint: list[Any] = []
+    for path, configured in candidates:
+        try:
+            result = path.lstat()
+            fingerprint.extend((
+                str(path), configured, True, path.is_symlink(),
+                result.st_ino, result.st_mtime_ns, result.st_ctime_ns,
+                result.st_size, stat.S_IMODE(result.st_mode),
+            ))
+        except OSError:
+            fingerprint.extend((str(path), configured, False, False, 0, 0, 0, 0, 0))
+    return tuple(fingerprint)
+
+
+def _cached_file_credentials(
+    provider: str,
+    config: Any,
+    loader: Callable[[], CredentialState | None],
+) -> CredentialState | None:
+    candidates = (
+        _candidate_codex_paths(config) if provider == "codex" else _candidate_claude_paths(config)
+    )
+    key = (provider, _candidate_fingerprint(candidates))
+    with _CREDENTIAL_CACHE_LOCK:
+        if key in _CREDENTIAL_CACHE:
+            state = _CREDENTIAL_CACHE.pop(key)
+            _CREDENTIAL_CACHE[key] = state
+            return copy.deepcopy(state)
+    state = loader()
+    with _CREDENTIAL_CACHE_LOCK:
+        _CREDENTIAL_CACHE.pop(key, None)
+        _CREDENTIAL_CACHE[key] = copy.deepcopy(state)
+        while len(_CREDENTIAL_CACHE) > _CREDENTIAL_CACHE_LIMIT:
+            _CREDENTIAL_CACHE.pop(next(iter(_CREDENTIAL_CACHE)))
+    return state
+
+
 def _state_from_file(
     provider: str,
     path: Path,
@@ -466,12 +593,7 @@ def _state_from_file(
     )
 
 
-def discover_codex_credentials(config: Any) -> CredentialState | None:
-    access = str(getattr(config, "access_token", "") or "").strip()
-    if access:
-        return CredentialState(provider="codex", access_token=access,
-                               expires_at=token_expiry(access), source="command line")
-
+def _discover_codex_file_credentials(config: Any) -> CredentialState | None:
     for path, configured in _candidate_codex_paths(config):
         if not _credential_file_is_readable(path):
             continue
@@ -486,6 +608,16 @@ def discover_codex_credentials(config: Any) -> CredentialState | None:
     return None
 
 
+def discover_codex_credentials(config: Any) -> CredentialState | None:
+    access = str(getattr(config, "access_token", "") or "").strip()
+    if access:
+        return CredentialState(provider="codex", access_token=access,
+                               expires_at=token_expiry(access), source="command line")
+    return _cached_file_credentials(
+        "codex", config, lambda: _discover_codex_file_credentials(config)
+    )
+
+
 def _is_oauth_token(value: str) -> bool:
     if not value:
         return False
@@ -494,7 +626,13 @@ def _is_oauth_token(value: str) -> bool:
     return value.startswith(("sk-ant-", "cc-", "eyJ", "oauth-"))
 
 
-def _read_claude_keychain() -> CredentialState | None:
+def _helper_environment() -> dict[str, str]:
+    """Minimal environment for trusted local helper executables."""
+    names = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL")
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def _read_claude_keychain_uncached() -> CredentialState | None:
     """Best-effort macOS Keychain support; inference never uses a subprocess."""
     if platform.system() != "Darwin":
         return None
@@ -506,6 +644,7 @@ def _read_claude_keychain() -> CredentialState | None:
             timeout=5,
             stdin=subprocess.DEVNULL,
             check=False,
+            env=_helper_environment(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -533,6 +672,22 @@ def _read_claude_keychain() -> CredentialState | None:
         path=None,
         scopes=list(oauth.get("scopes")) if isinstance(oauth.get("scopes"), list) else None,
     )
+
+
+def _read_claude_keychain() -> CredentialState | None:
+    """Briefly cache the Keychain subprocess result per local user/home."""
+    global _KEYCHAIN_CACHE
+    key = (platform.system(), os.environ.get("HOME", ""), os.environ.get("USER", ""))
+    now = time.monotonic()
+    with _CREDENTIAL_CACHE_LOCK:
+        if _KEYCHAIN_CACHE is not None:
+            cached_key, expires_at, state = _KEYCHAIN_CACHE
+            if cached_key == key and now < expires_at:
+                return copy.deepcopy(state)
+    state = _read_claude_keychain_uncached()
+    with _CREDENTIAL_CACHE_LOCK:
+        _KEYCHAIN_CACHE = (key, now + _KEYCHAIN_CACHE_TTL_SECONDS, copy.deepcopy(state))
+    return state
 
 
 def discover_claude_credentials(config: Any) -> CredentialState | None:
@@ -576,45 +731,50 @@ def discover_claude_credentials(config: Any) -> CredentialState | None:
             auth_mode="api_key",
         )
 
-    for path, configured in _candidate_claude_paths(config):
-        if not _credential_file_is_readable(path):
-            continue
-        data = _read_json_object(path)
-        if data is None:
-            continue
-        # Claude Code's canonical shape is claudeAiOauth. The generic token
-        # scanner also accepts the small set of current alternate shapes.
-        oauth = data.get("claudeAiOauth")
-        if isinstance(oauth, dict):
-            normalized = {
-                "tokens": {
-                    "accessToken": oauth.get("accessToken") or oauth.get("access_token"),
-                    "refreshToken": oauth.get("refreshToken") or oauth.get("refresh_token"),
-                    "expiresAt": oauth.get("expiresAt") or oauth.get("expires_at"),
-                    "scopes": oauth.get("scopes"),
+    def load_files() -> CredentialState | None:
+        for path, configured in _candidate_claude_paths(config):
+            if not _credential_file_is_readable(path):
+                continue
+            data = _read_json_object(path)
+            if data is None:
+                continue
+            # Claude Code's canonical shape is claudeAiOauth. The generic token
+            # scanner also accepts the small set of current alternate shapes.
+            oauth = data.get("claudeAiOauth")
+            if isinstance(oauth, dict):
+                normalized = {
+                    "tokens": {
+                        "accessToken": oauth.get("accessToken") or oauth.get("access_token"),
+                        "refreshToken": oauth.get("refreshToken") or oauth.get("refresh_token"),
+                        "expiresAt": oauth.get("expiresAt") or oauth.get("expires_at"),
+                        "scopes": oauth.get("scopes"),
+                    }
                 }
-            }
+                state = _state_from_file(
+                    "claude",
+                    path,
+                    normalized,
+                    source_label=_file_source_label("claude", path, configured),
+                )
+                if state:
+                    state.container_path = ("claudeAiOauth",)
+                    state.access_key = "accessToken"
+                    state.refresh_key = "refreshToken" if oauth.get("refreshToken") else None
+                    state.expiry_key = "expiresAt" if "expiresAt" in oauth else (
+                        "expires_at" if "expires_at" in oauth else None
+                    )
+                    state.scopes = list(oauth.get("scopes")) if isinstance(oauth.get("scopes"), list) else None
+                    return state
             state = _state_from_file(
-                "claude",
-                path,
-                normalized,
-                source_label=_file_source_label("claude", path, configured),
+                "claude", path, data, source_label=_file_source_label("claude", path, configured)
             )
             if state:
-                state.container_path = ("claudeAiOauth",)
-                state.access_key = "accessToken"
-                state.refresh_key = "refreshToken" if oauth.get("refreshToken") else None
-                state.expiry_key = "expiresAt" if "expiresAt" in oauth else (
-                    "expires_at" if "expires_at" in oauth else None
-                )
-                state.scopes = list(oauth.get("scopes")) if isinstance(oauth.get("scopes"), list) else None
                 return state
-        state = _state_from_file(
-            "claude", path, data, source_label=_file_source_label("claude", path, configured)
-        )
-        if state:
-            return state
+        return None
 
+    state = _cached_file_credentials("claude", config, load_files)
+    if state is not None:
+        return state
     return _read_claude_keychain()
 
 
@@ -713,10 +873,19 @@ def _http_status(error: BaseException) -> int | None:
     return int(value) if isinstance(value, int) else None
 
 
+_OAUTH_JSON_RESPONSE_LIMIT = 1024 * 1024
+
+
 def _json_response(response: Any) -> dict[str, Any]:
     try:
-        value = json.loads(response.read().decode("utf-8"))
-    except (OSError, http.client.HTTPException, UnicodeError, json.JSONDecodeError, AttributeError) as exc:
+        raw = response.read(_OAUTH_JSON_RESPONSE_LIMIT + 1)
+    except (OSError, http.client.HTTPException, AttributeError) as exc:
+        raise ProviderError("OAuth endpoint returned invalid JSON.", status=502, code="oauth_invalid_json") from exc
+    if len(raw) > _OAUTH_JSON_RESPONSE_LIMIT:
+        raise ProviderError("OAuth endpoint response was too large.", status=502, code="oauth_response_too_large")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, AttributeError) as exc:
         raise ProviderError("OAuth endpoint returned invalid JSON.", status=502, code="oauth_invalid_json") from exc
     if not isinstance(value, dict):
         raise ProviderError("OAuth endpoint returned an invalid response.", status=502, code="oauth_invalid_response")
@@ -765,11 +934,11 @@ def refresh_codex_oauth(
         if status == 429:
             raise AuthError(
                 "Codex OAuth refresh is rate-limited; retry later. Credentials were not changed.",
-                code="codex_refresh_rate_limited",
+                code="codex_refresh_rate_limited", headers=getattr(exc, "headers", None),
             ) from exc
         raise AuthError(
             f"Codex OAuth refresh failed (HTTP {status}). Run `codex login` and try again.",
-            code="codex_refresh_failed",
+            code="codex_refresh_failed", headers=getattr(exc, "headers", None),
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
         raise ProviderError("Codex OAuth refresh could not reach the token service.", status=502, code="codex_refresh_unreachable") from exc
@@ -864,19 +1033,35 @@ def refresh_claude_oauth(
     suffix = f" (HTTP {status})" if status else ""
     raise AuthError(
         f"Claude OAuth refresh failed{suffix}. Run `claude setup-token` or `claude login`.",
-        code="claude_refresh_failed",
+        code="claude_refresh_failed", headers=getattr(last_error, "headers", None),
     ) from last_error
 
 
-_REFRESH_LOCKS: dict[str, threading.Lock] = {}
+_REFRESH_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
 _REFRESH_LOCKS_GUARD = threading.Lock()
 _RETAINED_FILELESS: dict[str, CredentialState] = {}
+_RETAINED_FILELESS_LIMIT = 32
 _RETAINED_GUARD = threading.Lock()
 
 
-def _refresh_thread_lock(key: str) -> threading.Lock:
+def _acquire_refresh_thread_lock(key: str) -> threading.Lock:
     with _REFRESH_LOCKS_GUARD:
-        return _REFRESH_LOCKS.setdefault(key, threading.Lock())
+        lock, refs = _REFRESH_LOCKS.get(key, (threading.Lock(), 0))
+        _REFRESH_LOCKS[key] = (lock, refs + 1)
+    lock.acquire()
+    return lock
+
+
+def _release_refresh_thread_lock(key: str, lock: threading.Lock) -> None:
+    lock.release()
+    with _REFRESH_LOCKS_GUARD:
+        current = _REFRESH_LOCKS.get(key)
+        if current is None or current[0] is not lock:
+            return
+        if current[1] <= 1:
+            _REFRESH_LOCKS.pop(key, None)
+        else:
+            _REFRESH_LOCKS[key] = (lock, current[1] - 1)
 
 
 def _fileless_key(state: CredentialState) -> str:
@@ -884,14 +1069,27 @@ def _fileless_key(state: CredentialState) -> str:
 
 
 def _retained_fileless_state(state: CredentialState) -> CredentialState | None:
+    key = _fileless_key(state)
     with _RETAINED_GUARD:
-        retained = _RETAINED_FILELESS.get(_fileless_key(state))
+        retained = _RETAINED_FILELESS.get(key)
+        if retained is not None:
+            # An expired access token with no refresh grant can never be
+            # adopted again. Rotated states with a refresh token are retained
+            # even after access expiry so the original grant is not respent.
+            if retained.expires_at is not None and retained.expires_at <= _now() and not retained.refresh_token:
+                _RETAINED_FILELESS.pop(key, None)
+                return None
+            _RETAINED_FILELESS[key] = _RETAINED_FILELESS.pop(key)  # LRU touch
         return copy.copy(retained) if retained is not None else None
 
 
 def _retain_fileless_state(state: CredentialState) -> None:
+    key = _fileless_key(state)
     with _RETAINED_GUARD:
-        _RETAINED_FILELESS[_fileless_key(state)] = copy.copy(state)
+        _RETAINED_FILELESS.pop(key, None)
+        _RETAINED_FILELESS[key] = copy.copy(state)
+        while len(_RETAINED_FILELESS) > _RETAINED_FILELESS_LIMIT:
+            _RETAINED_FILELESS.pop(next(iter(_RETAINED_FILELESS)))
 
 
 @contextmanager
@@ -904,7 +1102,8 @@ def _credential_refresh_lock(path_or_key, *, path: Path | None = None) -> Iterat
     provider CLIs that ignore it remain outside that coordination.
     """
     key = str(path if path is not None else path_or_key)
-    with _refresh_thread_lock(key):
+    thread_lock = _acquire_refresh_thread_lock(key)
+    try:
         if path is None:
             yield
             return
@@ -919,7 +1118,10 @@ def _credential_refresh_lock(path_or_key, *, path: Path | None = None) -> Iterat
                 os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
             except (AttributeError, OSError):
                 pass
-            deadline = time.monotonic() + 5.0
+            # The lock holder may try two bounded OAuth endpoints (20 s
+            # each) plus the atomic write; wait long enough to adopt its
+            # rotation instead of failing or spending the same grant twice.
+            deadline = time.monotonic() + 65.0
             while True:
                 try:
                     if fcntl is not None:
@@ -955,6 +1157,8 @@ def _credential_refresh_lock(path_or_key, *, path: Path | None = None) -> Iterat
                     os.close(fd)
                 except OSError:
                     pass
+    finally:
+        _release_refresh_thread_lock(key, thread_lock)
 
 
 def _ensure_safe_credential_target(path: Path) -> None:
@@ -1121,6 +1325,8 @@ def resolve_codex_credentials(
     force_refresh: bool = False,
     opener: Callable[..., Any] | None = None,
 ) -> CredentialState:
+    if force_refresh:
+        invalidate_credential_cache("codex")
     state = discover_codex_credentials(config)
     if state is None or not state.access_token:
         raise AuthError(
@@ -1197,6 +1403,8 @@ def resolve_claude_credentials(
     force_refresh: bool = False,
     opener: Callable[..., Any] | None = None,
 ) -> CredentialState:
+    if force_refresh:
+        invalidate_credential_cache("claude")
     state = discover_claude_credentials(config)
     if state is None or not state.access_token:
         raise AuthError(
@@ -1816,6 +2024,28 @@ def request_tool_policy(body: Mapping[str, Any], *, route: str) -> tuple[str, st
     return choice, name.strip() if isinstance(name, str) else None, parallel is False
 
 
+def _validated_stop_sequences(body: Mapping[str, Any], *, route: str) -> list[str]:
+    """Return stop sequences or reject a malformed shape by name."""
+    value = body.get("stop") if body.get("stop") is not None else body.get("stop_sequences")
+    if value is None:
+        return []
+    if isinstance(value, str):
+        sequences = [value]
+    elif isinstance(value, list):
+        sequences = value
+    else:
+        raise ProviderError(
+            "stop must be a string or an array of strings.",
+            code=f"{route}_invalid_request",
+        )
+    if any(not isinstance(item, str) or not item for item in sequences):
+        raise ProviderError(
+            "stop sequences must be nonempty strings.",
+            code=f"{route}_invalid_request",
+        )
+    return list(sequences)
+
+
 def _wire_call_id(original_call_id: str) -> str:
     """Sanitize a history call ID into Anthropic's charset, injectively.
 
@@ -1932,6 +2162,9 @@ def responses_to_anthropic(
         system_parts.extend(_content_parts(instructions, role="system"))
     messages: list[dict[str, Any]] = []
     call_ids: dict[str, str] = {}
+    call_id_occurrences: dict[str, list[str]] = {}
+    call_output_counts: dict[str, int] = {}
+    used_wire_call_ids: set[str] = set()
 
     for position, raw in enumerate(_input_items(body)):
         if not isinstance(raw, dict):
@@ -1943,8 +2176,9 @@ def responses_to_anthropic(
                 original_call_id = "call_" + hashlib.sha256(
                     f"{raw.get('name') or 'tool'}:{position}".encode("utf-8")
                 ).hexdigest()[:16]
-            wire_call_id = _wire_call_id(original_call_id)
+            wire_call_id = _allocate_item_id(_wire_call_id(original_call_id), used_wire_call_ids)
             call_ids[wire_call_id] = original_call_id
+            call_id_occurrences.setdefault(original_call_id, []).append(wire_call_id)
             name = str(raw.get("name") or "").strip()
             if not name:
                 continue
@@ -1979,9 +2213,12 @@ def responses_to_anthropic(
 
         if item_type == "function_call_output":
             original_call_id = str(raw.get("call_id") or "").strip()
-            wire_call_id = next(
-                (wire for wire, original in call_ids.items() if original == original_call_id),
-                _wire_call_id(original_call_id) if original_call_id else original_call_id,
+            occurrences = call_id_occurrences.get(original_call_id, [])
+            output_index = call_output_counts.get(original_call_id, 0)
+            call_output_counts[original_call_id] = output_index + 1
+            wire_call_id = (
+                occurrences[output_index] if output_index < len(occurrences)
+                else _wire_call_id(original_call_id) if original_call_id else original_call_id
             )
             block = {
                 "type": "tool_result",
@@ -2077,11 +2314,9 @@ def responses_to_anthropic(
         value = body.get(source)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             payload[destination] = value
-    stop = body.get("stop") or body.get("stop_sequences")
-    if isinstance(stop, str):
-        payload["stop_sequences"] = [stop]
-    elif isinstance(stop, list) and all(isinstance(item, str) for item in stop):
-        payload["stop_sequences"] = stop
+    stop_sequences = _validated_stop_sequences(body, route="claude")
+    if stop_sequences:
+        payload["stop_sequences"] = stop_sequences
     if isinstance(body.get("metadata"), dict):
         payload["metadata"] = copy.deepcopy(body["metadata"])
     return payload, tool_names
@@ -2188,6 +2423,7 @@ def anthropic_json_to_responses(
         response_id = "resp_" + secrets.token_hex(8)
     output: list[dict[str, Any]] = []
     used_item_ids: set = set()
+    used_call_ids: set = set()
     text_message: dict[str, Any] | None = None
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     for index, block in enumerate(payload.get("content", []) if isinstance(payload.get("content"), list) else []):
@@ -2216,7 +2452,7 @@ def anthropic_json_to_responses(
             )
         elif block_type == "tool_use":
             raw_id = str(block.get("id") or "tool_" + str(index))
-            call_id = tool_names.decode_call_id(raw_id)
+            call_id = _allocate_item_id(tool_names.decode_call_id(raw_id), used_call_ids)
             name = tool_names.decode(str(block.get("name") or ""))
             arguments = block.get("input", {})
             if not isinstance(arguments, str):
@@ -2246,9 +2482,9 @@ def anthropic_json_to_responses(
         result["incomplete_details"] = {"reason": "max_output_tokens"}
     if status == "failed":
         result["error"] = {
-            "message": f"Claude turn stopped with reason: {stop_reason}.",
-            "type": str(stop_reason or "upstream_error"),
-            "code": str(stop_reason or "upstream_error"),
+            "message": bounded_client_error_text(f"Claude turn stopped with reason: {stop_reason}."),
+            "type": bounded_client_error_code(stop_reason, "upstream_error"),
+            "code": bounded_client_error_code(stop_reason, "upstream_error"),
         }
     return result
 
@@ -2271,6 +2507,9 @@ class StreamState:
     ignored_event_types: list[str] = field(default_factory=list)
     _used_item_ids: set = field(default_factory=set, init=False, repr=False)
     _coalesced_text: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _seen_block_indices: set[int] = field(default_factory=set, init=False, repr=False)
+    _accumulated_bytes: int = field(default=0, init=False, repr=False)
+    _used_call_ids: set = field(default_factory=set, init=False, repr=False)
 
     def ensure_id(self, value: Any = None) -> None:
         if self.response_id:
@@ -2296,9 +2535,9 @@ class StreamState:
             result["incomplete_details"] = {"reason": "max_output_tokens"}
         if status == "failed" and self.error_message:
             result["error"] = {
-                "message": self.error_message,
-                "type": self.error_type or "upstream_error",
-                "code": self.error_type or "upstream_error",
+                "message": bounded_client_error_text(self.error_message),
+                "type": bounded_client_error_code(self.error_type, "upstream_error"),
+                "code": bounded_client_error_code(self.error_type, "upstream_error"),
             }
         return result
 
@@ -2307,6 +2546,37 @@ def _event_payload(event_type: str, data: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(data)
     payload["type"] = event_type
     return payload
+
+
+def _fail_claude_stream(
+    state: StreamState,
+    events: list[tuple[str, dict[str, Any]]],
+    message: str,
+    error_type: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    if state.finished:
+        return events
+    state.error_message = message
+    state.error_type = error_type
+    state.stop_reason = "error"
+    events.append((
+        "response.failed",
+        _event_payload("response.failed", {"response": state.response(status="failed")}),
+    ))
+    state.finished = True
+    return events
+
+
+def _stream_append_within_limits(state: StreamState, block: dict[str, Any], current: str, fragment: str) -> bool:
+    current_bytes = block.setdefault("byte_len", _utf8_len(current))
+    fragment_bytes = _utf8_len(fragment)
+    if current_bytes + fragment_bytes > _STREAM_BLOCK_LIMIT:
+        return False
+    if state._accumulated_bytes + fragment_bytes > _STREAM_RESPONSE_LIMIT:
+        return False
+    block["byte_len"] = current_bytes + fragment_bytes
+    state._accumulated_bytes += fragment_bytes
+    return True
 
 
 def convert_anthropic_event(
@@ -2383,6 +2653,14 @@ def convert_anthropic_event(
 
     if event_type == "content_block_start":
         index = _sse_block_index(data, len(state.blocks))
+        existing = state.blocks.get(index)
+        if existing is not None and not existing.get("closed"):
+            return _fail_claude_stream(
+                state, events,
+                f"Claude stream restarted open content block {index}.",
+                "invalid_stream_lifecycle",
+            )
+        state._seen_block_indices.add(index)
         block = data.get("content_block") if isinstance(data.get("content_block"), dict) else {}
         block_type = block.get("type")
         if block_type == "text":
@@ -2406,7 +2684,7 @@ def convert_anthropic_event(
             events.append(("response.content_part.added", _event_payload("response.content_part.added", {"item_id": item_id, "output_index": len(state.output) - 1, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})))
         elif block_type == "tool_use":
             raw_id = str(block.get("id") or f"tool_{index}")
-            call_id = state.tool_names.decode_call_id(raw_id)
+            call_id = _allocate_item_id(state.tool_names.decode_call_id(raw_id), state._used_call_ids)
             name = state.tool_names.decode(str(block.get("name") or ""))
             item_id = _allocate_item_id(_responses_function_id(raw_id, call_id), state._used_item_ids)
             item = {
@@ -2426,8 +2704,28 @@ def convert_anthropic_event(
         index = _sse_block_index(data, 0)
         block = state.blocks.get(index)
         delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
+        if index not in state._seen_block_indices:
+            return _fail_claude_stream(
+                state, events,
+                f"Claude stream sent a delta for unknown content block {index}.",
+                "invalid_stream_lifecycle",
+            )
+        if block is None:
+            return events  # Deliberately ignored block type (for example thinking).
+        if block.get("closed"):
+            return _fail_claude_stream(
+                state, events,
+                f"Claude stream sent a delta for closed content block {index}.",
+                "invalid_stream_lifecycle",
+            )
         if block and block.get("kind") == "text" and delta.get("type") == "text_delta":
             text = str(delta.get("text") or "")
+            if not _stream_append_within_limits(state, block, block["text"], text):
+                return _fail_claude_stream(
+                    state, events,
+                    "Claude stream exceeded the accumulated response size limit.",
+                    "upstream_response_too_large",
+                )
             block["text"] += text
             item = block["item"]
             content = item.setdefault("content", [])
@@ -2438,17 +2736,41 @@ def convert_anthropic_event(
             events.append(("response.output_text.delta", _event_payload("response.output_text.delta", {"item_id": item["id"], "output_index": output_index, "content_index": 0, "delta": text})))
         elif block and block.get("kind") == "tool" and delta.get("type") == "input_json_delta":
             fragment = str(delta.get("partial_json") or "")
+            if not _stream_append_within_limits(state, block, block["arguments"], fragment):
+                return _fail_claude_stream(
+                    state, events,
+                    "Claude stream exceeded the accumulated response size limit.",
+                    "upstream_response_too_large",
+                )
             block["arguments"] += fragment
             block["item"]["arguments"] = block["arguments"]
             output_index = state.output.index(block["item"])
             events.append(("response.function_call_arguments.delta", _event_payload("response.function_call_arguments.delta", {"item_id": block["item"]["id"], "output_index": output_index, "delta": fragment})))
+        elif delta.get("type") in {"text_delta", "input_json_delta"}:
+            return _fail_claude_stream(
+                state, events,
+                f"Claude stream sent a {delta.get('type')} for incompatible content block {index}.",
+                "invalid_stream_lifecycle",
+            )
         return events
 
     if event_type == "content_block_stop":
         index = _sse_block_index(data, 0)
         block = state.blocks.get(index)
+        if index not in state._seen_block_indices:
+            return _fail_claude_stream(
+                state, events,
+                f"Claude stream stopped unknown content block {index}.",
+                "invalid_stream_lifecycle",
+            )
         if not block:
-            return events
+            return events  # Deliberately ignored block type.
+        if block.get("closed"):
+            return _fail_claude_stream(
+                state, events,
+                f"Claude stream stopped closed content block {index} twice.",
+                "invalid_stream_lifecycle",
+            )
         block["closed"] = True
         if block.get("kind") == "tool":
             try:
@@ -2486,11 +2808,9 @@ def convert_anthropic_event(
     if event_type == "error":
         error = data.get("error") if isinstance(data.get("error"), dict) else {}
         message = str(error.get("message") or "Claude upstream returned an error.")
-        state.error_message = message
-        state.error_type = str(error.get("type") or "upstream_error")
-        events.append(("error", _event_payload("error", {"error": {"message": message, "type": str(error.get("type") or "upstream_error")}})))
-        state.stop_reason = "error"
-        return events
+        return _fail_claude_stream(
+            state, events, message, str(error.get("type") or "upstream_error")
+        )
 
     if event_type == "message_stop":
         if any(not b.get("closed") for b in state.blocks.values()) or state.stop_reason is None:
@@ -2530,14 +2850,23 @@ def convert_anthropic_event(
 def _iter_sse_text(stream: Any) -> Iterator[tuple[str, dict[str, Any]]]:
     event_name = ""
     data_lines: list[str] = []
+    total_bytes = 0
+    event_bytes = 0
     while True:
-        line = stream.readline(4 * 1024 * 1024 + 1)
+        line = stream.readline(_SSE_LINE_LIMIT + 1)
         if not line:
             break
-        if len(line) > 4 * 1024 * 1024 and not line.endswith(b"\n" if isinstance(line, bytes) else "\n"):
+        line_bytes = len(line) if isinstance(line, bytes) else _utf8_len(line)
+        if line_bytes > _SSE_LINE_LIMIT and not line.endswith(b"\n" if isinstance(line, bytes) else "\n"):
             raise ProviderError(
                 "Claude SSE line exceeded the safety size limit.", status=502,
                 code="upstream_protocol_error",
+            )
+        total_bytes += line_bytes
+        if total_bytes > _STREAM_RESPONSE_LIMIT:
+            raise ProviderError(
+                "Claude stream exceeded the safety size limit.", status=502,
+                code="upstream_response_too_large",
             )
         if isinstance(line, bytes):
             line = line.decode("utf-8", errors="replace")
@@ -2554,13 +2883,21 @@ def _iter_sse_text(stream: Any) -> Iterator[tuple[str, dict[str, Any]]]:
                     yield event_name or str(data.get("type") or ""), data
             event_name = ""
             data_lines = []
+            event_bytes = 0
             continue
         if line.startswith(":"):
             continue
         if line.startswith("event:"):
             event_name = line[6:].strip()
         elif line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
+            value = line[5:].lstrip()
+            event_bytes += _utf8_len(value) + 1
+            if event_bytes > _SSE_EVENT_LIMIT:
+                raise ProviderError(
+                    "Claude SSE event exceeded the safety size limit.", status=502,
+                    code="upstream_protocol_error",
+                )
+            data_lines.append(value)
     if data_lines:
         try:
             data = json.loads("\n".join(data_lines))

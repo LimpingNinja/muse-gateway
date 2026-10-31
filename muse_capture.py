@@ -136,18 +136,27 @@ def _known_secret_spans(data, secret):
         yield len(data) - matched, len(data)
 
 
+def _helper_environment():
+    """Minimal environment for trusted local helper executables."""
+    names = (
+        "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL",
+        "SystemRoot", "WINDIR", "ComSpec", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    )
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def _private_directory(path):
     os.chmod(path, 0o700)
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         output = subprocess.check_output(
             ["whoami", "/user", "/fo", "csv", "/nh"], text=True,
-            creationflags=flags,
+            creationflags=flags, env=_helper_environment(),
         )
         sid = next(csv.reader(io.StringIO(output.strip())))[1]
         subprocess.run(
             ["icacls", str(path), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
-            check=True, capture_output=True, creationflags=flags,
+            check=True, capture_output=True, creationflags=flags, env=_helper_environment(),
         )
 
 
@@ -187,7 +196,7 @@ def _source_identity():
     try:
         revision = subprocess.check_output(
             ["git", "-C", str(root), "rev-parse", "HEAD"], text=True,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=_helper_environment(),
         ).strip()
     except (OSError, subprocess.SubprocessError):
         pass
@@ -244,6 +253,7 @@ class RequestCapture:
         self.first_events = {}
         self.terminals = {}
         self._finished = False
+        self._handles = {}
         for secret in secrets:
             self.add_secret(secret)
         self.token = _ACTIVE.set(self)
@@ -310,6 +320,42 @@ class RequestCapture:
             return self.redact(value.encode()).decode("utf-8", errors="replace")
         return value
 
+    def _artifact_unavailable(self, name):
+        stats = self.artifacts.get(name)
+        return bool(stats and stats["truncated"]) or self.written >= self.limit
+
+    def _mark_truncated(self, name):
+        stats = self.artifacts.setdefault(name, {"captured_bytes": 0, "truncated": False})
+        stats["truncated"] = True
+        self._close_handle(name)
+
+    def _close_handle(self, name):
+        handle = self._handles.pop(name, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def _close_handles(self):
+        for name in list(self._handles):
+            self._close_handle(name)
+
+    def _artifact_handle(self, name):
+        handle = self._handles.get(name)
+        if handle is not None:
+            return handle
+        path = self.directory / name
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(path, 0o600)
+            handle = os.fdopen(descriptor, "r+b")
+        except Exception:
+            os.close(descriptor)
+            raise
+        self._handles[name] = handle
+        return handle
+
     def _append(self, name, data):
         stats = self.artifacts.setdefault(name, {"captured_bytes": 0, "truncated": False})
         if stats["truncated"]:
@@ -319,16 +365,17 @@ class RequestCapture:
             stats["truncated"] = True
         selected = data[:available]
         try:
-            path = self.directory / name
             offset = None
+            handle = None
             if selected and len(data) >= available:
                 # The budget creates an EOF of its own. Include bounded bytes
                 # from the prior append so a split prefix cannot escape here.
                 previous = b""
                 if stats["captured_bytes"] and len(selected) < _MAX_OVERLAP:
-                    with open(path, "rb") as handle:
-                        handle.seek(max(0, stats["captured_bytes"] - _MAX_OVERLAP))
-                        previous = handle.read(_MAX_OVERLAP)
+                    handle = self._artifact_handle(name)
+                    handle.flush()
+                    handle.seek(max(0, stats["captured_bytes"] - _MAX_OVERLAP))
+                    previous = handle.read(_MAX_OVERLAP)
                 context = previous + selected[-_MAX_OVERLAP:]
                 scrubbed = self.redact(context)
                 if scrubbed != context:
@@ -341,20 +388,23 @@ class RequestCapture:
                         selected = scrubbed
                     else:
                         selected = selected[:start - stats["captured_bytes"]] + scrubbed
-            if offset is None and not path.exists():
-                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-            with open(path, "r+b" if offset is not None and path.exists() else "ab") as handle:
-                if offset is not None:
-                    handle.seek(offset)
-                    handle.write(selected)
-                    handle.truncate()
-                else:
-                    handle.write(selected)
-            os.chmod(path, 0o600)
+            if handle is None:
+                handle = self._artifact_handle(name)
+            if offset is not None:
+                handle.seek(offset)
+                handle.write(selected)
+                handle.truncate()
+            else:
+                handle.seek(stats["captured_bytes"])
+                handle.write(selected)
+            handle.flush()
             added = len(selected) if offset is None else offset + len(selected) - stats["captured_bytes"]
             self.written += added
             stats["captured_bytes"] += added
+            if stats["truncated"]:
+                self._close_handle(name)
         except OSError as error:
+            self._close_handle(name)
             if type(error).__name__ not in self.errors:
                 self.errors.append(type(error).__name__)
 
@@ -362,10 +412,20 @@ class RequestCapture:
         if self.events >= 50000:
             return
         self.events += 1
+        if self._artifact_unavailable("timeline.jsonl"):
+            self._mark_truncated("timeline.jsonl")
+            return
         record = {"event": name, "elapsed_ns": time.monotonic_ns() - self.started, **fields}
         self._append("timeline.jsonl", json.dumps(self.sanitize(record), ensure_ascii=True).encode() + b"\n")
 
     def json(self, name, value):
+        if name + ".json" in self.artifacts:
+            name = self.label(name)
+        artifact = name + ".json"
+        if self._artifact_unavailable(artifact):
+            self._mark_truncated(artifact)
+            return
+
         def register(node, protected=False):
             if isinstance(node, dict):
                 for key, item in node.items():
@@ -376,15 +436,17 @@ class RequestCapture:
             elif protected:
                 self.add_secret(node)
         register(value)
-        if name + ".json" in self.artifacts:
-            name = self.label(name)
-        self._append(name + ".json", json.dumps(self.sanitize(value), ensure_ascii=True, indent=2).encode() + b"\n")
+        self._append(artifact, json.dumps(self.sanitize(value), ensure_ascii=True, indent=2).encode() + b"\n")
 
     def bytes(self, name, data):
         """Redact before disk, retaining boundary overlap only in memory."""
         state = self.streams.setdefault(name, {"tail": b"", "redacting": None, "suppressed": False, "observed_bytes": 0, "sha256": hashlib.sha256()})
         state["observed_bytes"] += len(data)
         state["sha256"].update(data)
+        if self._artifact_unavailable(name):
+            self._mark_truncated(name)
+            state["tail"] = b""
+            return
         longest = max(map(len, self.secrets), default=0)
         if state["suppressed"]:
             return
@@ -475,6 +537,10 @@ class RequestCapture:
 
     def protobuf(self, name, message, original=None):
         """Retain a scrubbed protobuf plus readable fields; never auth bytes."""
+        if self.written >= self.limit:
+            self._mark_truncated(name + ".json")
+            self._mark_truncated(name + ".pb")
+            return message.SerializeToString()
         from google.protobuf.json_format import MessageToDict
         clone = type(message)()
         clone.CopyFrom(message)
@@ -523,6 +589,7 @@ class RequestCapture:
         self.event("request.close", **outcome)
         for name, state in self.streams.items():
             self._append(name, self.redact(state["tail"]))
+        self._close_handles()
         manifest = {
             "request_id": self.request_id, "outcome": outcome,
             "first_events": self.first_events, "terminal_events": self.terminals,

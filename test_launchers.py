@@ -790,6 +790,14 @@ class TrustBoundaryTests(unittest.TestCase):
                         os.chdir(previous)
                 self.assertEqual((path, count), (None, 0))
                 self.assertNotIn("MUSE_GATEWAY_HOSTILE_SENTINEL", os.environ)
+                target = Path(directory) / "real.env"
+                target.write_text("MUSE_GATEWAY_SYMLINK_SENTINEL=followed\n")
+                (module_dir / ".env").symlink_to(target)
+                with patch.object(muse_gateway, "__file__", str(module_dir / "muse_gateway.py")):
+                    self.assertEqual(muse_gateway._default_env_file(), os.path.realpath(target))
+                    path, count = muse_gateway._load_config_file([])
+                self.assertEqual((path, count), (os.path.realpath(target), 1))
+                self.assertEqual(os.environ.get("MUSE_GATEWAY_SYMLINK_SENTINEL"), "followed")
             finally:
                 os.environ.clear()
                 os.environ.update(saved)
@@ -818,6 +826,8 @@ class TrustBoundaryTests(unittest.TestCase):
             "META_API_KEY": "s3", "DEVIN_API_KEY": "s4", "CODEX_X": "s5",
             "OPENAI_API_KEY": "s6", "ANTHROPIC_API_KEY": "s7",
             "CLAUDE_CODE_OAUTH_TOKEN": "s8", "KIRO_X": "s9",
+            "AWS_SECRET_ACCESS_KEY": "aws-secret", "AZURE_CLIENT_SECRET": "azure-secret",
+            "CUSTOM_SERVICE_TOKEN": "custom-secret", "SUPPLIER_PASSWORD": "password-secret",
             "CLAUDE_CONFIG_DIR": "/tmp/claude-cfg", "PATH": "/usr/bin",
         }
         with patch.dict(os.environ, sentinels, clear=True):
@@ -959,7 +969,7 @@ class LifecycleAndIdentityTests(unittest.TestCase):
 
         with patch.dict(os.environ, _clean_environment(), clear=True), \
                 patch.object(muse_gateway, "_launch_lifecycle", side_effect=lifecycle), \
-                patch.object(muse_gateway, "_stop_child", side_effect=lambda child: setattr(child, "stopped", True)), \
+                patch.object(muse_gateway, "_stop_children", side_effect=lambda children: [setattr(child, "stopped", True) for child in children]), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = launch_main([], ["--check-only", "--port", str(_free_port())])
         self.assertEqual(code, 128 + 15)
@@ -993,6 +1003,11 @@ class LifecycleAndIdentityTests(unittest.TestCase):
             parse_args(["--version"])
         self.assertEqual(exited.exception.code, 0)
         self.assertEqual(out.getvalue().strip(), f"muse-gateway {muse_gateway._gateway_version()}")
+        import re as re_module
+        pyproject = (Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
+        packaged_version = re_module.search(r'^version\s*=\s*"([^"]+)"', pyproject, flags=re_module.MULTILINE).group(1)
+        self.assertEqual(muse_gateway._gateway_version(), packaged_version)
+        self.assertEqual(muse_gateway.MuseShimHandler.server_version, f"muse-gateway/{packaged_version}")
 
     def test_bare_server_failures_exit_one_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1016,15 +1031,19 @@ class LifecycleAndIdentityTests(unittest.TestCase):
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertIn("muse-gateway:", result.stderr)
 
-    def test_missing_protobuf_degrades_to_one_devin_error(self):
+    def test_unavailable_protobuf_degrades_to_one_devin_error(self):
         # P1-17 (de-wonder's method): block google.* in a child interpreter.
+        # Missing protobuf raises ImportError; a wrong runtime raises the
+        # protobuf VersionError. Both must degrade Devin, not crash startup.
         root = Path(__file__).resolve().parent
         probe = (
             "import sys, json, threading, urllib.request, urllib.error, argparse, io\n"
+            "mode = sys.argv[2]\n"
+            "class VersionError(Exception): pass\n"
             "class Block:\n"
             "    def find_spec(self, name, path=None, target=None):\n"
             "        if name == 'google' or name.startswith('google.'):\n"
-            "            raise ImportError('blocked ' + name)\n"
+            "            raise (VersionError('blocked ' + name) if mode == 'version' else ImportError('blocked ' + name))\n"
             "sys.meta_path.insert(0, Block())\n"
             "import muse_gateway as g\n"
             "from contextlib import redirect_stdout\n"
@@ -1048,16 +1067,49 @@ class LifecycleAndIdentityTests(unittest.TestCase):
             "    print('devin', e.code, json.load(e)['error']['type'])\n"
             "server.shutdown()\n"
         )
-        with tempfile.TemporaryDirectory() as directory:
-            env = {**_clean_environment(), "PYTHONPATH": str(root)}
-            result = subprocess.run([sys.executable, "-c", probe, str(Path(directory) / "g.log")],
-                                    cwd=directory, env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        lines = result.stdout.splitlines()
-        self.assertIn("help 0", lines)
-        self.assertIn("doctor True", lines)
-        self.assertIn("devin 503 devin_unavailable", lines)
-        self.assertNotIn("Traceback", result.stderr)
+        for mode in ("missing", "version"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                env = {**_clean_environment(), "PYTHONPATH": str(root)}
+                result = subprocess.run([sys.executable, "-c", probe, str(Path(directory) / "g.log"), mode],
+                                        cwd=directory, env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertIn("help 0", lines)
+                self.assertIn("doctor True", lines)
+                self.assertIn("devin 503 devin_unavailable", lines)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_env_file_help_names_only_the_beside_module_default(self):
+        import re
+
+        import muse_gateway
+
+        actions = {
+            option: action
+            for action in muse_gateway._build_parser()._actions
+            for option in action.option_strings
+        }
+        self.assertEqual(
+            actions["--env-file"].help,
+            "config file for server, doctor, models or launch (default: beside muse_gateway.py only)",
+        )
+        self.assertIn("--env-file PATH            config file (default: beside muse_gateway.py only)", muse_gateway.LAUNCH_USAGE)
+        self.assertNotIn("else ./.env", muse_gateway.LAUNCH_USAGE)
+        example = (Path(__file__).resolve().parent / ".env.example").read_text(encoding="utf-8")
+        example_keys = {
+            match.group(1)
+            for line in example.splitlines()
+            if (match := re.match(r"\s*#?\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line))
+        }
+        self.assertEqual(example_keys, {
+            "MUSE_GATEWAY_PORT", "MUSE_GATEWAY_TIMEOUT", "MUSE_GATEWAY_TURN_TIMEOUT",
+            "MUSE_GATEWAY_MAX_CONCURRENT_REQUESTS", "MUSE_GATEWAY_LOG_FILE",
+            "MUSE_GATEWAY_MODELS", "MUSE_GATEWAY_LOCAL_UPSTREAM", "MUSE_GATEWAY_LOCAL_API_KEY",
+            "MUSE_GATEWAY_CLAUDE_TRANSPORT", "MUSE_GATEWAY_CLAUDE_CLI_PASSTHROUGH",
+            "MUSE_GATEWAY_KIRO_UPSTREAM", "MUSE_GATEWAY_KIRO_API_KEY",
+        })
+        source = Path(muse_gateway.__file__).read_text(encoding="utf-8")
+        self.assertLessEqual(example_keys, set(re.findall(r"MUSE_GATEWAY_[A-Z0-9_]+", source)))
 
     def test_doctor_and_catalog_say_cli_turns_arrive_whole(self):
         # P2-12: the buffered transport is disclosed, never faked as streaming.
@@ -1099,6 +1151,80 @@ class LifecycleAndIdentityTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, stderr)
             self.assertIn("stopped on SIGTERM", stderr)
             self.assertNotIn("Traceback", stderr)
+
+    def test_timeout_options_reject_nonfinite_and_out_of_range_values(self):
+        for option in ("--timeout", "--stream-idle-timeout"):
+            for value in ("0", "-1", "nan", "inf", "86401"):
+                with self.subTest(option=option, value=value), \
+                        patch.dict(os.environ, _clean_environment(), clear=True), \
+                        redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as caught:
+                    parse_args(["auto", option, value])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_close_inflight_stops_a_real_tracked_sleep_child(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, _clean_environment(), clear=True):
+            config = Config(parse_args([
+                "auto", "--no-model-discovery", "--port", "0",
+                "--log-file", str(Path(directory) / "g.log"),
+            ]))
+            server = MuseShimServer(("127.0.0.1", 0), config)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                server.track(child)
+                self.assertEqual(server.close_inflight(), 1)
+                self.assertIsNotNone(child.poll())
+                self.assertEqual(server.closed_inflight_total, 1)
+                self.assertEqual(server.close_inflight(), 0)
+                self.assertEqual(server.closed_inflight_total, 1)
+            finally:
+                if child.poll() is None:
+                    _stop_child(child)
+                server.server_close()
+
+    def test_stop_child_stops_a_real_session_leader_and_grandchild(self):
+        if os.name == "nt":
+            self.skipTest("POSIX process-group ownership")
+        import time as time_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "grandchild.pid"
+            script = Path(directory) / "leader.py"
+            script.write_text(
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "open(sys.argv[1], 'w', encoding='utf-8').write(str(child.pid))\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            leader = subprocess.Popen(
+                [sys.executable, str(script), str(pid_file)], start_new_session=True)
+            grandchild_pid = None
+            try:
+                deadline = time_module.monotonic() + 5
+                while time_module.monotonic() < deadline and not pid_file.exists():
+                    time_module.sleep(0.02)
+                grandchild_pid = int(pid_file.read_text(encoding="utf-8"))
+                _stop_child(leader)
+                self.assertIsNotNone(leader.poll())
+                deadline = time_module.monotonic() + 5
+                while time_module.monotonic() < deadline:
+                    try:
+                        os.kill(grandchild_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time_module.sleep(0.02)
+                else:
+                    self.fail("grandchild survived owned process-group stop")
+            finally:
+                if leader.poll() is None:
+                    _stop_child(leader)
+                if grandchild_pid is not None:
+                    try:
+                        os.kill(grandchild_pid, 9)
+                    except (ProcessLookupError, PermissionError):
+                        pass
 
 
 if __name__ == "__main__":

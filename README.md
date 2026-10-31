@@ -24,7 +24,7 @@ affiliated with Meta, OpenAI, Anthropic, Cognition, or AWS.
 
 - **Python 3.10 or newer**, with pip. Install and run the gateway with the same
   Python environment. The package installs its one runtime dependency,
-  `protobuf>=7.35.1`, for you; you do not need a protobuf compiler.
+  `protobuf>=7.35.1,<8`, for you; you do not need a protobuf compiler.
 - **Muse Code**, available as `muse` in your terminal and signed in with
   `muse login` for the usual subscription-based launch.
 - **Access to the providers you want to use.** You do not need to install every
@@ -129,7 +129,10 @@ Use `--claude-cli` if the executable has a different path.
 By default the gateway invokes the official `claude -p` command. Claude's own
 tools and session persistence are disabled for these calls; requested tool
 calls come back to Muse to execute. Output arrives after each subprocess
-finishes, not token by token, and this transport advertises text-only input.
+finishes, not token by token, and this transport advertises text-only input
+(image input is rejected with `claude_cli_images_unsupported`). A per-request
+output cap below the model limit is rejected with
+`claude_cli_output_limit_unsupported`, because `claude -p` cannot enforce it.
 Time to first token therefore equals the whole generation time, and
 cancelling waits for the subprocess (bounded by `--timeout`). The gateway does
 not fake token pacing. Use `--claude-transport http` when you need streaming.
@@ -220,8 +223,10 @@ Without discovery, the small bundled SWE model list is a fallback, not an
 account-verified roster.
 
 Text streams incrementally. Function calls are released once their names and
-arguments are final, so the streamed and completed arguments agree. Developer
-messages retain their position in history. Native signed-reasoning replay is
+arguments are final, so the streamed and completed arguments agree. Because a
+call is held until final, text produced after it in the same upstream turn can
+stream first; the final output order is the release order. Developer messages
+retain their position in history. Native signed-reasoning replay is
 not implemented; incoming signatures are not forwarded as provider-owned state.
 
 ### Kiro Gateway
@@ -409,8 +414,9 @@ Commonly needed flags that otherwise appear only in `--help`: `--models`
 Use `--env-file PATH` after `launch` to choose a file. Otherwise it looks beside
 `muse_gateway.py` only — the current directory's `.env` is never loaded
 implicitly, because the working directory is the (untrusted) project under edit.
-A named `--env-file` that does not exist is an error. Startup prints a
-`config:` line naming the file loaded (or `config: no env file`). The source
+A named `--env-file` that does not exist is an error. Symlinked env files are
+followed; for the beside-module default, startup prints the resolved target.
+Startup prints a `config:` line naming the file loaded (or `config: no env file`). The source
 wrappers pass `.env` beside the scripts only when that file exists. Installing the package does not copy your source
 checkout's `.env`, and no launcher creates one automatically. Environment
 changes do not reconfigure an already running gateway that a launcher reuses.
@@ -420,14 +426,17 @@ Common settings (the provider sections above explain authentication):
 | Setting | Purpose |
 | --- | --- |
 | `MUSE_GATEWAY_PORT` | Listener port; default 8787 on loopback |
-| `MUSE_GATEWAY_TIMEOUT` | Upstream I/O timeout; default 600 seconds |
+| `MUSE_GATEWAY_TIMEOUT` | Upstream connect/headers budget, also the Claude CLI subprocess deadline; default 600 seconds |
+| `MUSE_GATEWAY_STREAM_IDLE_TIMEOUT` | Upstream stream idle budget after headers; default 120 seconds |
+| `MUSE_GATEWAY_TURN_TIMEOUT` | Absolute streaming turn deadline; default 3600 seconds |
+| `MUSE_GATEWAY_MAX_CONCURRENT_REQUESTS` | Concurrent inference POST limit; default 8, excess requests receive 503 |
 | `MUSE_GATEWAY_LOG_FILE` | Rotating diagnostics; default working-directory log |
 | `--capture-dir` (CLI flag only) | Opt-in private captures; off by default |
 | `MUSE_GATEWAY_MODELS` | Optional exact provider/model menu allowlist; unset/blank shows all available |
 | `MUSE_GATEWAY_LOCAL_UPSTREAM` | Local Responses service; unset disables local routing |
 | `MUSE_GATEWAY_LOCAL_API_KEY` | Optional local-only credential; unset sends no Authorization header |
 | `MUSE_GATEWAY_CLAUDE_TRANSPORT` | `cli` (default) or direct Messages `http` |
-| `MUSE_GATEWAY_CLAUDE_CLI_PASSTHROUGH` / `--claude-cli-passthrough` | Which Claude credential vars the `claude -p` child may inherit: `oauth` (default), `api-key`, `all`, `none`. Server-side policy of the serving gateway |
+| `MUSE_GATEWAY_CLAUDE_CLI_PASSTHROUGH` / `--claude-cli-passthrough` | Which Claude credential vars the `claude -p` child may inherit: `oauth` (default), `api-key`, `all`, `none`. Every tier also keeps `CLAUDE_CONFIG_DIR` (a location, not a credential). Server-side policy of the serving gateway |
 | `MUSE_GATEWAY_KIRO_UPSTREAM` | Separate Kiro Gateway; default loopback port 8000, `/v1` |
 | `MUSE_GATEWAY_KIRO_API_KEY` | Kiro Gateway proxy key only |
 | `--kiro-autostart` (CLI flag only) | Start the configured local checkout if needed; off by default |
@@ -498,7 +507,11 @@ You can invoke those scripts by absolute path from another project. The
 PowerShell wrapper also accepts `-EnvFile`, `-MuseBin`, `-LogFile`,
 `-LocalUpstream` and `-LocalApiKey`. Prefer environment settings to command-line
 secrets. Kiro options are `-KiroUpstream`, `-KiroApiKey`, `-KiroServerDir`, and
-`-KiroAutostart`, corresponding to the same `--kiro-*` launch flags. With `powershell -File`, omit the `--`
+`-KiroAutostart`, corresponding to the same `--kiro-*` launch flags. Devin
+options are `-DevinUpstream` and `-DevinApiKey` (`--devin-upstream`,
+`--devin-api-key`). `-Models` prints the model catalog instead of launching
+(`--models`), and `-ModelsProvider` limits it to one provider
+(`--models-provider`). With `powershell -File`, omit the `--`
 separator and pass Muse arguments directly.
 
 ### Manual server setup
@@ -579,8 +592,8 @@ server's log, not a newly chosen path in the attaching terminal.
 Under WSL or with more than one home directory (for example a Windows and a
 Linux login), the gateway reads credentials from the home of the process that
 runs it. If `doctor` reports a credential as not found, check that the CLI
-login lives in that same home; a symlinked credential file is followed like any
-other path.
+login lives in that same home; a symlinked credential file is deliberately
+not followed, and `doctor` names it as a refused symlink.
 
 Records contain request IDs, routes/models, recognised effort, item counts,
 HTTP status, and error categories. Ordinary logs exclude prompts, tool
@@ -601,10 +614,12 @@ Gateway. Muse may not display every field; use the matching gateway record.
 
 Client disconnects are detected when forwarding encounters an error. If the
 upstream stream is idle, its connection can remain open until more data
-arrives or the configured read timeout expires (`--timeout`, 600 seconds by
-default). Do not assume immediate upstream cancellation or stopped billing
-when closing the client. A forced-disconnect check does not establish how
-Muse's Escape-key cancellation behaves.
+arrives or the stream idle budget expires (`--stream-idle-timeout`, 120
+seconds by default). `--timeout` (600 seconds by default) separately bounds
+connect/headers and the Claude CLI subprocess. Do not assume immediate
+upstream cancellation or stopped billing when closing the client. A
+forced-disconnect check does not establish how Muse's Escape-key
+cancellation behaves.
 
 Doctor loads the same configuration file and environment as the other entry
 points. It checks configuration/credential availability, not inference:
@@ -654,6 +669,11 @@ and identifying truncated prefixes are scrubbed before writing; this can also
 remove matching fragments from conversation data. Saved Devin frames are
 scrubbed, potentially re-encoded copies. Frames that cannot safely be scrubbed
 are marked omitted, and hashes of original bytes are identified as such.
+Client-facing error text is capped at 512 UTF-8 bytes; a Devin trailer kept as
+capture evidence is scrubbed and truncated to 2,000 characters.
+Capture does synchronous disk and redaction work on the request path, so it can
+add or reshape latency; treat capture timelines as evidence from an instrumented
+run, not as an uninstrumented performance measurement.
 
 **Captures contain conversation content.** Owner-only permissions are applied,
 including a protected Windows ACL, and the gateway does not upload these files.
@@ -681,8 +701,11 @@ Switching providers does not make their opaque reasoning state interchangeable.
 
 ## Security
 
-Keep the listener on loopback. There is no client authentication or multi-tenant
-isolation; `--allow-non-loopback` requires your own access controls.
+Keep the listener on loopback. There is no multi-tenant isolation. Loopback
+requests require a loopback `Host`, and inference POSTs with a browser `Origin`
+are rejected. `--require-inbound-token` optionally requires
+`MUSE_GATEWAY_INBOUND_TOKEN` (sent as `x-muse-gateway-token` or Bearer) on
+inference POSTs; `--allow-non-loopback` refuses to start without it.
 
 Only configure upstreams you trust. Local requests use only the optional local
 key; without one they send no Authorization header. Generic keys and Muse's

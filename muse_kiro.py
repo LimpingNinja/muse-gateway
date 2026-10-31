@@ -90,12 +90,18 @@ def _single_header(headers: Any, name: str) -> str | None:
     return values[0] if len(values) == 1 and isinstance(values[0], str) else None
 
 
-def _retry_after(headers: Any, secrets: tuple[str, ...]) -> dict[str, str] | None:
+_RETRY_AFTER_MAX_SECONDS = 3600
+
+
+def _retry_after(headers: Any, secrets: tuple[str, ...]) -> dict[str, Any] | None:
     value = _single_header(headers, "Retry-After")
     if value is None or len(value) > 128 or any(ord(char) < 32 or ord(char) > 126 for char in value) or not _secret_free(value, secrets):
         return None
     value = value.strip(" ")
     if re.fullmatch(r"[0-9]{1,10}", value) and int(value) <= 2147483647:
+        delay = int(value)
+        if delay > _RETRY_AFTER_MAX_SECONDS:
+            return {"value": str(_RETRY_AFTER_MAX_SECONDS), "kind": "delay-seconds", "clamped": True}
         return {"value": value, "kind": "delay-seconds"}
     matched = next((index for index, pattern in enumerate(_HTTP_DATE) if re.fullmatch(pattern, value)), None)
     if matched is None:
@@ -114,6 +120,8 @@ def _retry_after(headers: Any, secrets: tuple[str, ...]) -> dict[str, str] | Non
             parsed = parsed.replace(year=candidate)
         if parsed.strftime("%a") != value[:3]:
             return None
+        if (parsed - datetime.now(timezone.utc)).total_seconds() > _RETRY_AFTER_MAX_SECONDS:
+            return {"value": str(_RETRY_AFTER_MAX_SECONDS), "kind": "delay-seconds", "clamped": True}
     except (TypeError, ValueError, OverflowError):
         return None
     return {"value": value, "kind": "http-date"}
@@ -202,6 +210,10 @@ def error_metadata(*, source: str, upstream_status: int | None = None,
         result["evidence_conflict"] = True
     if retry is not None:
         result["retry_after"] = retry
+    if _single_header(headers, "Retry-After") is not None:
+        result["retry_after_observation"] = (
+            "clamped" if retry and retry.get("clamped") else "accepted" if retry else "rejected"
+        )
     return result
 
 

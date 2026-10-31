@@ -113,6 +113,10 @@ class DummyForwardHandler:
 
     _note_upstream_error_headers = MuseShimHandler._note_upstream_error_headers
     _track_upstream = MuseShimHandler._track_upstream
+    _flush_pending_capture_artifacts = MuseShimHandler._flush_pending_capture_artifacts
+    _host_header_allowed = MuseShimHandler._host_header_allowed
+    _inbound_token_authorized = MuseShimHandler._inbound_token_authorized
+    _reject_untrusted_inbound = MuseShimHandler._reject_untrusted_inbound
 
     def _send_upstream_headers(self, *args, **kwargs):
         return None
@@ -408,6 +412,34 @@ class ClaudeAuthAndConversionTests(NoCredentialEnvTest):
         self.assertEqual(names.decode("mcp__read_file"), "read_file")
 
 
+    def test_keychain_helper_receives_only_minimal_environment(self):
+        import muse_providers
+
+        result = type("Result", (), {
+            "returncode": 0,
+            "stdout": json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat-keychain"}}),
+        })()
+        environment = {
+            "PATH": "/usr/bin:/bin", "HOME": "/Users/fixture",
+            "AWS_SECRET_ACCESS_KEY": "do-not-pass", "MUSE_GATEWAY_TOKEN": "do-not-pass",
+        }
+        muse_providers.invalidate_credential_cache("claude")
+        self.addCleanup(muse_providers.invalidate_credential_cache, "claude")
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(muse_providers.platform, "system", return_value="Darwin"), \
+                patch.object(muse_providers.subprocess, "run", return_value=result) as run:
+            state = muse_providers._read_claude_keychain()
+            again = muse_providers._read_claude_keychain()
+            self.assertEqual(run.call_count, 1)
+            muse_providers.invalidate_credential_cache("claude")
+            busted = muse_providers._read_claude_keychain()
+            self.assertEqual(run.call_count, 2)
+        self.assertEqual(state.access_token, "sk-ant-oat-keychain")
+        self.assertEqual(again.access_token, "sk-ant-oat-keychain")
+        self.assertEqual(busted.access_token, "sk-ant-oat-keychain")
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/Users/fixture"})
+
+
 class FlattenWireShapeTests(NoCredentialEnvTest):
     """P2-07 contract: namespace-flatten error wire shapes are pinned.
 
@@ -503,6 +535,19 @@ class ClaudeStreamTests(NoCredentialEnvTest):
                 for output in self._converted_calls(ToolNameMap(oauth=False), ids, "read_file"):
                     self.assertEqual(len({item["id"] for item in output}), 2)
                     self.assertEqual([item["call_id"] for item in output], ids)
+        for output in self._converted_calls(ToolNameMap(oauth=False), ["call_x", "call_x"], "read_file"):
+            self.assertEqual([item["call_id"] for item in output], ["call_x", "call_x_2"])
+            self.assertEqual(len({item["id"] for item in output}), 2)
+        duplicate_history = [
+            {"type": "function_call", "call_id": "dup", "name": "f", "arguments": "{}"},
+            {"type": "function_call", "call_id": "dup", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "dup", "output": "first"},
+            {"type": "function_call_output", "call_id": "dup", "output": "second"},
+        ]
+        payload, _ = responses_to_anthropic({"model": "claude-test", "input": duplicate_history})
+        parts = [part for message in payload["messages"] for part in message["content"] if isinstance(part, dict)]
+        self.assertEqual([part["id"] for part in parts if part["type"] == "tool_use"], ["dup", "dup_2"])
+        self.assertEqual([part["tool_use_id"] for part in parts if part["type"] == "tool_result"], ["dup", "dup_2"])
 
     def test_text_tool_text_item_ids_are_distinct_and_equal_across_modes(self):
         content = [
@@ -583,6 +628,55 @@ class ClaudeStreamTests(NoCredentialEnvTest):
         self.assertEqual([kind for kind, _ in events], ["response.failed"])
         self.assertEqual(events[0][1]["response"]["output"][0]["status"], "in_progress")
         self.assertEqual(events[0][1]["response"]["output"][0]["arguments"], '{"path":')
+
+    def test_claude_event_and_accumulated_block_caps_fail_typed(self):
+        import io as io_module
+        import muse_providers
+
+        with patch.object(muse_providers, "_SSE_EVENT_LIMIT", 8):
+            with self.assertRaises(ProviderError) as caught:
+                list(muse_providers._iter_sse_text(io_module.BytesIO(b'data: {"type":"x","value":"123456789"}\n\n')))
+            self.assertEqual(caught.exception.code, "upstream_protocol_error")
+        with patch.object(muse_providers, "_STREAM_RESPONSE_LIMIT", 8):
+            with self.assertRaises(ProviderError) as caught:
+                list(muse_providers._iter_sse_text(io_module.BytesIO(b"data: {}\n\n")))
+            self.assertEqual(caught.exception.code, "upstream_response_too_large")
+
+        state = StreamState("fixture", ToolNameMap(oauth=False))
+        convert_anthropic_event("message_start", {"message": {"id": "msg_cap"}}, state)
+        convert_anthropic_event("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}, state)
+        with patch.object(muse_providers, "_STREAM_BLOCK_LIMIT", 4):
+            events = convert_anthropic_event("content_block_delta", {"index": 0, "delta": {
+                "type": "text_delta", "text": "12345"}}, state)
+        self.assertEqual(events[-1][0], "response.failed")
+        self.assertEqual(events[-1][1]["response"]["error"]["code"], "upstream_response_too_large")
+        with patch.object(muse_providers, "_OAUTH_JSON_RESPONSE_LIMIT", 4):
+            with self.assertRaises(ProviderError) as caught:
+                muse_providers._json_response(FakeResponse(b"12345"))
+            self.assertEqual(caught.exception.code, "oauth_response_too_large")
+
+    def test_unknown_block_and_upstream_error_fail_once_without_bare_error(self):
+        state = StreamState("fixture", ToolNameMap(oauth=False))
+        convert_anthropic_event("message_start", {"message": {"id": "msg_unknown"}}, state)
+        events = convert_anthropic_event("content_block_delta", {"index": 9, "delta": {
+            "type": "text_delta", "text": "lost"}}, state)
+        self.assertEqual([kind for kind, _ in events], ["response.failed"])
+        self.assertEqual(events[0][1]["response"]["error"]["type"], "invalid_stream_lifecycle")
+        self.assertEqual(convert_anthropic_event("error", {"error": {
+            "type": "overloaded_error", "message": "busy"}}, state), [])
+
+        state = StreamState("fixture", ToolNameMap(oauth=False))
+        convert_anthropic_event("message_start", {"message": {"id": "msg_error"}}, state)
+        convert_anthropic_event("content_block_start", {"index": 0, "content_block": {
+            "type": "thinking", "thinking": ""}}, state)
+        self.assertEqual(convert_anthropic_event("content_block_delta", {"index": 0, "delta": {
+            "type": "thinking_delta", "thinking": "private"}}, state), [])
+        self.assertEqual(convert_anthropic_event("content_block_stop", {"index": 0}, state), [])
+        events = convert_anthropic_event("error", {"error": {
+            "type": "overloaded_error", "message": "busy"}}, state)
+        self.assertEqual([kind for kind, _ in events], ["response.failed"])
+        self.assertNotIn("error", [kind for kind, _ in events])
+        self.assertEqual(convert_anthropic_event("message_stop", {}, state), [])
 
 
 class MuseAcceptanceAssertionTests(unittest.TestCase):
@@ -966,7 +1060,10 @@ class CliAndSafetyTests(NoCredentialEnvTest):
         native, _ = responses_to_anthropic(dict(body, tool_choice="required", parallel_tool_calls=False))
         self.assertEqual(native["tool_choice"], {"type": "any", "disable_parallel_tool_use": True})
         for bad, code in (({"tool_choice": {"type": "web_search"}}, "claude_unsupported_tool_choice"),
-                          ({"parallel_tool_calls": "no"}, "claude_invalid_request")):
+                          ({"parallel_tool_calls": "no"}, "claude_invalid_request"),
+                          ({"stop": 7}, "claude_invalid_request"),
+                          ({"stop": ["END", 7]}, "claude_invalid_request"),
+                          ({"stop": ""}, "claude_invalid_request")):
             with self.subTest(bad=bad), self.assertRaises(ProviderError) as caught:
                 responses_to_anthropic(dict(body, **bad))
             self.assertEqual(caught.exception.code, code)
@@ -996,6 +1093,7 @@ class CliAndSafetyTests(NoCredentialEnvTest):
     def test_claude_cli_rejects_images_and_unenforceable_output_caps_before_spawn(self):
         # P2-02 (inverts R22): no silent no-op cap, no base64 images in stdin.
         cases = (
+            ({"stop": ["END"]}, "claude_cli_stop_unsupported"),
             ({"max_output_tokens": 100}, "claude_cli_output_limit_unsupported"),
             ({"input": [{"role": "user", "content": [
                 {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}]},
@@ -1085,8 +1183,16 @@ class CliAndSafetyTests(NoCredentialEnvTest):
 
     def test_non_loopback_binding_requires_explicit_opt_in(self):
         self.assert_cli_error(["generic", "--host", "0.0.0.0"], "refusing non-loopback")
-        args = parse_args(["generic", "--host", "0.0.0.0", "--allow-non-loopback"])
+        self.assert_cli_error(
+            ["generic", "--host", "0.0.0.0", "--allow-non-loopback"],
+            "without an inbound token",
+        )
+        with patch.dict(os.environ, {"MUSE_GATEWAY_INBOUND_TOKEN": "fixture-inbound-token"}):
+            args = parse_args([
+                "generic", "--host", "0.0.0.0", "--allow-non-loopback", "--require-inbound-token",
+            ])
         self.assertTrue(args.allow_non_loopback)
+        self.assertTrue(args.require_inbound_token)
 
     def test_body_limit_rejects_before_reading(self):
         class NeverRead:
@@ -1114,6 +1220,24 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertNotIn("doctor-secret", rendered)
             self.assertNotIn("refresh-secret", rendered)
             self.assertIn("secrets: not displayed", rendered)
+
+    def test_doctor_names_refused_symlinked_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "real-auth.json"
+            target.write_text(json.dumps({"tokens": {"access_token": "doctor-secret"}}), encoding="utf-8")
+            link = Path(directory) / "auth.json"
+            try:
+                link.symlink_to(target)
+            except (NotImplementedError, OSError):
+                self.skipTest("symlinks are unavailable")
+            config = Config(_args(provider="codex", codex_auth_path=str(link)))
+            output = io.StringIO()
+            result = run_doctor(config, output=output)
+            self.assertEqual(result, 1)
+            rendered = output.getvalue()
+            self.assertIn("symlinked credential refused", rendered)
+            self.assertIn(str(link), rendered)
+            self.assertNotIn("doctor-secret", rendered)
 
     def test_error_redaction_is_byte_safe(self):
         import http.client
@@ -1159,7 +1283,9 @@ class CliAndSafetyTests(NoCredentialEnvTest):
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     relayed = response.read()
-                    self.assertTrue(relayed.startswith(stream_bytes))
+                    self.assertTrue(relayed.startswith(b"event: response.created"))
+                    self.assertNotIn(b"event: error", relayed)
+                    self.assertIn(b"unsupported_value", relayed)
                     self.assertIn(b"response.failed", relayed)
             finally:
                 connection.close()
@@ -1176,6 +1302,28 @@ class CliAndSafetyTests(NoCredentialEnvTest):
             self.assertIn('"stream_failed": true', logged)
             self.assertIn("upstream_stream_error", logged)
             self.assertEqual(stderr.getvalue(), "")
+
+    def test_client_errors_are_bounded_and_secret_bearing_request_ids_are_rejected(self):
+        error = ProviderError("x" * 5000 + "\x00tail", code="c" * 5000, metadata={"detail": "y" * 5000})
+        self.assertLessEqual(len(str(error).encode()), 512)
+        self.assertLessEqual(len(error.code), 128)
+        self.assertLessEqual(len(error.metadata["detail"].encode()), 512)
+        self.assertNotIn("\x00", str(error))
+        jwt = (_jwt({"sub": "fixture"}) + ".signaturevalue").encode()
+        self.assertNotIn(jwt, _redact_bytes(b"jwt=" + jwt, []))
+
+        handler = object.__new__(MuseShimHandler)
+        handler._request_secrets = ["secret-request-id-value"]
+        handler._retry_after = None
+        handler.headers = {}
+        handler.server = type("Server", (), {
+            "config": type("ConfigStub", (), {"secret_values": lambda self: []})(),
+        })()
+        self.assertIsNone(handler._note_upstream_error_headers(
+            {"x-request-id": "secret-request-id-value", "Retry-After": "999999"}))
+        self.assertFalse(hasattr(handler, "_upstream_request_id"))
+        self.assertEqual(handler._retry_after, "3600")
+        self.assertEqual(handler._retry_after_observation, "clamped")
 
 
 class RedirectAndHermesTests(unittest.TestCase):
@@ -1485,6 +1633,19 @@ class NamedCoverageGapTests(NoCredentialEnvTest):
         self.assertEqual(_parse_expiry(1_800_000_000_000), 1_800_000_000.0)
         self.assertEqual(_parse_expiry("1800000000000"), 1_800_000_000.0)
         self.assertEqual(_parse_expiry("2027-01-15T08:00:00Z"), 1_800_000_000.0)
+        import time as time_module
+        if hasattr(time_module, "tzset"):
+            previous_tz = os.environ.get("TZ")
+            os.environ["TZ"] = "America/New_York"
+            time_module.tzset()
+            try:
+                self.assertEqual(_parse_expiry("2027-01-15T08:00:00"), 1_800_000_000.0)
+            finally:
+                if previous_tz is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = previous_tz
+                time_module.tzset()
         for value in (None, True, 0, -5, "", "  ", "not-a-date"):
             self.assertIsNone(_parse_expiry(value), value)
         self.assertEqual(jwt_claims(_jwt({"exp": 5, "sub": "x"}))["exp"], 5)
@@ -1542,7 +1703,9 @@ class RefreshLockingTests(NoCredentialEnvTest):
         import muse_providers
 
         muse_providers._RETAINED_FILELESS.clear()
+        muse_providers.invalidate_credential_cache()
         self.addCleanup(muse_providers._RETAINED_FILELESS.clear)
+        self.addCleanup(muse_providers.invalidate_credential_cache)
 
     def _fileless_config(self):
         return Config(_args(provider="claude"))
@@ -1605,6 +1768,94 @@ class RefreshLockingTests(NoCredentialEnvTest):
         self.assertEqual(sorted(results), ["r1-access", "r1-access"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(active["max"], 1)
+
+    def test_concurrent_file_backed_refresh_spends_grant_once_for_both_providers(self):
+        import tempfile
+        import threading as threading_module
+        from pathlib import Path
+
+        import muse_providers
+
+        expired = _jwt({"exp": int(time.time()) - 10})
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                muse_providers.invalidate_credential_cache()
+                path = Path(directory) / "credentials.json"
+                if provider == "codex":
+                    path.write_text(json.dumps({
+                        "access_token": expired, "refresh_token": "r0-refresh",
+                        "expires_at": int(time.time()) - 10,
+                    }), encoding="utf-8")
+                    config = Config(_args(provider="codex", codex_auth_path=str(path)))
+                    resolve = resolve_codex_credentials
+                    env = {}
+                else:
+                    path.write_text(json.dumps({"claudeAiOauth": {
+                        "accessToken": expired, "refreshToken": "r0-refresh",
+                        "expiresAt": int(time.time()) - 10,
+                    }}), encoding="utf-8")
+                    config = Config(_args(provider="claude"))
+                    resolve = resolve_claude_credentials
+                    env = {"CLAUDE_CODE_CREDENTIALS_PATH": str(path)}
+                calls = []
+                active = {"now": 0, "max": 0}
+                guard = threading_module.Lock()
+
+                def opener(request, timeout=None):
+                    with guard:
+                        active["now"] += 1
+                        active["max"] = max(active["max"], active["now"])
+                        calls.append(request.data.decode())
+                    time.sleep(0.2)
+                    with guard:
+                        active["now"] -= 1
+                    return FakeResponse(json.dumps({
+                        "access_token": "r1-access", "refresh_token": "r1-refresh",
+                        "expires_in": 3600,
+                    }))
+
+                results = []
+                errors = []
+
+                def worker():
+                    try:
+                        with patch.dict(os.environ, env, clear=False):
+                            results.append(resolve(config, opener=opener).access_token)
+                    except Exception as error:
+                        errors.append(error)
+
+                threads = [threading_module.Thread(target=worker) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+                self.assertEqual(errors, [])
+                self.assertEqual(sorted(results), ["r1-access", "r1-access"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(active["max"], 1)
+                self.assertIn("r1-refresh", path.read_text(encoding="utf-8"))
+                self.assertNotIn(str(path), muse_providers._REFRESH_LOCKS)
+
+    def test_file_credential_cache_adopts_external_login_and_isolates_copies(self):
+        import tempfile
+        from pathlib import Path
+
+        import muse_providers
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth.json"
+            path.write_text(json.dumps({"access_token": "token-one", "refresh_token": "r-one"}), encoding="utf-8")
+            config = Config(_args(provider="codex", codex_auth_path=str(path)))
+            first = muse_providers.discover_codex_credentials(config)
+            first.access_token = "mutated"
+            again = muse_providers.discover_codex_credentials(config)
+            self.assertEqual(again.access_token, "token-one")
+            path.write_text(json.dumps({"access_token": "token-two", "refresh_token": "r-two"}), encoding="utf-8")
+            stat = path.stat()
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            adopted = muse_providers.discover_codex_credentials(config)
+            self.assertEqual(adopted.access_token, "token-two")
+            self.assertLessEqual(len(muse_providers._CREDENTIAL_CACHE), muse_providers._CREDENTIAL_CACHE_LIMIT)
 
 
 if __name__ == "__main__":

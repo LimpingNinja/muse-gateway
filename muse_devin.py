@@ -53,7 +53,7 @@ from muse_devin_wire import (
 import devin_pb2
 from muse_capture import current_capture
 from muse_models import provider_catalog, resolve_limits
-from muse_providers import ProviderError, _allocate_item_id, _input_items, _responses_function_id, request_tool_policy, set_response_idle_timeout
+from muse_providers import ProviderError, _allocate_item_id, _input_items, _responses_function_id, _validated_stop_sequences, bounded_client_error_code, bounded_client_error_text, request_tool_policy, set_response_idle_timeout
 
 
 class DevinCredentialError(DevinWireError):
@@ -1292,16 +1292,18 @@ REQUEST_POLICY_CODES = {
 def validate_request_policy(body, tool_names):
     """P1-05 request policy; raises before any upstream call.
 
-    "none" sends no tools (no new wire value). "required" has no verified
-    ChatToolChoice spelling (Q3), so it is rejected by name, not guessed.
+    "none" sends no tools (no new wire value). "required" maps to
+    ChatToolChoice option_name "required" (live-verified on swe-1-6,
+    M12 capture 2026-10-25: auto answered in text, required forced a call).
     """
     try:
         choice, tool_name, serial = request_tool_policy(body, route="devin")
+        _validated_stop_sequences(body, route="devin")
     except ProviderError as error:
         raise DevinChatError(str(error), code=error.code) from error
-    if choice == "required":
+    if choice == "required" and not tool_names:
         raise DevinChatError(
-            "Devin cannot enforce tool_choice=required; use auto, none, or a named function.",
+            "tool_choice=required needs at least one tool.",
             code="devin_unsupported_tool_choice",
         )
     if choice == "named" and tool_name not in set(tool_names):
@@ -1353,6 +1355,8 @@ def build_chat_request(
         tools = []
     if choice == "named":
         request.tool_choice.tool_name = tool_name
+    elif choice == "required":
+        request.tool_choice.option_name = "required"
     else:
         request.tool_choice.option_name = "auto"
     request.system_prompt_cache_options.type = devin_pb2.CacheControlType.Value(
@@ -1369,12 +1373,8 @@ def build_chat_request(
     configuration.temperature = _body_number(body, "temperature", 1.0)
     configuration.top_k = 40
     configuration.top_p = fround(_body_number(body, "top_p", 0.95))
-    stops = body.get("stop") or body.get("stop_sequences") or []
-    if isinstance(stops, str):
-        stops = [stops]
-    for stop in stops if isinstance(stops, list) else []:
-        if isinstance(stop, str) and stop:
-            configuration.stop_patterns.append(stop)
+    for stop in _validated_stop_sequences(body, route="devin"):
+        configuration.stop_patterns.append(stop)
     request.tools.extend(tools)
     return request
 
@@ -1384,8 +1384,13 @@ def build_chat_request(
 # ---------------------------------------------------------------------------
 
 
-def _finalize_tool_arguments(accumulated, concat_candidate="", invalid_fallback=""):
-    """Authoritative final parse: prefer valid JSON object; None on unrecoverable corruption."""
+def _finalize_tool_arguments(accumulated, concat_candidate="", invalid_fallback="", allow_empty=False):
+    """Authoritative final parse: prefer valid JSON object; None on unrecoverable corruption.
+
+    Live Devin sends arguments_json="" for a no-argument call (M12 capture
+    2026-10-25); allow_empty maps that completed call to "{}". Truncated
+    calls keep returning None via allow_empty=False.
+    """
     for candidate in (concat_candidate, accumulated, invalid_fallback):
         if not candidate:
             continue
@@ -1395,7 +1400,18 @@ def _finalize_tool_arguments(accumulated, concat_candidate="", invalid_fallback=
             continue
         if isinstance(parsed, dict):
             return candidate
+    if allow_empty and not (concat_candidate or accumulated or invalid_fallback):
+        return "{}"
     return None
+
+
+_STREAM_BLOCK_LIMIT = 8 * 1024 * 1024
+_STREAM_RESPONSE_LIMIT = 64 * 1024 * 1024
+_STREAM_MAX_TOOL_BLOCKS = 1024
+
+
+def _utf8_len(value):
+    return len(str(value or "").encode("utf-8", errors="surrogatepass"))
 
 
 class DevinStreamState:
@@ -1426,6 +1442,9 @@ class DevinStreamState:
         self.started = False
         self.sequence_number = 0
         self._used_item_ids = set()
+        self._pending_started_events = []
+        self._accumulated_bytes = 0
+        self._thinking_bytes = 0
 
     def _number_events(self, events):
         for event_name, payload in events:
@@ -1448,7 +1467,7 @@ class DevinStreamState:
         if not self.response_id:
             self.response_id = "resp_" + uuid.uuid4().hex[:16]
         snapshot = self.final_response(status="in_progress")
-        return [
+        events = [
             ("response.created", {
                 "type": "response.created",
                 "response": copy.deepcopy(snapshot),
@@ -1458,6 +1477,10 @@ class DevinStreamState:
                 "response": copy.deepcopy(snapshot),
             }),
         ]
+        # If feed() raises after opening the response, fail() must still be
+        # able to emit these lifecycle events before response.failed.
+        self._pending_started_events = list(events)
+        return events
 
     def _message_item_id(self):
         seed = f"{self.response_id}:{len(self.output)}"
@@ -1475,7 +1498,7 @@ class DevinStreamState:
             "status": "in_progress",
             "content": [],
         }
-        self.text_block = {"item": item, "text": ""}
+        self.text_block = {"item": item, "text": "", "byte_len": 0}
         self.output.append(item)
         index = len(self.output) - 1
         return [
@@ -1500,6 +1523,8 @@ class DevinStreamState:
                 block["name"] = name
                 block["item"]["name"] = name
             return []
+        if len(self.tool_blocks) >= _STREAM_MAX_TOOL_BLOCKS:
+            raise DevinChatError("Devin tool block count exceeded the safety size limit")
         item_id = _allocate_item_id(
             _responses_function_id(wire_id, wire_id), self._used_item_ids
         )
@@ -1513,7 +1538,8 @@ class DevinStreamState:
         }
         self.tool_blocks[wire_id] = {
             "item": item, "name": name or "", "arguments": "",
-            "concat_arguments": "", "invalid": "",
+            "concat_arguments": "", "concat_bytes": 0,
+            "invalid": "", "invalid_bytes": 0,
         }
         self.tool_order.append(wire_id)
         # HTTP deltas cannot be replaced after argument repair or late naming.
@@ -1521,6 +1547,11 @@ class DevinStreamState:
         # The item joins output only when released, so output_index never
         # runs backwards in the event stream (P2-04).
         return []
+
+    def _account_accumulated(self, fragment_bytes, *, block_bytes=0):
+        if block_bytes > _STREAM_BLOCK_LIMIT or self._accumulated_bytes + fragment_bytes > _STREAM_RESPONSE_LIMIT:
+            raise DevinChatError("Devin response exceeded the safety size limit")
+        self._accumulated_bytes += fragment_bytes
 
     def feed(self, message):
         """Fold one GetChatMessageResponse; return event tuples."""
@@ -1541,6 +1572,10 @@ class DevinStreamState:
         events.extend(self._ensure_started())
         if message.delta_thinking:
             self.had_output = True
+            fragment_bytes = _utf8_len(message.delta_thinking)
+            self._account_accumulated(
+                fragment_bytes, block_bytes=self._thinking_bytes + fragment_bytes)
+            self._thinking_bytes += fragment_bytes
             self.thinking_text += message.delta_thinking
         if message.delta_signature:
             self.had_output = True
@@ -1548,6 +1583,10 @@ class DevinStreamState:
             self.had_output = True
             events.extend(self._ensure_text_block())
             block = self.text_block
+            fragment_bytes = _utf8_len(message.delta_text)
+            self._account_accumulated(
+                fragment_bytes, block_bytes=block.get("byte_len", 0) + fragment_bytes)
+            block["byte_len"] = block.get("byte_len", 0) + fragment_bytes
             block["text"] += message.delta_text
             item = block["item"]
             content = item.setdefault("content", [])
@@ -1571,17 +1610,27 @@ class DevinStreamState:
             block = self.tool_blocks[wire_id]
             if call.arguments_json:
                 previous = block["arguments"]
-                block["concat_arguments"] = block.get("concat_arguments", "") + call.arguments_json
-                # Per-block cap mirrors muse_kiro._BLOCK_LIMIT (8 MiB).
-                if len(block["concat_arguments"]) > 8 * 1024 * 1024 or len(previous) > 8 * 1024 * 1024:
-                    raise DevinChatError("Devin tool arguments exceeded the safety size limit")
-                block["arguments"] = (
+                fragment_bytes = _utf8_len(call.arguments_json)
+                concat_bytes = block.get("concat_bytes", 0) + fragment_bytes
+                candidate = (
                     call.arguments_json if call.arguments_json.startswith(previous)
                     else previous + call.arguments_json
                 )
+                # Byte caps mirror muse_kiro._BLOCK_LIMIT (8 MiB).
+                self._account_accumulated(
+                    fragment_bytes,
+                    block_bytes=max(concat_bytes, _utf8_len(candidate), _utf8_len(previous)),
+                )
+                block["concat_arguments"] = block.get("concat_arguments", "") + call.arguments_json
+                block["concat_bytes"] = concat_bytes
+                block["arguments"] = candidate
                 block["item"]["arguments"] = block["arguments"]
             if call.invalid_json_str:
+                invalid_bytes = _utf8_len(call.invalid_json_str)
+                added_bytes = max(0, invalid_bytes - block.get("invalid_bytes", 0))
+                self._account_accumulated(added_bytes, block_bytes=invalid_bytes)
                 block["invalid"] = call.invalid_json_str
+                block["invalid_bytes"] = invalid_bytes
         if message.stop_reason != 0:
             self.stop_reason = int(message.stop_reason)
         usage = message.usage
@@ -1594,19 +1643,25 @@ class DevinStreamState:
                 "cached_tokens": cached,
                 "cache_write_tokens": cache_write,
             }
+        self._pending_started_events = []
         return self._number_events(events)
 
     def fail(self, message, error_type="upstream_error"):
         """Emit one failed terminal outcome, retaining partial output."""
+        if self.finished:
+            return []
+        self.finished = True
         self.error_message = message
         self.error_type = error_type
         self.stop_reason = "error"
-        events = self._ensure_started()
+        events = list(self._pending_started_events)
+        self._pending_started_events = []
+        events.extend(self._ensure_started())
+        self._pending_started_events = []
         final = self.final_response(status="failed")
         events.append(("response.failed", {
             "type": "response.failed", "response": final,
         }))
-        self.finished = True
         return self._number_events(events)
 
     def _finish_items(self):
@@ -1635,7 +1690,8 @@ class DevinStreamState:
             block = self.tool_blocks[wire_id]
             item = block["item"]
             arguments = _finalize_tool_arguments(
-                block["arguments"], block.get("concat_arguments", ""), block["invalid"]
+                block["arguments"], block.get("concat_arguments", ""), block["invalid"],
+                allow_empty=self.stop_reason != 3,
             )
             if arguments is None:
                 if self.stop_reason == 3:
@@ -1697,7 +1753,10 @@ class DevinStreamState:
         if tool_error is not None:
             return self.fail("Devin tool arguments were not valid JSON", tool_error)
         events.extend(item_events)
-        if self.stop_reason in (3, 4, 5, 6, 8, 12):
+        # Stop 4 (MIN_LOG_PROB) is a normal end on live claude-haiku-5-5:
+        # it followed a complete 9-token answer (M12 capture 2026-10-25),
+        # so only the remaining limit-style stops stay incomplete.
+        if self.stop_reason in (3, 5, 6, 8, 12):
             status = "incomplete"
         else:
             status = "completed"
@@ -1733,9 +1792,9 @@ class DevinStreamState:
             result["incomplete_details"] = {"reason": "max_output_tokens"}
         if status == "failed" and self.error_message:
             result["error"] = {
-                "message": self.error_message,
-                "type": self.error_type or "upstream_error",
-                "code": self.error_type or "upstream_error",
+                "message": bounded_client_error_text(self.error_message),
+                "type": bounded_client_error_code(self.error_type, "upstream_error"),
+                "code": bounded_client_error_code(self.error_type, "upstream_error"),
             }
         return result
 
@@ -1783,12 +1842,14 @@ def run_turn_events(
     timeout=300.0,
     conversation_id=None,
     idle_timeout=None,
+    track=None,
+    register_secret=None,
 ):
     """Bound upstream connection failures before the first event as well."""
     try:
         yield from _run_turn_events(
             body, flat_tools, model, access_token, base_url, effort,
-            timeout, conversation_id, idle_timeout,
+            timeout, conversation_id, idle_timeout, track, register_secret,
         )
     except (HTTPException, ConnectionError) as error:
         raise DevinChatError("Devin upstream connection failed before a response") from error
@@ -1804,6 +1865,8 @@ def _run_turn_events(
     timeout=300.0,
     conversation_id=None,
     idle_timeout=None,
+    track=None,
+    register_secret=None,
 ):
     """Run one Devin turn, yielding (event_type, payload) tuples.
 
@@ -1825,12 +1888,17 @@ def _run_turn_events(
     ])
     wire_uid = model.wire_uid(effort)
     wire_api_key, user_jwt, chat_base = fetch_auth(access_token, resolved_base, timeout=min(timeout, 30.0))
+    if callable(register_secret):
+        register_secret(wire_api_key)
+        register_secret(user_jwt)
     assignment_jwt = None
     request_uid = wire_uid
     if model.is_router:
         assigned_uid, assignment_jwt = assign_if_router(
             model, wire_api_key, cascade_id, staged, chat_base, timeout=min(timeout, 30.0)
         )
+        if callable(register_secret):
+            register_secret(assignment_jwt)
         request_uid = assigned_uid
     gemini = is_gemini_uid(model.uid) or is_gemini_uid(request_uid)
     tools = build_tools(flat_tools, gemini)
@@ -1842,6 +1910,8 @@ def _run_turn_events(
     state = DevinStreamState(f"devin/{model.logical_id}")
     history_bytes = _shrinkable_history_bytes(history_protos, staged)
     response = open_chat_stream(chat_base, request.SerializeToString(), timeout=timeout)
+    if callable(track):
+        track(response)
     if idle_timeout:
         # After headers the read budget is idle time, not total time (P1-09).
         set_response_idle_timeout(response, idle_timeout)
@@ -1899,9 +1969,28 @@ def _run_turn_events(
         yield event
 
 
+def _enforce_final_response_size(final):
+    encoded = json.dumps(final, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) <= _STREAM_RESPONSE_LIMIT:
+        return final
+    return {
+        "id": final.get("id") or "resp_" + uuid.uuid4().hex[:16],
+        "object": "response",
+        "status": "failed",
+        "model": final.get("model"),
+        "output": [],
+        "usage": None,
+        "error": {
+            "message": "Devin final response exceeded the safety size limit.",
+            "type": "upstream_response_too_large",
+            "code": "upstream_response_too_large",
+        },
+    }
+
+
 def run_turn_final(
     body, flat_tools, model, access_token, base_url=None, effort=None, timeout=300.0,
-    conversation_id=None, idle_timeout=None,
+    conversation_id=None, idle_timeout=None, track=None, register_secret=None,
 ):
     """Non-streaming turn: consume the same stream, return the final object.
 
@@ -1912,10 +2001,10 @@ def run_turn_final(
     final = None
     for event_type, payload in run_turn_events(
         body, flat_tools, model, access_token, base_url, effort, timeout, conversation_id,
-        idle_timeout,
+        idle_timeout, track, register_secret,
     ):
         if event_type in {"response.completed", "response.failed", "response.incomplete"}:
             final = payload.get("response")
     if final is None:
         raise DevinChatError("Devin turn ended without a terminal event")
-    return final
+    return _enforce_final_response_size(final)

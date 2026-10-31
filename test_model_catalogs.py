@@ -67,13 +67,14 @@ class CatalogSnapshotTests(unittest.TestCase):
             provider="auto", model_discovery=True,
             log_file="/tmp/muse-gateway-catalog-test.log"))
 
-    def _publish(self, config, limit, *, generation=None):
+    def _publish(self, config, limit, *, generation=None, outcome="ok_nonempty"):
         return config._publish_catalog(
             "codex", "codex",
             entries=[{"model_id": "codex/m", "output_limit": limit}],
             raw={"m": {"model": "m", "context_limit": 10000, "output_limit": limit}},
             stamped=0.0,
-            generation=config._catalog_generation.get("codex", 0) if generation is None else generation)
+            generation=config._catalog_generation.get("codex", 0) if generation is None else generation,
+            outcome=outcome)
 
     def test_snapshot_limit_is_coherent_and_stale_generation_cannot_publish(self):
         config = self._config()
@@ -84,6 +85,33 @@ class CatalogSnapshotTests(unittest.TestCase):
         config._catalog_generation["codex"] = 5
         self.assertFalse(self._publish(config, 999, generation=4))
         self.assertEqual(config.model_output_limit("codex", "m"), 50)
+
+    def test_failed_refresh_preserves_last_good_live_catalog(self):
+        from muse_gateway import provider_model_catalog
+
+        config = self._config()
+        self.assertTrue(self._publish(config, 1000))
+        self.assertTrue(self._publish(config, 50, outcome="failed"))
+        self.assertEqual(config.model_output_limit("codex", "m"), 1000)
+        self.assertEqual(config._catalog_snapshots["codex"].outcome, "failed")
+
+        calls = []
+
+        def discover(_config, _provider, authorization=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return [{"model": "live", "context_limit": 10000, "output_limit": 1000}]
+            return []
+
+        config = self._config()
+        with patch("muse_gateway._discover_provider_models", side_effect=discover), \
+                patch("muse_gateway._provider_is_available", return_value=True):
+            first = provider_model_catalog(config, "codex")
+            config._model_catalog_cache["codex"] = (0.0, first)
+            second = provider_model_catalog(config, "codex")
+        self.assertEqual(second, first)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(config._catalog_snapshots["codex"].outcome, "failed")
 
     def test_single_flight_one_discovery_for_concurrent_cold_fetches(self):
         import threading

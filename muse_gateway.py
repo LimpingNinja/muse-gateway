@@ -38,6 +38,7 @@ import ipaddress
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 import re
 import secrets
@@ -68,6 +69,8 @@ from muse_providers import (
     DEFAULT_CLAUDE_ENDPOINT,
     DEFAULT_CODEX_ENDPOINT,
     ProviderError,
+    bounded_client_error_code,
+    bounded_client_error_text,
     anthropic_json_to_responses,
     build_gateway_opener,
     claude_headers,
@@ -77,6 +80,7 @@ from muse_providers import (
     credentials_usable,
     discover_claude_credentials,
     discover_codex_credentials,
+    refused_symlink_credential_labels,
     demote_codex_encrypted_reasoning,
     drop_or_reject_previous_response_id,
     _flatten_tools,
@@ -86,7 +90,6 @@ from muse_providers import (
     resolve_codex_credentials,
     response_sse_line,
     responses_to_anthropic,
-    translate_anthropic_sse,
     validate_claude_endpoint,
     validate_claude_token_url,
     validate_codex_endpoint,
@@ -94,7 +97,10 @@ from muse_providers import (
 )
 try:
     import muse_devin
-except ImportError as _devin_import_error:  # protobuf absent for this interpreter (P1-17)
+except Exception as _devin_import_error:  # protobuf absent or wrong version (P1-17, M2)
+    if not isinstance(_devin_import_error, ImportError) and type(_devin_import_error).__name__ != "VersionError":
+        raise
+
     class _MissingDevin:
         """Stand-in so non-Devin routes, --help, doctor and --models still run."""
 
@@ -165,6 +171,51 @@ def env_value(name: str, default: str | None = None) -> str | None:
 def env_flag(name: str, default: bool = False) -> bool:
     value = env_value(name)
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+
+
+def _validated_timeout(value: Any, default: float, name: str) -> float:
+    if value is None or value == "":
+        return float(default)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number of seconds between 0 and {MAX_TIMEOUT_SECONDS}.")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite number of seconds between 0 and {MAX_TIMEOUT_SECONDS}.") from error
+    if not math.isfinite(seconds) or seconds <= 0 or seconds > MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"{name} must be a finite number of seconds between 0 and {MAX_TIMEOUT_SECONDS}.")
+    return seconds
+
+
+def _timeout_seconds(value: str) -> float:
+    try:
+        return _validated_timeout(value, 600.0, "timeout")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _validated_concurrency(value: Any) -> int:
+    if value is None or value == "":
+        return 8
+    if isinstance(value, bool):
+        raise ValueError("--max-concurrent-requests must be an integer between 1 and 1024.")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("--max-concurrent-requests must be an integer between 1 and 1024.") from error
+    if str(value).strip() != str(limit) or limit < 1 or limit > 1024:
+        raise ValueError("--max-concurrent-requests must be an integer between 1 and 1024.")
+    return limit
+
+
+def _concurrency_limit(value: str) -> int:
+    try:
+        return _validated_concurrency(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _parse_model_list(value: str | None, fallback: tuple[str, ...]) -> list[str]:
@@ -417,6 +468,15 @@ class Config:
             getattr(args, "allow_oauth_host_override", False)
         )
         self.allow_non_loopback: bool = bool(getattr(args, "allow_non_loopback", False))
+        self.require_inbound_token: bool = bool(getattr(args, "require_inbound_token", False))
+        self.inbound_token: str | None = (
+            str(getattr(args, "inbound_token", None) or os.environ.get("MUSE_GATEWAY_INBOUND_TOKEN", "")).strip() or None
+        )
+        if self.require_inbound_token and not self.inbound_token:
+            raise ProviderError(
+                "--require-inbound-token needs MUSE_GATEWAY_INBOUND_TOKEN set in the gateway process environment.",
+                code="inbound_token_missing",
+            )
         self.verbose: bool = bool(getattr(args, "verbose", False))
         self.log_file: str = os.path.abspath(os.path.expanduser(
             getattr(args, "log_file", None) or "muse-gateway.log"
@@ -425,7 +485,7 @@ class Config:
         self.capture_dir: str | None = (
             os.path.expanduser(str(_capture_dir)) if _capture_dir else None
         )
-        self.timeout: float = float(getattr(args, "timeout", 600.0) or 600.0)
+        self.timeout: float = _validated_timeout(getattr(args, "timeout", 600.0), 600.0, "--timeout")
         self.max_body_bytes: int = int(
             getattr(args, "max_body_bytes", DEFAULT_MAX_BODY_BYTES)
         )
@@ -453,8 +513,14 @@ class Config:
                 code="invalid_claude_passthrough",
             )
         self.claude_cli_passthrough: str = str(_passthrough)
-        self.stream_idle_timeout: float = float(
-            getattr(args, "stream_idle_timeout", 120.0) or 120.0
+        self.stream_idle_timeout: float = _validated_timeout(
+            getattr(args, "stream_idle_timeout", 120.0), 120.0, "--stream-idle-timeout"
+        )
+        self.turn_timeout: float = _validated_timeout(
+            getattr(args, "turn_timeout", 3600.0), 3600.0, "--turn-timeout"
+        )
+        self.max_concurrent_requests: int = _validated_concurrency(
+            getattr(args, "max_concurrent_requests", 8)
         )
         self.doctor_provider: str | None = getattr(args, "doctor_provider", None)
         self.codex_models = list(DEFAULT_CODEX_MODELS)
@@ -485,6 +551,12 @@ class Config:
                 f"refusing non-loopback bind address {self.host!r}; "
                 "use --allow-non-loopback only when remote access is intentional.",
                 code="non_loopback_bind_rejected",
+            )
+        if not _is_loopback_host(self.host) and not (self.require_inbound_token and self.inbound_token):
+            raise ProviderError(
+                f"refusing non-loopback bind address {self.host!r} without an inbound token; "
+                "set MUSE_GATEWAY_INBOUND_TOKEN and pass --require-inbound-token.",
+                code="non_loopback_token_required",
             )
         native_providers = (
             ("codex", "claude") if self.provider == "auto" else (self.provider,)
@@ -592,6 +664,7 @@ class Config:
             self.local_api_key,
             self.devin_api_key,
             self.kiro_api_key,
+            self.inbound_token,
         ):
             if isinstance(value, str) and value:
                 values.append(value)
@@ -614,23 +687,43 @@ class Config:
     def _publish_catalog(self, key: str, provider: str, *, entries, raw, stamped,
                          generation: int, outcome: str = "ok",
                          devin_roster=None, devin_dropped: int = 0) -> bool:
-        snapshot = _CatalogSnapshot(
-            entries=tuple(entries), raw=dict(raw), devin_roster=devin_roster,
-            devin_dropped=devin_dropped, stamped=stamped,
-            generation=generation, outcome=outcome,
-        )
         with self._catalog_lock:
             if generation != self._catalog_generation.get(key, 0):
                 return False
+            existing = self._catalog_snapshots.get(key)
+            if outcome not in {"ok", "ok_nonempty", "disabled"} and existing is not None and existing.outcome in {"ok", "ok_nonempty"}:
+                # Preserve last-good live entries/raw/roster on a failed
+                # refresh. The caller-supplied backdated stamp still records
+                # when discovery may be retried.
+                snapshot = _CatalogSnapshot(
+                    entries=existing.entries, raw=dict(existing.raw),
+                    devin_roster=existing.devin_roster,
+                    devin_dropped=existing.devin_dropped, stamped=stamped,
+                    generation=generation, outcome=outcome,
+                )
+            else:
+                snapshot = _CatalogSnapshot(
+                    entries=tuple(entries), raw=dict(raw), devin_roster=devin_roster,
+                    devin_dropped=devin_dropped, stamped=stamped,
+                    generation=generation, outcome=outcome,
+                )
             self._catalog_snapshots[key] = snapshot
-            self._model_catalog_cache[key] = (stamped, list(entries))
-            self._raw_model_rosters[provider] = dict(raw)
-            if devin_roster is not None:
-                self._devin_roster = devin_roster
-                self._devin_dropped_fusion = devin_dropped
-                self._devin_rosters[key] = (devin_roster, devin_dropped)
+            self._model_catalog_cache[key] = (stamped, list(snapshot.entries))
+            self._raw_model_rosters[provider] = dict(snapshot.raw)
+            if snapshot.devin_roster is not None:
+                self._devin_roster = snapshot.devin_roster
+                self._devin_dropped_fusion = snapshot.devin_dropped
+                self._devin_rosters[key] = (snapshot.devin_roster, snapshot.devin_dropped)
                 while len(self._devin_rosters) > 4:
-                    self._devin_rosters.pop(next(iter(self._devin_rosters)))
+                    evicted = next(iter(self._devin_rosters))
+                    self._devin_rosters.pop(evicted)
+                    if evicted != key:
+                        self._catalog_snapshots.pop(evicted, None)
+                        self._model_catalog_cache.pop(evicted, None)
+                        self._catalog_generation.pop(evicted, None)
+                        flight = self._catalog_flight_locks.get(evicted)
+                        if flight is not None and not flight.locked():
+                            self._catalog_flight_locks.pop(evicted, None)
             return True
 
 
@@ -798,7 +891,7 @@ def _discover_provider_models(
             with _credentialed_urlopen(
                 request, timeout=min(config.timeout, 8.0), config=config
             ) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                payload = _read_bounded_json(response, limit=CATALOG_JSON_RESPONSE_LIMIT)
             raw_models = payload.get("models", []) if isinstance(payload, dict) else []
             result = []
             for item in raw_models:
@@ -831,7 +924,7 @@ def _discover_provider_models(
         with _credentialed_urlopen(
             request, timeout=min(config.timeout, 8.0), config=config
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = _read_bounded_json(response, limit=CATALOG_JSON_RESPONSE_LIMIT)
         raw_models = payload.get("data", []) if isinstance(payload, dict) else []
         result = []
         for item in raw_models:
@@ -905,10 +998,10 @@ def _get_discovery_json(
 ) -> Any:
     request = urllib.request.Request(url, method="GET", headers=headers)
     with _credentialed_urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        return _read_bounded_json(response, limit=CATALOG_JSON_RESPONSE_LIMIT)
 
 
-_DISCOVERY_ERRORS = (OSError, HTTPException, ValueError, TypeError, json.JSONDecodeError)
+_DISCOVERY_ERRORS = (OSError, HTTPException, ValueError, TypeError, json.JSONDecodeError, ProviderError)
 
 
 def _parse_openai_style_models(payload: Any, provider: str) -> list[dict[str, Any]]:
@@ -1082,7 +1175,7 @@ def _devin_cache_key(config: Config, token: str) -> str:
     return "devin:" + hashlib.sha256(token.encode()).hexdigest()
 
 
-def _devin_catalog_entries(config: Config, access_token=None) -> list[dict[str, Any]]:
+def _devin_catalog_entries(config: Config, access_token=None, note_error_headers=None) -> list[dict[str, Any]]:
     """Devin rows with their own roster stash (uid/routing the generic item
     shape cannot carry). Explicit devin_models curate; fusion pairings are
     dropped inside discovery (option B) with the count stashed for doctor."""
@@ -1125,6 +1218,10 @@ def _devin_catalog_entries(config: Config, access_token=None) -> list[dict[str, 
                     token, config.devin_upstream, timeout=min(config.timeout, 8.0)
                 )
                 live_ok = bool(models)
+            except muse_devin.DevinHttpError as error:
+                if callable(note_error_headers):
+                    note_error_headers(getattr(error, "headers", None))
+                models = []
             except (muse_devin.DevinWireError, OSError, ValueError):
                 models = []
             if not models:
@@ -1161,7 +1258,8 @@ def _devin_catalog_entries(config: Config, access_token=None) -> list[dict[str, 
             stale = config._model_catalog_cache.get(cache_key)
             if stale:
                 return stale[1]
-        return entries
+        snapshot = config._catalog_snapshots.get(cache_key)
+        return list(snapshot.entries) if snapshot is not None else entries
     finally:
         flight.release()
 
@@ -1202,7 +1300,7 @@ def _menu_entries(config: Config, provider: str, entries: list[dict[str, Any]]) 
         notes.append("omitted: missing capacity metadata for " + ", ".join(incomplete))
     if unresolved:
         notes.append("unresolved MUSE_GATEWAY_MODELS IDs (not entitlement): " + ", ".join(unresolved))
-    detail = "; ".join(notes)
+    detail = bounded_client_error_text("; ".join(notes))
     config._catalog_diagnostics[provider] = detail
     if detail and detail not in config._reported_catalog_diagnostics:
         print("muse-gateway catalog: " + detail, file=sys.stderr)
@@ -1273,7 +1371,8 @@ def _kiro_catalog_entries_locked(config: Config) -> list[dict[str, Any]]:
         stale = config._model_catalog_cache.get("kiro")
         if stale:
             return stale[1]
-    return entries
+    snapshot = config._catalog_snapshots.get("kiro")
+    return list(snapshot.entries) if snapshot is not None else entries
 
 
 def provider_model_catalog(
@@ -1341,7 +1440,8 @@ def _provider_model_catalog_locked(
         stale = config._model_catalog_cache.get(provider)
         if stale:
             return _menu_entries(config, provider, stale[1])
-    return _menu_entries(config, provider, entries)
+    snapshot = config._catalog_snapshots.get(provider)
+    return _menu_entries(config, provider, list(snapshot.entries) if snapshot is not None else entries)
 
 
 def _codex_model_efforts(config: Config, model: Any) -> list[str]:
@@ -1452,6 +1552,11 @@ def run_claude_cli(
         oauth=False,
         max_output_tokens=model_limit,
     )
+    if payload.get("stop_sequences"):
+        raise ProviderError(
+            "Claude CLI transport cannot enforce stop sequences; omit stop or use --claude-transport http.",
+            code="claude_cli_stop_unsupported",
+        )
     # P2-02: `claude -p` has no token-limit flag (checked against the
     # installed CLI's --help), so a cap below the model limit cannot be
     # honored; refuse it rather than pretend.
@@ -1753,6 +1858,13 @@ def _anthropic_message_sse(payload: dict[str, Any]) -> io.BytesIO:
     return io.BytesIO(raw)
 
 
+_LOG_TOKEN_PATTERN = re.compile(
+    rb"(?:devin-session-token\$[^\s\"'<>]+|"
+    rb"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|"
+    rb"sk-[A-Za-z0-9_-]{16,})"
+)
+
+
 def _redact_bytes(payload: bytes, secrets: Iterable[str]) -> bytes:
     result = payload
     values = set()
@@ -1764,7 +1876,7 @@ def _redact_bytes(payload: bytes, secrets: Iterable[str]) -> bytes:
     forms = {form for secret in values for form in encoded_secret_forms(secret)}
     for form in sorted(forms, key=len, reverse=True):
         result = result.replace(form, b"[REDACTED]")
-    return result
+    return _LOG_TOKEN_PATTERN.sub(b"[REDACTED]", result)
 
 
 _REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
@@ -2040,8 +2152,8 @@ def _iter_upstream_chunks(upstream: Any, *, content_type: str) -> Iterable[bytes
         reader = getattr(upstream, "readline", None)
         if callable(reader):
             while True:
-                chunk = reader(4 * 1024 * 1024 + 1)
-                if chunk and len(chunk) > 4 * 1024 * 1024 and not chunk.endswith(b"\n" if isinstance(chunk, bytes) else "\n"):
+                chunk = reader(UPSTREAM_SSE_LINE_LIMIT + 1)
+                if chunk and len(chunk) > UPSTREAM_SSE_LINE_LIMIT and not chunk.endswith(b"\n" if isinstance(chunk, bytes) else "\n"):
                     raise ProviderError(
                         "Upstream SSE line exceeded the safety size limit.",
                         status=502, code="upstream_protocol_error",
@@ -2109,41 +2221,68 @@ def _read_bounded_upstream_body(upstream: Any, *, limit: int = UPSTREAM_JSON_RES
     return data
 
 
-class _ClientCancelWatch:
-    """Shut the upstream socket when the inbound client hangs up (P1-10).
+CATALOG_JSON_RESPONSE_LIMIT = 4 * 1024 * 1024
+HEALTH_JSON_RESPONSE_LIMIT = 64 * 1024
 
-    A watcher thread polls the client socket once a second (no async
-    runtime). Closing the upstream unblocks a relay that is waiting on a
-    silent (thinking) upstream; the existing BrokenPipe handling stays as
-    the backstop for writes.
+
+def _read_bounded_json(response: Any, *, limit: int) -> Any:
+    raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise ProviderError(
+            "JSON response exceeded the safety size limit.",
+            status=502, code="upstream_response_too_large",
+        )
+    return json.loads(raw.decode("utf-8"))
+
+
+class _ClientCancelWatch:
+    """Shut the upstream socket on client hangup or turn deadline.
+
+    A watcher thread polls the client socket (no async runtime). Closing
+    the upstream unblocks a relay waiting on a silent upstream; existing
+    BrokenPipe handling stays as the backstop for writes.
     """
 
     POLL_SECONDS = 1.0
 
-    def __init__(self, handler: Any, upstream: Any) -> None:
+    def __init__(self, handler: Any, upstream: Any, *, deadline: float | None = None) -> None:
         self.handler, self.upstream = handler, upstream
+        self.deadline = deadline
         self.fired = False
+        self.deadline_fired = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def __enter__(self) -> "_ClientCancelWatch":
-        if getattr(self.handler, "connection", None) is not None:
+        if getattr(self.handler, "connection", None) is not None or self.deadline is not None:
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
         return self
 
+    def _interrupt_upstream(self) -> None:
+        sock = response_socket(self.upstream)
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+            else:
+                self.upstream.close()
+        except (OSError, AttributeError):
+            pass
+
     def _run(self) -> None:
-        while not self._stop.wait(self.POLL_SECONDS):
+        while True:
+            wait = self.POLL_SECONDS
+            if self.deadline is not None:
+                wait = min(wait, max(0.0, self.deadline - time.monotonic()))
+            if self._stop.wait(wait):
+                return
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                self.deadline_fired = True
+                self._interrupt_upstream()
+                return
             if _client_hung_up(self.handler):
                 self.fired = True
-                sock = response_socket(self.upstream)
-                try:
-                    if sock is not None:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    else:
-                        self.upstream.close()
-                except OSError:
-                    pass
+                self._interrupt_upstream()
                 return
 
     def __exit__(self, *_exc: Any) -> None:
@@ -2152,39 +2291,220 @@ class _ClientCancelWatch:
             self._thread.join(self.POLL_SECONDS + 1)
 
 
-def _relay_upstream_chunks(handler: Any, iterator: Any, watch: _ClientCancelWatch, observe: Any,
-                           is_sse: bool, line_buf: bytearray, consume_line: Any) -> bool:
-    """Forward upstream chunks; False when the client cancelled mid-stream."""
-    while True:
+UPSTREAM_SSE_LINE_LIMIT = 4 * 1024 * 1024
+UPSTREAM_SSE_EVENT_LIMIT = 8 * 1024 * 1024
+UPSTREAM_STREAM_RESPONSE_LIMIT = 64 * 1024 * 1024
+_SSE_FRAME_BOUNDARY = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+
+
+def _parse_sse_frame(frame: bytes) -> tuple[str, dict[str, Any]] | None:
+    """Parse one complete SSE frame into a Responses event payload."""
+    event_names: list[str] = []
+    data_lines: list[bytes] = []
+    for line in frame.splitlines():
+        if not line or line.startswith(b":"):
+            continue
+        field, separator, value = line.partition(b":")
+        if separator and value.startswith(b" "):
+            value = value[1:]
+        if field == b"event":
+            event_names.append(value.decode("utf-8", errors="strict").strip())
+        elif field == b"data":
+            data_lines.append(value)
+    if not data_lines:
+        return None
+    raw = b"\n".join(data_lines)
+    if raw == b"[DONE]":
+        return ("[DONE]", {})
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("SSE data payload is not an object")
+    event_type = payload.get("type")
+    if not isinstance(event_type, str) or not event_type:
+        raise ValueError("SSE data payload has no event type")
+    if any(name != event_type for name in event_names):
+        raise ValueError("SSE event name does not match payload type")
+    return event_type, payload
+
+
+def _relay_parsed_sse(handler: Any, iterator: Any, watch: _ClientCancelWatch, observe: Any) -> bool:
+    """Relay validated Responses SSE; False when the client cancelled."""
+    buffer = bytearray()
+    total = 0
+    next_sequence = 0
+    resp_id = "resp_" + secrets.token_hex(8)
+    saw_created = False
+    saw_terminal = False
+    missing_sequence = 0
+    failure_code = "upstream_truncated"
+    failure_message = "Upstream stream ended without a terminal event."
+    failure_log = "upstream_stream_truncated"
+
+    def write_event(event_type: str, payload: dict[str, Any]) -> None:
+        nonlocal next_sequence
+        payload = dict(payload)
+        payload["sequence_number"] = next_sequence
+        next_sequence += 1
+        handler.wfile.write(response_sse_line(event_type, payload))
+        handler.wfile.flush()
+
+    def ensure_created(first_payload: dict[str, Any] | None = None) -> None:
+        nonlocal resp_id, saw_created
+        if saw_created:
+            return
+        if isinstance(first_payload, dict):
+            response_obj = first_payload.get("response")
+            if isinstance(response_obj, dict) and isinstance(response_obj.get("id"), str) and response_obj["id"]:
+                resp_id = response_obj["id"]
+        snapshot = {"id": resp_id, "object": "response", "status": "in_progress", "output": []}
+        write_event("response.created", {"type": "response.created", "response": dict(snapshot)})
+        if not (isinstance(first_payload, dict) and first_payload.get("type") == "response.in_progress"):
+            write_event("response.in_progress", {"type": "response.in_progress", "response": dict(snapshot)})
+        saw_created = True
+
+    def write_failed(code: str, message: str) -> None:
+        ensure_created()
+        handler._stream_failed = True
+        write_event("response.failed", {
+            "type": "response.failed",
+            "response": {
+                "id": resp_id, "object": "response", "status": "failed", "output": [],
+                "error": {
+                    "type": bounded_client_error_code(code, "upstream_truncated"),
+                    "code": bounded_client_error_code(code, "upstream_truncated"),
+                    "message": bounded_client_error_text(message),
+                },
+            },
+        })
+
+    while not saw_terminal:
         try:
             chunk = next(iterator)
         except StopIteration:
-            return True
+            break
         except (OSError, HTTPException, TimeoutError, ProviderError) as error:
             if watch.fired:
                 handler.close_connection = True
                 if callable(observe):
                     observe("client_disconnected", disconnect_origin="client")
                 return False
-            handler._stream_failed = True
-            if callable(observe):
-                observe("upstream_stream_interrupted", kind=type(error).__name__)
-            return True
+            if isinstance(error, ProviderError):
+                failure_code = error.code
+                failure_message = str(error)
+                failure_log = failure_code
+            else:
+                failure_log = "upstream_stream_interrupted"
+                if callable(observe):
+                    observe(failure_log, kind=type(error).__name__)
+            break
         if watch.fired:
             handler.close_connection = True
             if callable(observe):
                 observe("client_disconnected", disconnect_origin="client")
             return False
-        if is_sse:
-            line_buf.extend(chunk)
-            while b"\n" in line_buf:
-                idx = line_buf.index(b"\n") + 1
-                consume_line(bytes(line_buf[:idx]))
-                del line_buf[:idx]
-        # Forwarded bytes are unchanged on the happy path. Client-write
-        # failures propagate (never mistaken for upstream failures).
-        handler.wfile.write(chunk)
-        handler.wfile.flush()
+        total += len(chunk)
+        if total > UPSTREAM_STREAM_RESPONSE_LIMIT:
+            failure_code = "upstream_response_too_large"
+            failure_message = "Upstream stream exceeded the safety size limit."
+            failure_log = failure_code
+            buffer.clear()
+            break
+        buffer.extend(chunk)
+        while True:
+            match = _SSE_FRAME_BOUNDARY.search(buffer)
+            if match is None:
+                if len(buffer) > UPSTREAM_SSE_EVENT_LIMIT:
+                    failure_code = "upstream_protocol_error"
+                    failure_message = "Upstream SSE event exceeded the safety size limit."
+                    failure_log = failure_code
+                    buffer.clear()
+                break
+            frame = bytes(buffer[:match.start()])
+            del buffer[:match.end()]
+            if len(frame) > UPSTREAM_SSE_EVENT_LIMIT:
+                failure_code = "upstream_protocol_error"
+                failure_message = "Upstream SSE event exceeded the safety size limit."
+                failure_log = failure_code
+                buffer.clear()
+                break
+            try:
+                parsed = _parse_sse_frame(frame)
+            except (ValueError, UnicodeError):
+                failure_code = "upstream_protocol_error"
+                failure_message = "Upstream stream sent a malformed SSE frame."
+                failure_log = failure_code
+                buffer.clear()
+                break
+            if parsed is None:
+                continue
+            event_type, payload = parsed
+            if event_type == "[DONE]":
+                continue
+            if not isinstance(payload.get("sequence_number"), int) or isinstance(payload.get("sequence_number"), bool):
+                missing_sequence += 1
+            if event_type == "error":
+                error_obj = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+                code = error_obj.get("code") or error_obj.get("type") or payload.get("code") or "upstream_error"
+                message = error_obj.get("message") or payload.get("message") or "Upstream stream returned an error."
+                if callable(observe):
+                    observe("upstream_stream_error", **_upstream_diagnostic(json.dumps(payload).encode()))
+                write_failed(str(code), str(message))
+                saw_terminal = True
+                break
+            response_obj = payload.get("response")
+            if isinstance(response_obj, dict):
+                response_obj = dict(response_obj)
+                payload = dict(payload)
+                payload["response"] = response_obj
+                if not saw_created and event_type == "response.created":
+                    if isinstance(response_obj.get("id"), str) and response_obj["id"]:
+                        resp_id = response_obj["id"]
+                elif not saw_created:
+                    ensure_created(payload)
+                    response_obj = dict(payload["response"])
+                    payload = dict(payload)
+                    payload["response"] = response_obj
+                response_obj["id"] = resp_id
+            elif not saw_created and event_type != "response.created":
+                ensure_created(payload)
+            if event_type == "response.created":
+                saw_created = True
+            if event_type == "response.failed" and callable(observe):
+                observe("upstream_stream_error", **_upstream_diagnostic(json.dumps(payload).encode()))
+            if event_type in {"response.failed", "response.incomplete"}:
+                handler._stream_failed = True
+            write_event(event_type, payload)
+            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                saw_terminal = True
+                break
+            if watch.fired:
+                handler.close_connection = True
+                if callable(observe):
+                    observe("client_disconnected", disconnect_origin="client")
+                return False
+        if failure_code != "upstream_truncated" and not buffer and total > 0 and not saw_terminal:
+            # A protocol/size failure above has consumed/discarded the frame;
+            # terminal synthesis below is the next and only output.
+            if failure_log in {"upstream_protocol_error", "upstream_response_too_large"}:
+                break
+    if watch.fired and not saw_terminal:
+        handler.close_connection = True
+        if callable(observe):
+            observe("client_disconnected", disconnect_origin="client")
+        return False
+    if missing_sequence and callable(observe):
+        observe("upstream_missing_sequence_number", count=missing_sequence)
+    if not saw_terminal:
+        if buffer.strip() and failure_code == "upstream_truncated":
+            failure_message = "Upstream stream ended with an incomplete SSE frame."
+        if getattr(watch, "deadline_fired", False):
+            failure_code = "turn_timeout"
+            failure_message = "Turn exceeded the configured deadline."
+            failure_log = failure_code
+        if callable(observe):
+            observe(failure_log)
+        write_failed(failure_code, failure_message)
+    return True
 
 
 def _client_hung_up(handler: Any) -> bool:
@@ -2203,79 +2523,12 @@ def _client_hung_up(handler: Any) -> bool:
 
 def _write_upstream_body(handler: BaseHTTPRequestHandler, upstream: Any, *, stream: bool, content_type: str) -> None:
     if stream:
-        frame = bytearray()
-        line_buf = bytearray()
-        event_name = b""
-        saw_terminal = False
-        last_seq = -1
-        resp_id = "resp_" + secrets.token_hex(8)
-        missing_seq = 0
         observe = getattr(handler, "_log_event", None)
-        is_sse = "text/event-stream" in content_type.lower()
-
-        def observe_frame() -> None:
-            nonlocal saw_terminal, last_seq, resp_id, missing_seq
-            try:
-                event = json.loads(frame)
-            except (ValueError, UnicodeError):
-                event = None
-            event_type = ""
-            if isinstance(event, dict):
-                event_type = str(event.get("type") or "")
-                seq = event.get("sequence_number")
-                if isinstance(seq, int) and not isinstance(seq, bool):
-                    last_seq = max(last_seq, seq)
-                else:
-                    missing_seq += 1
-                response_obj = event.get("response")
-                if isinstance(response_obj, dict) and isinstance(response_obj.get("id"), str):
-                    resp_id = response_obj["id"]
-            if not event_type:
-                event_type = event_name.decode("utf-8", errors="replace")
-            if event_type in ("response.completed", "response.failed", "response.incomplete"):
-                saw_terminal = True
-            failed = event_type in ("error", "response.failed")
-            if failed:
-                handler._stream_failed = True  # type: ignore[attr-defined]
-                if callable(observe):
-                    observe("upstream_stream_error", **_upstream_diagnostic(bytes(frame)))
-            frame.clear()
-
-        def consume_line(raw_line: bytes) -> None:
-            nonlocal event_name
-            if raw_line.strip() == b"":
-                if frame or event_name:
-                    observe_frame()
-                event_name = b""
-            elif raw_line.startswith(b"event:"):
-                event_name = raw_line[6:].strip()[:64]
-            elif raw_line.startswith(b"data:") and len(frame) < 65536:
-                frame.extend((raw_line[5:].strip() + b"\n")[:65536 - len(frame)])
-
         iterator = iter(_iter_upstream_chunks(upstream, content_type=content_type))
-        watch = _ClientCancelWatch(handler, upstream)
+        watch_factory = getattr(handler, "_stream_watch", None)
+        watch = watch_factory(upstream) if callable(watch_factory) else _ClientCancelWatch(handler, upstream)
         with watch:
-            relayed = _relay_upstream_chunks(handler, iterator, watch, observe, is_sse, line_buf, consume_line)
-        if not relayed:
-            return
-        if line_buf and is_sse:
-            consume_line(bytes(line_buf))
-        if frame or event_name:
-            observe_frame()
-        if is_sse and missing_seq > 0 and callable(observe):
-            observe("upstream_missing_sequence_number", count=missing_seq)
-        if is_sse and not saw_terminal:
-            handler._stream_failed = True  # type: ignore[attr-defined]
-            if callable(observe):
-                observe("upstream_stream_truncated")
-            handler.wfile.write(response_sse_line("response.failed", {
-                "type": "response.failed", "sequence_number": last_seq + 1,
-                "response": {"id": resp_id, "object": "response", "status": "failed",
-                             "output": [],
-                             "error": {"type": "upstream_truncated",
-                                       "code": "upstream_truncated",
-                                       "message": "Upstream stream ended without a terminal event."}}}))
-            handler.wfile.flush()
+            _relay_parsed_sse(handler, iterator, watch, observe)
         return
     payload = _read_bounded_upstream_body(upstream)
     if payload:
@@ -2373,7 +2626,12 @@ def _buffered_codex_response(upstream: Any, content_type: str) -> dict[str, Any]
                             status=502, code="codex_truncated_stream") from parse_error
 
     def streamed_lines() -> Iterable[str]:
+        total = 0
         for chunk in _iter_upstream_chunks(upstream, content_type=content_type):
+            total += len(chunk)
+            if total > UPSTREAM_STREAM_RESPONSE_LIMIT:
+                raise ProviderError("Codex stream exceeded the safety size limit.",
+                                    status=502, code="upstream_response_too_large")
             text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
             yield from text.splitlines()
 
@@ -2437,8 +2695,25 @@ def _warn_credential_forwarding_once(route: str, url: str, *, custom: bool) -> N
     )
 
 
+def _gateway_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("muse-gateway")
+    except Exception:
+        pass
+    try:
+        text = Path(__file__).with_name("pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'^version\s*=\s*"([^"]+)"', text, flags=re.MULTILINE)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    return "0.0.0+unknown"
+
+
 class MuseShimHandler(BaseHTTPRequestHandler):
-    server_version = "muse-gateway/0.5.0"
+    server_version = f"muse-gateway/{_gateway_version()}"
     protocol_version = "HTTP/1.1"
     # Idle keep-alive budget only; upstream sockets use their own timeouts (P1-09).
     timeout = 30
@@ -2447,6 +2722,10 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self._capture_request = None
+        self._inference_slot_acquired = False
+        self._request_started_at: float | None = None
+        self._pending_capture_incoming: tuple[dict[str, Any], dict[str, str], bytes] | None = None
+        self._pending_capture_transformed: tuple[dict[str, Any], str, str] | None = None
         if getattr(self.server, "capture_session", None) is not None:
             self.wfile = CapturingWriter(self.wfile)
 
@@ -2457,6 +2736,13 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             self._release_tracked()
             capture = getattr(self, "_capture_request", None)
             if capture is not None:
+                if getattr(self, "_pending_capture_incoming", None) is not None or getattr(self, "_pending_capture_transformed", None) is not None:
+                    capture.event(
+                        "capture.request_artifacts_omitted",
+                        reason="credential_registration_incomplete",
+                    )
+                    self._pending_capture_incoming = None
+                    self._pending_capture_transformed = None
                 capture.finish(status=getattr(self, "_response_status", None),
                                stream_failed=getattr(self, "_stream_failed", False),
                                close_connection=self.close_connection)
@@ -2479,6 +2765,46 @@ class MuseShimHandler(BaseHTTPRequestHandler):
         if capture is not None:
             capture.add_secret(value)
 
+    def _flush_pending_capture_artifacts(self) -> None:
+        """Write request artifacts only after route credentials are known."""
+        capture = current_capture()
+        if capture is None:
+            self._pending_capture_incoming = None
+            self._pending_capture_transformed = None
+            return
+        incoming = getattr(self, "_pending_capture_incoming", None)
+        if incoming is not None:
+            body, headers, raw = incoming
+            capture.json("incoming", body)
+            capture.json("incoming.headers", headers)
+            capture.bytes("incoming.body", raw)
+            self._pending_capture_incoming = None
+        transformed = getattr(self, "_pending_capture_transformed", None)
+        if transformed is not None:
+            body, provider, model = transformed
+            capture.json("transformed", body)
+            capture.event("route.selected", provider=provider, model=model)
+            self._pending_capture_transformed = None
+
+    def _turn_deadline(self) -> float | None:
+        started = getattr(self, "_request_started_at", None)
+        timeout = getattr(self.config, "turn_timeout", None)
+        if started is None or not timeout:
+            return None
+        return started + float(timeout)
+
+    def _stream_watch(self, upstream: Any) -> _ClientCancelWatch:
+        return _ClientCancelWatch(self, upstream, deadline=self._turn_deadline())
+
+    def _acquire_inference_slot(self) -> bool:
+        semaphore = getattr(getattr(self, "server", None), "inference_semaphore", None)
+        if semaphore is None:
+            return True
+        if not semaphore.acquire(blocking=False):
+            return False
+        self._inference_slot_acquired = True
+        return True
+
     def _track_upstream(self, resource: Any) -> None:
         """Let server shutdown close this request's upstream (P1-10)."""
         track = getattr(getattr(self, "server", None), "track", None)
@@ -2495,17 +2821,85 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             if callable(untrack):
                 untrack(resource)
         self._tracked_resources = []
+        if getattr(self, "_inference_slot_acquired", False):
+            semaphore = getattr(getattr(self, "server", None), "inference_semaphore", None)
+            if semaphore is not None:
+                semaphore.release()
+            self._inference_slot_acquired = False
+
+    def _host_header_allowed(self, *, require_present: bool = False) -> bool:
+        headers = getattr(self, "headers", None)
+        host = headers.get("Host") if headers is not None else None
+        if not host:
+            return not require_present
+        hostname = urllib.parse.urlsplit("//" + str(host).strip()).hostname
+        if not hostname:
+            return False
+        hostname = hostname.lower().rstrip(".")
+        if getattr(self.config, "allow_non_loopback", False):
+            return True
+        allowed = {"localhost", "127.0.0.1", "::1"}
+        configured = str(getattr(self.config, "host", "") or "").lower().rstrip(".")
+        if configured and configured not in {"0.0.0.0", "::", "*"}:
+            allowed.add(configured)
+        return hostname in allowed or _is_loopback_host(hostname)
+
+    def _inbound_token_authorized(self) -> bool:
+        if not getattr(self.config, "require_inbound_token", False):
+            return True
+        expected = getattr(self.config, "inbound_token", None)
+        if not expected:
+            return False
+        candidates = []
+        custom = self.headers.get("x-muse-gateway-token")
+        if custom:
+            candidates.append(str(custom).strip())
+        authorization = self.headers.get("Authorization") or ""
+        if authorization.lower().startswith("bearer "):
+            candidates.append(authorization[7:].strip())
+        return any(secrets.compare_digest(candidate, expected) for candidate in candidates if candidate)
+
+    def _reject_untrusted_inbound(self, *, post: bool = False) -> bool:
+        if not self._host_header_allowed(require_present=post):
+            self.send_provider_error(ProviderError(
+                "Request Host is not allowed for this loopback gateway.",
+                status=403, code="bad_host",
+            ))
+            return True
+        if post and self.headers.get("Origin"):
+            self.send_provider_error(ProviderError(
+                "Browser-origin inference requests are not allowed.",
+                status=403, code="browser_origin_rejected",
+            ))
+            return True
+        if post and not self._inbound_token_authorized():
+            self.send_provider_error(ProviderError(
+                "A valid gateway inbound token is required.",
+                status=401, code="inbound_token_required",
+            ))
+            return True
+        return False
 
     def _note_upstream_error_headers(self, headers: Any) -> str | None:
         """Keep a strict Retry-After and one bounded request ID (P1-08)."""
         if not headers:
             return None
-        retry = muse_kiro._retry_after(headers, tuple(self._all_secrets()))
+        secrets = tuple(self._all_secrets())
+        retry = muse_kiro._retry_after(headers, secrets)
+        if muse_kiro._single_header(headers, "Retry-After") is not None:
+            self._retry_after_observation = (
+                "clamped" if retry and retry.get("clamped") else "accepted" if retry else "rejected"
+            )
         if retry:
             self._retry_after = retry["value"]
         for header_name in ("request-id", "x-request-id", "anthropic-request-id"):
             candidate = muse_kiro._single_header(headers, header_name)
-            if candidate and len(candidate) <= 128 and all(33 <= ord(c) <= 126 for c in candidate):
+            if (
+                candidate
+                and len(candidate) <= 128
+                and all(33 <= ord(c) <= 126 for c in candidate)
+                and muse_kiro._secret_free(candidate, secrets)
+            ):
                 self._upstream_request_id = candidate
                 return candidate
         return None
@@ -2562,23 +2956,28 @@ class MuseShimHandler(BaseHTTPRequestHandler):
         # transform error must not leave a successful-looking capture outcome.
         self._stream_failed = True
         error_status = status or getattr(error, "status", 400)
-        code = getattr(error, "code", "shim_error")
+        if getattr(error, "headers", None) is not None:
+            self._note_upstream_error_headers(getattr(error, "headers"))
+        code = bounded_client_error_code(getattr(error, "code", "shim_error"), "shim_error")
         kiro_fields = muse_kiro.error_fields(error) if isinstance(error, ProviderError) else {}
+        if "code" in kiro_fields:
+            kiro_fields["code"] = bounded_client_error_code(kiro_fields["code"], code)
         extra = dict(getattr(self, "_upstream_diagnostic", {}))
         # Upstream diagnostics travel as one sub-dict so no upstream key can
         # collide with our own log fields (the old `code` splat TypeError
         # killed the error response entirely).
         self._log_event("provider_error", status=error_status, code=code,
                         upstream=extra,
+                        retry_after_observation=getattr(self, "_retry_after_observation", None),
                         **({"metadata": kiro_fields["metadata"]} if kiro_fields else {}))
         if getattr(self, "_response_started", False):
             # A partial response cannot be replaced by a second HTTP response.
             self.close_connection = True
             return
-        message = _redact_bytes(
+        message = bounded_client_error_text(_redact_bytes(
             str(error).encode("utf-8"),
             self._all_secrets(),
-        ).decode("utf-8")
+        ).decode("utf-8"))
         try:
             retry = kiro_fields.get("metadata", {}).get("retry_after")
             retry_value = retry["value"] if retry else getattr(self, "_retry_after", None)
@@ -2612,6 +3011,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 status=500, code="internal_error"))
 
     def _handle_get(self) -> None:
+        if self._reject_untrusted_inbound(post=False):
+            return
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/health":
             self.send_json(
@@ -2680,11 +3081,24 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             raise ShimError(
                 f"request body exceeds the configured limit of {self.config.max_body_bytes} bytes"
             )
-        # Inbound body deadline (P1-09): a stalled client body gets a 408,
-        # never a parked handler thread.
-        self.connection.settimeout(max(self.body_timeout_floor, float(self.config.timeout)))
+        # Inbound body deadline (P1-09/M4): one absolute monotonic deadline,
+        # not a per-read timeout that a dribbling client can keep resetting.
+        deadline = time.monotonic() + max(self.body_timeout_floor, float(self.config.timeout))
+        chunks: list[bytes] = []
+        remaining = content_length
         try:
-            raw = self.rfile.read(content_length)
+            while remaining:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError("request body deadline exceeded")
+                self.connection.settimeout(budget)
+                reader = getattr(self.rfile, "read1", self.rfile.read)
+                chunk = reader(min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
         except (TimeoutError, socket.timeout) as exc:
             self.close_connection = True
             raise ProviderError("request body was not received in time.",
@@ -2702,19 +3116,20 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             raise ShimError("request body must be valid JSON") from exc
         if not isinstance(body, dict):
             raise ShimError("request body must be a JSON object")
-        capture = current_capture()
-        if capture is not None:
-            capture.json("incoming", body)
-            capture.json("incoming.headers", dict(self.headers))
-            capture.bytes("incoming.body", raw)
+        if current_capture() is not None:
+            # Defer disk writes until the selected route credential has been
+            # registered; the incoming body may echo that credential.
+            self._pending_capture_incoming = (body, dict(self.headers), raw)
         return body
 
     def do_POST(self) -> None:
         self._request_id = secrets.token_hex(6)
+        self._request_started_at = time.monotonic()
         self._response_started = False
         self._stream_failed = False
         self._request_secrets: list[str] = []
         self._retry_after: str | None = None
+        self._retry_after_observation: str | None = None
         self._upstream_request_id: str | None = None
         self._diagnostic: dict[str, Any] = {}
         self._upstream_diagnostic: dict[str, Any] = {}
@@ -2730,6 +3145,15 @@ class MuseShimHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path not in {"/responses", "/v1/responses"}:
             self.send_json(404, {"error": {"message": "not found", "type": "shim_error"}})
+            return
+        if self._reject_untrusted_inbound(post=True):
+            return
+        if not self._acquire_inference_slot():
+            self._retry_after = "1"
+            self.send_provider_error(ProviderError(
+                "Gateway is at its concurrent inference limit; retry shortly.",
+                status=503, code="gateway_busy",
+            ))
             return
 
         try:
@@ -2754,8 +3178,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 transformed["max_output_tokens"] = min(int(requested), limit)
             self._diagnostic["provider"] = provider
             if current_capture() is not None:
-                current_capture().json("transformed", transformed)
-                current_capture().event("route.selected", provider=provider, model=upstream_model)
+                self._pending_capture_transformed = (transformed, provider, upstream_model)
         except (ProviderError, ShimError, ValueError) as error:
             local_error = (
                 error
@@ -2912,9 +3335,10 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             self._log_event("previous_response_id_dropped")
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         endpoint = self.config.provider_url("kiro")
+        self._register_secret(key)
+        self._flush_pending_capture_artifacts()
         capture = current_capture()
         if capture is not None:
-            capture.add_secret(key)
             capture.json("outgoing", payload)
             # Body/open are recorded once inside muse_kiro.open_request as
             # kiro.outgoing.body / kiro.upstream.open (no duplicate writes).
@@ -3000,41 +3424,46 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 )
                 terminal = False
                 try:
-                    try:
-                        first = next(pending)
-                    except StopIteration as error:
-                        raise ProviderError(
-                            "Kiro Gateway returned an empty stream.",
-                            status=502, code="kiro_invalid_response",
-                        ) from error
-                    if first[0] in {"response.failed", "response.incomplete", "error"}:
-                        raise ProviderError(
-                            "Kiro Gateway could not complete the response.",
-                            status=502, code="kiro_failed_response",
-                        )
-                    self._send_upstream_headers(
-                        upstream, content_type="text/event-stream", stream=True,
-                    )
-                    event_type, value = first
-                    while True:
-                        self.wfile.write(response_sse_line(event_type, value))
-                        self.wfile.flush()
-                        if event_type in {"response.completed", "response.failed", "response.incomplete"}:
-                            terminal = True
-                            self._stream_failed = event_type != "response.completed"
-                            if event_type == "response.failed":
-                                failure = (value.get("response") or {}).get("error") or {}
-                                self._log_event("kiro_upstream_error", metadata=failure.get("metadata"))  # P3-05 n1
-                            break
+                    with self._stream_watch(upstream) as watch:
                         try:
-                            event_type, value = next(pending)
-                        except StopIteration:
-                            break
-                    if not terminal:
-                        raise ProviderError(
-                            "Kiro Gateway stream ended without a terminal response.",
-                            status=502, code="kiro_stream_truncated",
+                            first = next(pending)
+                        except StopIteration as error:
+                            raise ProviderError(
+                                "Kiro Gateway returned an empty stream.",
+                                status=502, code="kiro_invalid_response",
+                            ) from error
+                        if first[0] in {"response.failed", "response.incomplete", "error"}:
+                            raise ProviderError(
+                                "Kiro Gateway could not complete the response.",
+                                status=502, code="kiro_failed_response",
+                            )
+                        self._send_upstream_headers(
+                            upstream, content_type="text/event-stream", stream=True,
                         )
+                        event_type, value = first
+                        while True:
+                            self.wfile.write(response_sse_line(event_type, value))
+                            self.wfile.flush()
+                            if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                                terminal = True
+                                self._stream_failed = event_type != "response.completed"
+                                if event_type == "response.failed":
+                                    failure = (value.get("response") or {}).get("error") or {}
+                                    self._log_event("kiro_upstream_error", metadata=failure.get("metadata"))  # P3-05 n1
+                                break
+                            if watch.fired:
+                                self._log_event("client_disconnected", disconnect_origin="client")
+                                self.close_connection = True
+                                return
+                            try:
+                                event_type, value = next(pending)
+                            except StopIteration:
+                                break
+                        if not terminal:
+                            raise ProviderError(
+                                "Kiro Gateway stream ended without a terminal response.",
+                                status=502, code="turn_timeout" if watch.deadline_fired else "kiro_stream_truncated",
+                            )
                 finally:
                     pending.close()
         except urllib.error.HTTPError as error:
@@ -3083,11 +3512,15 @@ class MuseShimHandler(BaseHTTPRequestHandler):
         try:
             token, _identity = muse_devin.resolve_access_token(api_key=config.devin_api_key)
             self._register_secret(token)
+            self._flush_pending_capture_artifacts()
         except muse_devin.DevinCredentialError as error:
             raise ProviderError(str(error), code="devin_credential_unavailable") from error
         try:
-            _ = _devin_catalog_entries(config, access_token=token)
+            _ = _devin_catalog_entries(
+                config, access_token=token, note_error_headers=self._note_upstream_error_headers
+            )
         except muse_devin.DevinHttpError as error:
+            self._note_upstream_error_headers(getattr(error, "headers", None))
             raise ProviderError(
                 "Devin upstream error.", status=502, code="devin_upstream_error"
             ) from error
@@ -3116,14 +3549,28 @@ class MuseShimHandler(BaseHTTPRequestHandler):
             effort=effort or model.default_effort or "default",
             router=bool(model.is_router),
         )
+        watch_box: dict[str, _ClientCancelWatch] = {}
+
+        def track_devin(resource: Any) -> None:
+            self._track_upstream(resource)
+            watch = self._stream_watch(resource)
+            watch.__enter__()
+            watch_box["watch"] = watch
+
         try:
             if not stream:
-                final = muse_devin.run_turn_final(
-                    body, tools, model, token,
-                    base_url=config.devin_upstream, effort=effort, timeout=config.timeout,
-                    conversation_id=conversation_id,
-                    idle_timeout=config.stream_idle_timeout,
-                )
+                try:
+                    final = muse_devin.run_turn_final(
+                        body, tools, model, token,
+                        base_url=config.devin_upstream, effort=effort, timeout=config.timeout,
+                        conversation_id=conversation_id,
+                        idle_timeout=config.stream_idle_timeout,
+                        track=track_devin,
+                        register_secret=self._register_secret,
+                    )
+                finally:
+                    if "watch" in watch_box:
+                        watch_box.pop("watch").__exit__()
                 self._stream_failed = final.get("status") != "completed"
                 self.send_json(200, final)
                 return
@@ -3132,8 +3579,9 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 base_url=config.devin_upstream, effort=effort, timeout=config.timeout,
                 conversation_id=conversation_id,
                 idle_timeout=config.stream_idle_timeout,
+                track=track_devin,
+                register_secret=self._register_secret,
             )
-            self._track_upstream(pending)
             try:
                 try:
                     first_event = next(pending)
@@ -3141,23 +3589,58 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     raise muse_devin.DevinChatError(
                         "Devin turn ended without a terminal event"
                     )
+                watch = watch_box.get("watch")
+                if watch is not None and watch.fired:
+                    self._log_event("client_disconnected", disconnect_origin="client")
+                    self.close_connection = True
+                    return
                 self._send_upstream_headers(
                     types.SimpleNamespace(status=200, headers={}),
                     content_type="text/event-stream",
                     stream=True,
                 )
                 event_type, payload = first_event
-                if event_type in {"response.failed", "response.incomplete"}:
-                    self._stream_failed = True
-                self.wfile.write(response_sse_line(event_type, payload))
-                self.wfile.flush()
-                for event_type, payload in pending:
+                terminal = False
+                last_sequence = -1
+                response_id = "resp_" + secrets.token_hex(8)
+                while True:
                     if event_type in {"response.failed", "response.incomplete"}:
                         self._stream_failed = True
-                    chunk = response_sse_line(event_type, payload)
-                    self.wfile.write(chunk)
+                    if isinstance(payload, dict):
+                        sequence = payload.get("sequence_number")
+                        if isinstance(sequence, int) and not isinstance(sequence, bool):
+                            last_sequence = max(last_sequence, sequence)
+                        response_obj = payload.get("response")
+                        if isinstance(response_obj, dict) and isinstance(response_obj.get("id"), str):
+                            response_id = response_obj["id"]
+                    self.wfile.write(response_sse_line(event_type, payload))
+                    self.wfile.flush()
+                    if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                        terminal = True
+                        break
+                    if watch is not None and watch.fired:
+                        self._log_event("client_disconnected", disconnect_origin="client")
+                        self.close_connection = True
+                        return
+                    try:
+                        event_type, payload = next(pending)
+                    except StopIteration:
+                        break
+                if not terminal:
+                    self._stream_failed = True
+                    deadline_hit = bool(watch is not None and watch.deadline_fired)
+                    code = "turn_timeout" if deadline_hit else "upstream_truncated"
+                    self._log_event(code)
+                    self.wfile.write(response_sse_line("response.failed", {
+                        "type": "response.failed", "sequence_number": last_sequence + 1,
+                        "response": {"id": response_id, "object": "response", "status": "failed",
+                                     "output": [], "error": {"type": code, "code": code,
+                                                             "message": "Turn exceeded the configured deadline." if deadline_hit else "Devin stream ended without a terminal event."}},
+                    }))
                     self.wfile.flush()
             finally:
+                if "watch" in watch_box:
+                    watch_box.pop("watch").__exit__()
                 pending.close()
         except muse_devin.DevinAuthError as error:
             status = getattr(error.__cause__, "status", None)
@@ -3209,10 +3692,11 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                 "User-Agent": self.server_version,
             },
         )
+        if authorization:
+            self._register_secret(authorization)
+        self._flush_pending_capture_artifacts()
         capture = current_capture()
         if capture is not None:
-            if authorization:
-                capture.add_secret(authorization)
             capture.bytes("outgoing.body", request.data)
             capture.json("outgoing", body)
             capture.json("outgoing.headers", dict(request.header_items()))
@@ -3253,6 +3737,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     def forward_codex(self, body: dict[str, Any]) -> None:
         state = resolve_codex_credentials(self.config)
         self._register_secret(state.access_token)
+        self._register_secret(state.refresh_token)
+        self._flush_pending_capture_artifacts()
         if not body.get("model"):
             raise ProviderError(
                 "Codex request is missing model; send model or pin one with --model in a provider-specific server mode.",
@@ -3350,6 +3836,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                             "Run `codex login` and try again.",
                             code="codex_upstream_unauthorized",
                         ) from refresh_error
+                    self._register_secret(state.access_token)
+                    self._register_secret(state.refresh_token)
                     auth_refreshed = True
                     continue
                 if error.code in {401, 403}:
@@ -3416,6 +3904,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     def forward_claude_cli(self, body: dict[str, Any]) -> None:
         for name in _CLAUDE_PASSTHROUGH_SETS[self.config.claude_cli_passthrough]:
             self._register_secret(os.environ.get(name, ""))
+        self._flush_pending_capture_artifacts()
         payload, tool_names = run_claude_cli(
             body, self.config, track=self._track_upstream
         )
@@ -3453,6 +3942,8 @@ class MuseShimHandler(BaseHTTPRequestHandler):
     def forward_claude(self, body: dict[str, Any]) -> None:
         state = resolve_claude_credentials(self.config)
         self._register_secret(state.access_token)
+        self._register_secret(state.refresh_token)
+        self._flush_pending_capture_artifacts()
         payload, tool_names = responses_to_anthropic(
             body,
             oauth=state.auth_mode != "api_key",
@@ -3506,19 +3997,33 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                             coalesce_text=True,
                             native_usage=True,
                         )
-                        first_chunk = next(converted, None)
-                        self._send_upstream_headers(
-                            upstream,
-                            content_type="text/event-stream",
-                            stream=True,
-                        )
-                        if first_chunk is not None:
-                            self.wfile.write(first_chunk)
-                            self.wfile.flush()
-                        for chunk in converted:
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
-                        return
+                        try:
+                            with self._stream_watch(upstream) as watch:
+                                first_chunk = next(converted, None)
+                                if watch.fired:
+                                    self._log_event("client_disconnected", disconnect_origin="client")
+                                    self.close_connection = True
+                                    return
+                                self._send_upstream_headers(
+                                    upstream,
+                                    content_type="text/event-stream",
+                                    stream=True,
+                                )
+                                if first_chunk is not None:
+                                    self.wfile.write(first_chunk)
+                                    self.wfile.flush()
+                                for chunk in converted:
+                                    if watch.fired:
+                                        self._log_event("client_disconnected", disconnect_origin="client")
+                                        self.close_connection = True
+                                        return
+                                    self.wfile.write(chunk)
+                                    self.wfile.flush()
+                                if watch.deadline_fired:
+                                    self._log_event("turn_timeout")
+                                return
+                        finally:
+                            converted.close()
                     try:
                         response_payload = json.loads(_read_bounded_upstream_body(upstream).decode("utf-8"))
                     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -3560,6 +4065,7 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     try:
                         state = resolve_claude_credentials(self.config, force_refresh=True)
                         self._register_secret(state.access_token)
+                        self._register_secret(state.refresh_token)
                     except ProviderError as refresh_error:
                         raise AuthError(
                             "Claude upstream rejected the OAuth credentials and refresh failed. "
@@ -3577,6 +4083,22 @@ class MuseShimHandler(BaseHTTPRequestHandler):
                     status=error.code,
                     code="claude_upstream_error",
                 ) from error
+
+
+def _shutdown_tracked_response(resource: Any) -> None:
+    """Interrupt a tracked response without closing a running generator."""
+    if isinstance(resource, types.GeneratorType):
+        return
+    sock = resource if isinstance(resource, socket.socket) else response_socket(resource)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+            return
+        except OSError:
+            pass
+    close = getattr(resource, "close", None)
+    if callable(close):
+        close()
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
@@ -3614,6 +4136,8 @@ class MuseShimServer(ThreadingHTTPServer):
         self.capture_session = None
         self._inflight: set[Any] = set()
         self._inflight_lock = threading.Lock()
+        self._closed_inflight_total = 0
+        self.inference_semaphore = threading.BoundedSemaphore(config.max_concurrent_requests)
         # Computed once, never per /health request (P1-15).
         self.source_fingerprint = source_fingerprint()
         if config.kiro_requested:
@@ -3649,16 +4173,26 @@ class MuseShimServer(ThreadingHTTPServer):
         with self._inflight_lock:
             self._inflight.discard(resource)
 
+    @property
+    def closed_inflight_total(self) -> int:
+        with self._inflight_lock:
+            return self._closed_inflight_total
+
     def close_inflight(self) -> int:
         """Close in-flight upstream responses and terminate tracked children."""
         with self._inflight_lock:
             resources, self._inflight = list(self._inflight), set()
-        for resource in resources:
+            self._closed_inflight_total += len(resources)
+        children = [resource for resource in resources if isinstance(resource, subprocess.Popen)]
+        responses = [resource for resource in resources if not isinstance(resource, subprocess.Popen)]
+        for resource in responses:
             try:
-                if isinstance(resource, subprocess.Popen):
-                    _stop_child(resource)
-                else:
-                    resource.close()
+                _shutdown_tracked_response(resource)
+            except Exception:
+                pass
+        if children:
+            try:
+                _stop_children(children)
             except Exception:
                 pass
         return len(resources)
@@ -3717,6 +4251,7 @@ _CLI_ONLY_SETTINGS = {
     "CODEX_TOKEN_URL": "--codex-token-url", "CLAUDE_TOKEN_URL": "--claude-token-url",
     "ALLOW_OAUTH_HOST_OVERRIDE": "--allow-oauth-host-override",
     "ALLOW_NON_LOOPBACK": "--allow-non-loopback",
+    "REQUIRE_INBOUND_TOKEN": "--require-inbound-token",
     "KIRO_AUTOSTART": "--kiro-autostart", "KIRO_SERVER_DIR": "--kiro-server-dir",
     "CAPTURE_DIR": "--capture-dir",
 }
@@ -3894,7 +4429,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-non-loopback",
         action="store_true",
         default=False,
-        help="allow binding beyond loopback (remote clients can reach this proxy)",
+        help="allow binding beyond loopback (requires --require-inbound-token)",
+    )
+    parser.add_argument(
+        "--require-inbound-token",
+        action="store_true",
+        default=False,
+        help="require MUSE_GATEWAY_INBOUND_TOKEN on inference POSTs (x-muse-gateway-token or Bearer)",
     )
     parser.add_argument(
         "--max-body-bytes",
@@ -3902,11 +4443,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_BODY_BYTES,
         help=f"maximum incoming JSON body size (default: {DEFAULT_MAX_BODY_BYTES})",
     )
-    parser.add_argument("--timeout", type=float, default=env_value("MUSE_GATEWAY_TIMEOUT", "600"),
+    parser.add_argument("--timeout", type=_timeout_seconds, default=env_value("MUSE_GATEWAY_TIMEOUT", "600"),
                         help="connect/headers budget in seconds (also the Claude CLI subprocess deadline)")
-    parser.add_argument("--stream-idle-timeout", type=float,
+    parser.add_argument("--stream-idle-timeout", type=_timeout_seconds,
                         default=env_value("MUSE_GATEWAY_STREAM_IDLE_TIMEOUT", "120"),
                         help="upstream stream idle budget in seconds after headers (default: 120)")
+    parser.add_argument("--turn-timeout", type=_timeout_seconds,
+                        default=env_value("MUSE_GATEWAY_TURN_TIMEOUT", "3600"),
+                        help="absolute streaming turn deadline in seconds (default: 3600)")
+    parser.add_argument("--max-concurrent-requests", type=_concurrency_limit,
+                        default=env_value("MUSE_GATEWAY_MAX_CONCURRENT_REQUESTS", "8"),
+                        help="maximum concurrent inference POSTs (default: 8)")
     parser.add_argument(
         "--capture-dir", default=None,
         help="opt-in private request/response captures (CLI-only; contains conversation content; "
@@ -3961,7 +4508,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--env-file",
         default=None,
-        help="config file for server, doctor, models or launch (default: beside module, else ./.env)",
+        help="config file for server, doctor, models or launch (default: beside muse_gateway.py only)",
     )
     parser.add_argument(
         "--log-file", default=env_value("MUSE_GATEWAY_LOG_FILE"),
@@ -4018,6 +4565,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ProviderError(
                 f"refusing non-loopback bind address {args.host!r}; use --allow-non-loopback when intentional.",
                 code="non_loopback_bind_rejected",
+            )
+        inbound_token = os.environ.get("MUSE_GATEWAY_INBOUND_TOKEN", "").strip()
+        if args.require_inbound_token and not inbound_token:
+            raise ProviderError(
+                "--require-inbound-token needs MUSE_GATEWAY_INBOUND_TOKEN set in the gateway process environment.",
+                code="inbound_token_missing",
+            )
+        if not _is_loopback_host(args.host) and not (args.require_inbound_token and inbound_token):
+            raise ProviderError(
+                f"refusing non-loopback bind address {args.host!r} without an inbound token; "
+                "set MUSE_GATEWAY_INBOUND_TOKEN and pass --require-inbound-token.",
+                code="non_loopback_token_required",
             )
         native_providers = ("codex", "claude") if provider == "auto" else (provider,)
         for native_provider in native_providers:
@@ -4105,6 +4664,9 @@ def _credential_status(config: Config, provider: str) -> tuple[bool, str]:
     except Exception:
         state = None
     if state is None:
+        symlinks = refused_symlink_credential_labels(config, provider)
+        if symlinks:
+            return False, f"symlinked credential refused at {symlinks[0]}; replace the symlink with the real file"
         if provider == "codex":
             return False, "no OAuth credentials found; run `codex login`"
         return False, "no OAuth login or API key found; run `claude login`"
@@ -4218,7 +4780,7 @@ def _existing_shim_is_compatible(
 ) -> bool:
     try:
         with urllib.request.urlopen(f"{base_url}/health", timeout=1.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = _read_bounded_json(response, limit=HEALTH_JSON_RESPONSE_LIMIT)
         compatible = (
             response.status == 200
             and isinstance(payload, dict)
@@ -4227,7 +4789,7 @@ def _existing_shim_is_compatible(
             and payload.get("provider") == provider
             and payload.get("claude_transport") == claude_transport
         )
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, ProviderError):
         return False
     if compatible:
         _warn_version_mismatch(base_url, payload)
@@ -4252,6 +4814,52 @@ class _LauncherSignal(BaseException):
         self.signum = signum
 
 
+def _signal_owned_child(process: subprocess.Popen[Any], *, kill: bool = False) -> None:
+    """Signal one gateway-owned child, never an unrelated process (P1-10)."""
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            group = os.getpgid(process.pid)
+        except OSError:
+            group = None
+        if group not in (None, 0, 1) and group == process.pid:
+            try:
+                os.killpg(group, signal.SIGKILL if kill else signal.SIGTERM)
+                return
+            except (OSError, ProcessLookupError):
+                pass  # Fall through to the direct handle below.
+    try:
+        if kill:
+            process.kill()
+        else:
+            process.terminate()
+    except OSError:
+        pass
+
+
+def _wait_for_children(processes: list[subprocess.Popen[Any]], timeout: float) -> list[subprocess.Popen[Any]]:
+    deadline = time.monotonic() + timeout
+    alive = []
+    for process in processes:
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            alive.append(process)
+    return alive
+
+
+def _stop_children(processes: Iterable[subprocess.Popen[Any]]) -> None:
+    """Signal every owned child first, then wait against shared deadlines."""
+    live = [process for process in processes if process.poll() is None]
+    for process in live:
+        _signal_owned_child(process)
+    live = _wait_for_children(live, 3.0)
+    for process in live:
+        _signal_owned_child(process, kill=True)
+    _wait_for_children(live, 2.0)
+
+
 def _stop_child(process: subprocess.Popen[Any]) -> None:
     """Stop a gateway-owned child, never an unrelated process (P1-10).
 
@@ -4261,34 +4869,7 @@ def _stop_child(process: subprocess.Popen[Any]) -> None:
     grandchildren cannot outlive the child. Anything else gets a direct
     terminate/kill. Every wait is bounded; proceed regardless.
     """
-    if process.poll() is not None:
-        return
-    if os.name != "nt":
-        try:
-            group = os.getpgid(process.pid)
-        except OSError:
-            group = None
-        if group not in (None, 0, 1) and group == process.pid:
-            for signal_number in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(group, signal_number)
-                except (OSError, ProcessLookupError):
-                    break
-                try:
-                    process.wait(timeout=3.0 if signal_number == signal.SIGTERM else 2.0)
-                except subprocess.TimeoutExpired:
-                    continue
-                return
-            return
-    process.terminate()
-    try:
-        process.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        try:
-            process.wait(timeout=2.0)  # P3-05: bounded; proceed regardless
-        except subprocess.TimeoutExpired:
-            pass
+    _stop_children([process])
 
 
 def _subcommand_index(argv: list[str], word: str) -> int | None:
@@ -4396,15 +4977,17 @@ def run_muse(config: Config, muse_args: list[str], *, output: Any = None) -> int
     except _LauncherSignal as received:
         return 128 + received.signum
     finally:
+        for signum in previous_signal_handlers:
+            signal.signal(signum, signal.SIG_IGN)
         if child is not None:
             _stop_child(child)
-        for signum, previous in previous_signal_handlers.items():
-            signal.signal(signum, previous)
         if server is not None:
             server.shutdown()
             server.server_close()
         if server_thread is not None:
             server_thread.join(timeout=2.0)
+        for signum, previous in previous_signal_handlers.items():
+            signal.signal(signum, previous)
 
 
 LAUNCH_USAGE = """\
@@ -4429,7 +5012,7 @@ ends option parsing and everything from there goes to `muse`.
   --kiro-server-dir DIR      Kiro Gateway checkout to autostart (~/kiro-gateway)
   --kiro-autostart            start the checkout when its loopback service is down
   --check-only               preflight + catalog check, then exit (no Muse)
-  --env-file PATH            config file (default: muse_gateway.py dir, else ./)
+  --env-file PATH            config file (default: beside muse_gateway.py only)
   --muse-bin PATH            Muse executable (default: auto-detect)
   --log-file PATH            rotating diagnostics (default: ./muse-gateway.log)
   -h                         this help; --help passes through to Muse
@@ -4441,7 +5024,7 @@ Advanced server options go before `launch`. Removed gateway flags are rejected.
 """
 
 _LAUNCH_FLAG_OPTIONS = {"--no-model-discovery", "--portable", "--verbose", "--insecure-upstream",
-                        "--allow-oauth-host-override", "--allow-non-loopback"}
+                        "--allow-oauth-host-override", "--allow-non-loopback", "--require-inbound-token"}
 _LAUNCH_VALUE_OPTIONS = {
     "--host": "host", "--timeout": "timeout", "--max-body-bytes": "max_body_bytes",
     "--capture-dir": "capture_dir", "--codex-auth-path": "codex_auth_path",
@@ -4450,7 +5033,8 @@ _LAUNCH_VALUE_OPTIONS = {
     "--claude-upstream": "claude_upstream", "--claude-token-url": "claude_token_url",
     "--claude-credentials": "claude_credentials", "--claude-cli": "claude_cli",
     "--claude-cli-passthrough": "claude_cli_passthrough",
-    "--stream-idle-timeout": "stream_idle_timeout",
+    "--stream-idle-timeout": "stream_idle_timeout", "--turn-timeout": "turn_timeout",
+    "--max-concurrent-requests": "max_concurrent_requests",
     "--claude-transport": "claude_transport", "--meta-upstream": "meta_upstream",
     "--meta-api-key": "meta_api_key",
     "--port": "port",
@@ -4560,6 +5144,10 @@ _FILE_ENV_NAMES: set[str] = set()  # names load_env_file set in this process
 _CHILD_ENV_DROP_PREFIXES = (
     "MUSE_GATEWAY_", "MUSE_SHIM_", "META_", "DEVIN_", "CODEX_",
     "OPENAI_", "ANTHROPIC_", "CLAUDE_", "KIRO_",
+    "AWS_", "AZURE_", "GCP_", "GOOGLE_CLOUD_",
+)
+_SECRET_ENV_NAME = re.compile(
+    r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS?)(?:$|_)"
 )
 
 # Claude CLI credential passthrough policy (--claude-cli-passthrough).
@@ -4583,20 +5171,15 @@ def _child_environment(*, keep: frozenset[str] = frozenset()) -> dict[str, str]:
     for name, value in os.environ.items():
         if name in keep:
             env[name] = value
-        elif name in _FILE_ENV_NAMES or name.startswith(_CHILD_ENV_DROP_PREFIXES):
+        elif (
+            name in _FILE_ENV_NAMES
+            or name.startswith(_CHILD_ENV_DROP_PREFIXES)
+            or _SECRET_ENV_NAME.search(name)
+        ):
             continue
         else:
             env[name] = value
     return env
-
-
-def _gateway_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("muse-gateway")
-    except Exception:
-        return MuseShimHandler.server_version.split("/")[1]
 
 
 def load_env_file(path: str) -> int:
@@ -4656,9 +5239,11 @@ def _default_env_file() -> str | None:
     """Locate the env file beside muse_gateway.py only.
 
     The working directory is the project under edit, i.e. untrusted input:
-    never adopt its .env implicitly. Operators opt in with --env-file."""
+    never adopt its .env implicitly. Operators opt in with --env-file. A
+    symlinked beside-module file is deliberately followed; the resolved
+    target is returned so startup reporting names the file actually read."""
     script_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    return script_env if os.path.isfile(script_env) else None
+    return os.path.realpath(script_env) if os.path.isfile(script_env) else None
 
 
 def _load_config_file(argv: list[str], *, explicit: str | None = None) -> tuple[str | None, int]:
@@ -4690,7 +5275,7 @@ def _wait_for_health(base_url: str, timeout: float = 15.0) -> dict[str, Any] | N
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(base_url + "/health", timeout=2) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                payload = _read_bounded_json(response, limit=HEALTH_JSON_RESPONSE_LIMIT)
             if isinstance(payload, dict) and payload.get("ok") is True:
                 return payload
         except Exception:
@@ -4976,21 +5561,22 @@ def launch_main(
     except _LauncherSignal as received:
         return 128 + received.signum
     finally:
+        for signum in previous_signal_handlers:
+            signal.signal(signum, signal.SIG_IGN)
         kiro_child = box.get("kiro_child")
         child = box.get("child")
         server = box.get("server")
         server_thread = box.get("server_thread")
-        if child is not None:
-            _stop_child(child)
-        if kiro_child is not None:
-            _stop_child(kiro_child)
-        for signum, previous in previous_signal_handlers.items():
-            signal.signal(signum, previous)
+        owned_children = [owned for owned in (child, kiro_child) if owned is not None]
+        if owned_children:
+            _stop_children(owned_children)
         if server is not None:
             server.shutdown()
             server.server_close()
         if server_thread is not None:
             server_thread.join(timeout=2.0)
+        for signum, previous in previous_signal_handlers.items():
+            signal.signal(signum, previous)
 
 
 def _launch_lifecycle(
@@ -5068,7 +5654,7 @@ def _launch_lifecycle(
             with urllib.request.urlopen(
                 base_url + "/muse-code/models", timeout=10
             ) as response:
-                catalog = json.loads(response.read().decode("utf-8"))
+                catalog = _read_bounded_json(response, limit=CATALOG_JSON_RESPONSE_LIMIT)
             ids = [item.get("id", "?") for item in catalog.get("data", [])]
         except Exception as error:
             print(f"error: catalog check failed: {error}", file=sys.stderr)
@@ -5148,11 +5734,13 @@ def main(argv: list[str] | None = None) -> int:
         if server is not None:
             threading.Thread(target=server.shutdown, daemon=True).start()
 
-    previous = None
+    previous_handlers: dict[int, Any] = {}
     if threading.current_thread() is threading.main_thread():
         # Install before binding so a ready port can never precede the
-        # SIGTERM handler.
-        previous = signal.signal(signal.SIGTERM, stop_on_signal)
+        # stop-signal handlers. SIGHUP does not exist on Windows.
+        for signum in (getattr(signal, "SIGHUP", None), signal.SIGTERM):
+            if signum is not None:
+                previous_handlers[signum] = signal.signal(signum, stop_on_signal)
     try:
         server = MuseShimServer((config.host, config.port), config)
     except OSError as error:
@@ -5171,8 +5759,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"muse-gateway: could not listen on {base_url}: {error.strerror or error}. "
                   "Stop the other process or use --port.", file=sys.stderr)
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
         return 1
     print(
         f"muse-gateway {config.provider} listening on http://{config.host}:{server.server_port} "
@@ -5187,10 +5775,11 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         stopping.append("SIGINT")
     finally:
-        closed = server.close_inflight()
+        server.close_inflight()
+        closed = server.closed_inflight_total
         server.server_close()
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
     if stopping:
         print(f"muse-gateway: stopped on {stopping[0]} (closed {closed} in-flight request(s)).",
               file=sys.stderr, flush=True)

@@ -9,11 +9,21 @@ _SOURCES = {"documented", "user-approved", "unverified-fallback", "bundled-seed"
 _SEED_FLAGS = {"reasoning", "supports_tools", "supports_images", "supports_parallel", "is_default"}
 
 
+def _bounded_label(value: Any) -> str:
+    text = "".join(
+        char if ord(char) >= 32 and not 127 <= ord(char) <= 159 else " "
+        for char in str(value or "")
+    )
+    if len(text) > 128:
+        text = text[:125] + "..."
+    return repr(text)
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate key {key!r}")
+            raise ValueError(f"duplicate key {_bounded_label(key)}")
         result[key] = value
     return result
 
@@ -35,21 +45,21 @@ def _parse_catalog(provider: str, text: str) -> dict[str, Any]:
             if provider == "devin":
                 record_keys |= {"label"} | _SEED_FLAGS
             if not isinstance(record, dict) or set(record) - record_keys:
-                raise ValueError(f"invalid model record {name!r}")
+                raise ValueError(f"invalid model record {_bounded_label(name)}")
             for field in ("context", "output"):
                 value = record.get(field)
                 if type(value) is not int or value <= 0:
-                    raise ValueError(f"{name!r}: {field} must be a positive integer")
+                    raise ValueError(f"{_bounded_label(name)}: {field} must be a positive integer")
             sources = record.get("sources")
             if (not isinstance(sources, dict) or set(sources) != {"context", "output"}
                     or any(not isinstance(source, str) or source not in _SOURCES
                            for source in sources.values())):
-                raise ValueError(f"{name!r}: invalid capacity provenance")
+                raise ValueError(f"{_bounded_label(name)}: invalid capacity provenance")
             for flag in _SEED_FLAGS & record.keys():
                 if type(record[flag]) is not bool:
-                    raise ValueError(f"{name!r}: {flag} must be boolean")
+                    raise ValueError(f"{_bounded_label(name)}: {flag} must be boolean")
             if "label" in record and (not isinstance(record["label"], str) or not record["label"].strip()):
-                raise ValueError(f"{name!r}: label must be nonempty text")
+                raise ValueError(f"{_bounded_label(name)}: label must be nonempty text")
         fallbacks = data.get("fallbacks")
         if (not isinstance(fallbacks, list)
                 or any(not isinstance(name, str) or name not in models for name in fallbacks)
@@ -58,7 +68,7 @@ def _parse_catalog(provider: str, text: str) -> dict[str, Any]:
         if provider == "devin":
             for name in fallbacks:
                 if not ({"label"} | _SEED_FLAGS) <= models[name].keys():
-                    raise ValueError(f"{name!r}: incomplete Devin fallback capabilities")
+                    raise ValueError(f"{_bounded_label(name)}: incomplete Devin fallback capabilities")
         efforts = data.get("reasoning_efforts", [])
         if (not isinstance(efforts, list)
                 or any(not isinstance(effort, str) or not effort for effort in efforts)

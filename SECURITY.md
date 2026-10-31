@@ -29,7 +29,11 @@ for the current interface and reporting process.
 muse-gateway is a local loopback proxy. It handles model requests and tool
 history, holds credentials in memory, and may refresh Codex/Claude credentials
 on disk. The default Claude transport also starts the official Claude Code
-CLI. It is not a multi-user server and has no client authentication.
+CLI. It is not a multi-user server. Loopback requests must use a loopback
+`Host`; inference POSTs with a browser `Origin` are rejected. Client token
+authentication is opt-in with `--require-inbound-token`; without it, other
+local processes that can reach the loopback port can spend configured provider
+credentials.
 
 Secret leakage, unsafe binds, credential file handling, cross-origin redirects,
 unsafe host overrides, and sensitive logging/capture are especially relevant.
@@ -42,8 +46,11 @@ vulnerabilities. Please do not send provider account-abuse reports here.
 ## Safe defaults (for users)
 
 - Keep the default loopback bind (`127.0.0.1`).
-- `--allow-non-loopback` is not access control. Supply your own authentication,
-  network restrictions, and transport protection if remote access is needed.
+- `--allow-non-loopback` requires `--require-inbound-token` with
+  `MUSE_GATEWAY_INBOUND_TOKEN` set in the gateway process environment. The
+  token is accepted as `x-muse-gateway-token` or a Bearer token on inference
+  POSTs; `/health` remains a liveness endpoint. Still add network restrictions
+  and transport protection if remote access is needed.
 - Do not use `--allow-oauth-host-override` unless you intend to trust the
   replacement host with credentials. Codex/Claude's native host allowlists do
   not cover arbitrary Meta, Devin, local, or generic endpoints.

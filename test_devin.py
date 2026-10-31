@@ -487,9 +487,13 @@ class DevinRequestPolicyTests(unittest.TestCase):
         return build_chat_request("", {"input": "hi", **body}, model, model.uid, "k", "jwt",
                                   "cascade", [], build_tools([self.TOOL], False))
 
-    def test_none_serial_named_and_stop_sequences_reach_the_wire(self):
+    def test_none_serial_named_required_and_stop_sequences_reach_the_wire(self):
         default = self._request()
         self.assertEqual((default.tool_choice.option_name, len(default.tools)), ("auto", 1))
+        # M12 live capture: option_name "required" forced a call on swe-1-6.
+        required = self._request(tool_choice="required")
+        self.assertEqual(required.tool_choice.WhichOneof("choice"), "option_name")
+        self.assertEqual(required.tool_choice.option_name, "required")
         self.assertFalse(default.disable_parallel_tool_calls)
         self.assertEqual(len(self._request(tool_choice="none").tools), 0)
         self.assertTrue(self._request(parallel_tool_calls=False).disable_parallel_tool_calls)
@@ -498,12 +502,22 @@ class DevinRequestPolicyTests(unittest.TestCase):
         self.assertEqual(named.tool_choice.tool_name, "read_file")
         self.assertEqual(list(self._request(stop_sequences=["END"]).configuration.stop_patterns), ["END"])
 
+    def test_required_without_tools_is_rejected_before_inference(self):
+        with patch(
+            "muse_devin.fetch_auth", side_effect=AssertionError("policy check reached upstream")
+        ):
+            with self.assertRaises(DevinChatError) as caught:
+                list(run_turn_events({"input": "hi", "tool_choice": "required"}, [], devin_model(), "k"))
+        self.assertEqual(caught.exception.code, "devin_unsupported_tool_choice")
+
     def test_unrepresentable_controls_are_rejected_before_inference(self):
         cases = (
-            ({"tool_choice": "required"}, "devin_unsupported_tool_choice"),
             ({"tool_choice": {"type": "function", "name": "missing"}}, "devin_unsupported_tool_choice"),
             ({"tool_choice": {"type": "web_search"}}, "devin_unsupported_tool_choice"),
             ({"parallel_tool_calls": "no"}, "devin_invalid_request"),
+            ({"stop": 7}, "devin_invalid_request"),
+            ({"stop": ["END", 7]}, "devin_invalid_request"),
+            ({"stop": ""}, "devin_invalid_request"),
             ({"max_output_tokens": 0}, "invalid_output_limit"),
             ({"max_output_tokens": -5}, "invalid_output_limit"),
         )
@@ -532,13 +546,71 @@ class DevinHistoryReferenceTests(unittest.TestCase):
                                  [], devin_model(), "k"))
         self.assertEqual(caught.exception.code, "devin_unresolved_reference")
 
+    def test_base64_images_reach_devin_proto_and_url_images_are_rejected(self):
+        from muse_devin import build_history_prompts, history_to_prompts
+
+        _, staged, _ = history_to_prompts({"input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "look"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,AAEC"},
+            ],
+        }]}, "cascade")
+        protos = build_history_prompts(staged, "cascade")
+        self.assertEqual(protos[0].prompt, "look")
+        self.assertEqual(len(protos[0].images), 1)
+        self.assertEqual(protos[0].images[0].base64_data, "AAEC")
+        self.assertEqual(protos[0].images[0].mime_type, "image/jpeg")
+        with self.assertRaises(DevinChatError):
+            history_to_prompts({"input": [{
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": "https://example.com/image.png"}],
+            }]}, "cascade")
+
+    def test_colliding_wire_ids_are_allocated_distinctly_in_history(self):
+        from muse_devin import history_to_prompts, normalize_tool_call_id
+
+        seen = set()
+        self.assertEqual(normalize_tool_call_id("call:x", seen), "call_x")
+        self.assertEqual(normalize_tool_call_id("call_x", seen), "call_x-2")
+        _, staged, call_ids = history_to_prompts({"input": [
+            {"type": "function_call", "call_id": "call:x", "name": "echo", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_x", "name": "echo", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call:x", "output": "first"},
+            {"type": "function_call_output", "call_id": "call_x", "output": "second"},
+        ]}, "c")
+        calls = staged[0]["tool_calls"]
+        self.assertEqual([call["id"] for call in calls], ["call_x", "call_x-2"])
+        self.assertEqual([prompt["tool_call_id"] for prompt in staged[1:]], ["call_x", "call_x-2"])
+        self.assertEqual(call_ids, {"call:x": "call_x", "call_x": "call_x-2"})
+
 
 class DevinStreamTests(unittest.TestCase):
-    def _run_stream(self, stream, body=None):
+    def _run_stream(self, stream, body=None, track=None, register_secret=None):
         with patch("muse_devin.fetch_auth", return_value=("k", "jwt", "https://x")), patch(
             "muse_devin.open_chat_stream", return_value=stream
         ):
-            return list(run_turn_events(body or {"input": "hi"}, [], devin_model(), "k"))
+            return list(run_turn_events(
+                body or {"input": "hi"}, [], devin_model(), "k",
+                track=track, register_secret=register_secret,
+            ))
+
+    def test_open_response_is_tracked_for_shutdown(self):
+        from muse_devin_wire import CONNECT_END_STREAM_FLAG, frame_message
+
+        message = devin_pb2.GetChatMessageResponse(
+            message_id="r-track", delta_text="Hi", stop_reason=2)
+        frames = (
+            frame_message(message.SerializeToString())
+            + frame_message(b"{}", CONNECT_END_STREAM_FLAG)
+        )
+        stream = UnclosableBytesIO(frames)
+        tracked = []
+        registered = []
+        events = self._run_stream(stream, track=tracked.append, register_secret=registered.append)
+        self.assertEqual(tracked, [stream])
+        self.assertEqual(registered, ["k", "jwt"])
+        self.assertEqual(events[-1][0], "response.completed")
 
     def _text_tool_sequence(self):
         state = DevinStreamState("devin/swe-1-6")
@@ -561,6 +633,22 @@ class DevinStreamTests(unittest.TestCase):
             state.feed(first) + state.feed(second) + state.feed(third) + state.finish()
         )
         return events
+
+    def test_fail_is_idempotent_and_preserves_started_events_after_feed_error(self):
+        state = DevinStreamState("devin/swe-1-6")
+        message = devin_pb2.GetChatMessageResponse(message_id="r-fail")
+        call = message.delta_tool_calls.add()
+        call.id, call.name = "c1", "t"
+        call.arguments_json = "x" * (8 * 1024 * 1024 + 1)
+        with self.assertRaises(DevinChatError):
+            state.feed(message)
+        events = state.fail("boom", "upstream_error")
+        self.assertEqual(
+            [kind for kind, _ in events],
+            ["response.created", "response.in_progress", "response.failed"],
+        )
+        self.assertEqual([payload["sequence_number"] for _, payload in events], [0, 1, 2])
+        self.assertEqual(state.fail("again", "upstream_error"), [])
 
     def test_text_and_tool_sequence(self):
         events = self._text_tool_sequence()
@@ -589,6 +677,26 @@ class DevinStreamTests(unittest.TestCase):
         deltas = "".join(payload["delta"] for kind, payload in events
                          if kind == "response.function_call_arguments.delta")
         self.assertEqual(deltas, calls[0]["arguments"])
+
+    def test_empty_tool_arguments_and_min_log_prob_complete(self):
+        # M12 live capture: a forced no-arg call arrives with
+        # arguments_json="" and stop 10; claude-haiku-5-5 ends normal
+        # short text turns with stop 4 (MIN_LOG_PROB).
+        state = DevinStreamState("devin/swe-1-6")
+        message = devin_pb2.GetChatMessageResponse(message_id="r-empty", stop_reason=10)
+        call = message.delta_tool_calls.add()
+        call.id, call.name, call.arguments_json = "c1", "record_color", ""
+        events = state.feed(message) + state.finish()
+        self.assertEqual(events[-1][0], "response.completed")
+        final_call = events[-1][1]["response"]["output"][0]
+        self.assertEqual(final_call["arguments"], "{}")
+
+        state = DevinStreamState("devin/claude-haiku-5-5")
+        message = devin_pb2.GetChatMessageResponse(
+            message_id="r-haiku", delta_text="LIVE_OK", stop_reason=4)
+        events = state.feed(message) + state.finish()
+        self.assertEqual(events[-1][0], "response.completed")
+        self.assertEqual(events[-1][1]["response"]["status"], "completed")
 
     def test_nested_prefix_fragments_survive_every_chunk_boundary(self):
         # P1-04 (inverts R07): a delta that happens to share the received
@@ -633,6 +741,27 @@ class DevinStreamTests(unittest.TestCase):
         self.assertEqual(kinds[-1], "response.failed")
         self.assertNotIn("response.completed", kinds)
         self.assertIn("safety size limit", events[-1][1]["response"]["error"]["message"])
+
+    def test_text_thinking_and_final_response_caps_are_byte_based(self):
+        import muse_devin
+
+        with patch.object(muse_devin, "_STREAM_BLOCK_LIMIT", 4):
+            state = DevinStreamState("devin/swe-1-6")
+            with self.assertRaises(DevinChatError):
+                state.feed(devin_pb2.GetChatMessageResponse(
+                    message_id="r-text-cap", delta_text="12345"))
+            state = DevinStreamState("devin/swe-1-6")
+            with self.assertRaises(DevinChatError):
+                state.feed(devin_pb2.GetChatMessageResponse(
+                    message_id="r-think-cap", delta_thinking="12345"))
+        with patch.object(muse_devin, "_STREAM_RESPONSE_LIMIT", 64):
+            final = muse_devin._enforce_final_response_size({
+                "id": "resp_big", "object": "response", "status": "completed",
+                "model": "devin/swe-1-6", "output": [{"type": "message", "text": "x" * 100}],
+            })
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["error"]["code"], "upstream_response_too_large")
+        self.assertLessEqual(len(json.dumps(final).encode()), 512)
 
     def test_tool_before_text_keeps_output_index_order(self):
         # P2-04: a deferred tool released after streaming text never makes
@@ -712,20 +841,29 @@ class DevinStreamTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "devin_context_overflow")
 
     def test_turn_error_trailer_with_details_yields_failed(self):
-        from muse_devin_wire import CONNECT_END_STREAM_FLAG, frame_message
+        from muse_devin_wire import CONNECT_END_STREAM_FLAG, frame_message, parse_trailer_error
 
-        trailer = (
-            '{"error":{"code":"unavailable","message":"overloaded",'
-            '"details":[{"type":"retryInfo","value":"later"}]}}'
-        )
+        trailer = json.dumps({"error": {
+            "code": "unavailable" + "x" * 5000,
+            "message": "overloaded " + "m" * 5000,
+            "details": [{"type": "retryInfo", "value": "later " + "d" * 5000}],
+        }})
+        parsed = parse_trailer_error(trailer)
+        self.assertLessEqual(len(parsed.code), 128)
+        self.assertLessEqual(len(parsed.message.encode()), 512)
+        self.assertLessEqual(len(parsed.formatted.encode()), 512)
+        self.assertLessEqual(len(parsed.raw), 2001)
         stream = frame_message(trailer.encode(), CONNECT_END_STREAM_FLAG)
         events = self._run_stream(UnclosableBytesIO(stream))
         kinds = [event for event, _ in events]
         self.assertEqual(kinds[:2], ["response.created", "response.in_progress"])
         self.assertEqual(kinds[2], "response.failed")
         self.assertEqual(kinds[-1], "response.failed")
-        self.assertIn("overloaded", events[2][1]["response"]["error"]["message"])
-        self.assertIn("retryInfo: later", events[2][1]["response"]["error"]["message"])
+        message = events[2][1]["response"]["error"]["message"]
+        self.assertIn("overloaded", message)
+        self.assertLessEqual(len(message.encode()), 512)
+        self.assertNotIn("m" * 1000, message)
+        self.assertNotIn("d" * 1000, message)
 
 
 class DevinGatewayTests(unittest.TestCase):

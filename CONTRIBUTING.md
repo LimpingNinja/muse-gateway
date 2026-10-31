@@ -130,6 +130,13 @@ Protocol references: [Connect](https://connectrpc.com/docs/protocol/),
 - `tests/`: public HTTP contracts, protocol peers, selected fault challenges,
   and the explicit installed-Muse acceptance command.
 - `test_capture.py`: private diagnostic capture and related security checks.
+- `test_errata.py`: checks for the shipped Kiro Gateway errata (static
+  fallback models valid and in the packaged Kiro catalog; the discovery patch
+  touches only the expected files; license file present).
+- `test_model_catalogs.py`: packaged provider catalogs and their loader
+  (validation errors, limit resolution, Devin fallbacks), catalog snapshot
+  coherence/single-flight refresh, no-cache refresh throttling, and model
+  prefix/presentation handling.
 
 The `muse_shim` module alias, the `muse-shim` command alias, and legacy
 protocol identifiers are compatibility interfaces. `MUSE_SHIM_*` settings are

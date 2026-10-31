@@ -122,10 +122,13 @@ MAX_CONNECT_FRAME_PAYLOAD = 16 * 1024 * 1024
 LARGE_HISTORY_RECOVERY_BYTES = 512 * 1024
 # Bounds on retained error evidence.
 MAX_TRAILER_EVIDENCE_CHARS = 2000
-MAX_ERROR_DETAIL_CHARS = 4096
+MAX_ERROR_DETAIL_CHARS = 512
 # ADDITIVE: cap gunzip expansion (OMP gunzipSync is unbounded). Far above any
 # legitimate unary body; trips only on corrupt/zip-bomb input.
 MAX_UNARY_DECOMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_UNARY_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_CHAT_STREAM_BYTES = 64 * 1024 * 1024
+MAX_HTTP_ERROR_BODY_BYTES = 64 * 1024
 
 CONNECT_UA = "connect-go/1.18.1 (go1.26.3)"
 
@@ -316,6 +319,14 @@ def truncate_trailer_evidence(text):
     return text
 
 
+def _bounded_trailer_text(value, limit):
+    text = "".join(
+        char if ord(char) >= 32 and not 127 <= ord(char) <= 159 else " "
+        for char in str(value or "")
+    )
+    return text[:limit - 3] + "..." if len(text) > limit else text
+
+
 def summarize_trailer_details(details):
     """Summarize loosely-shaped ``{type, value, debug}`` detail entries."""
     if not isinstance(details, list) or not details:
@@ -374,9 +385,9 @@ def parse_trailer_error(text):
     if not isinstance(error, dict):
         raise DevinFrameError("Devin end-stream trailer error field must be an object")
     code = error.get("code")
-    code = code if isinstance(code, str) else ""
+    code = _bounded_trailer_text(code if isinstance(code, str) else "", 128)
     message = error.get("message")
-    message = message if isinstance(message, str) else ""
+    message = _bounded_trailer_text(message if isinstance(message, str) else "", MAX_ERROR_DETAIL_CHARS)
     if not code and not message:
         raise DevinFrameError("Devin end-stream trailer error object has no code or message")
     formatted = f"Devin stream error{f' {code}' if code else ''}: {message}"
@@ -384,7 +395,9 @@ def parse_trailer_error(text):
     if "details" in error:
         detail = summarize_trailer_details(error["details"])
         if detail:
+            detail = _bounded_trailer_text(detail, MAX_ERROR_DETAIL_CHARS)
             formatted += f" [details: {detail}]"
+    formatted = _bounded_trailer_text(formatted, MAX_ERROR_DETAIL_CHARS)
     return DevinTrailerError(code, message, formatted, detail, truncate_trailer_evidence(text))
 
 
@@ -458,6 +471,13 @@ def normalize_base_url(base_url):
     return cleaned
 
 
+def _read_bounded_body(response, limit):
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise DevinWireError("Devin response body exceeded the safety size limit")
+    return body
+
+
 def _post(url, body, headers, timeout):
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     capture = current_capture()
@@ -467,7 +487,7 @@ def _post(url, body, headers, timeout):
         response = build_gateway_opener(url).open(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         try:
-            payload = error.read()
+            payload = error.read(MAX_HTTP_ERROR_BODY_BYTES + 1)[:MAX_HTTP_ERROR_BODY_BYTES]
         finally:
             # The chained exception can outlive this request; do not leave
             # its HTTP response/socket open until garbage collection.
@@ -515,7 +535,9 @@ def unary_rpc(base_url, path, request_bytes, timeout=30.0):
         status = response.getcode()
         content_type = response.headers.get("Content-Type", "")
         try:
-            body = response.read()
+            body = _read_bounded_body(response, MAX_UNARY_RESPONSE_BYTES)
+        except DevinWireError as error:
+            raise DevinHttpError("request", status, "response body too large") from error
         except (OSError, http.client.HTTPException) as error:
             raise DevinHttpError("request", status, "response body truncated") from error
         if capture is not None and label is not None:
@@ -552,7 +574,7 @@ def open_chat_stream(base_url, request_bytes, timeout=60.0):
     status = response.getcode()
     if not 200 <= status < 300:
         try:
-            body = response.read()
+            body = response.read(MAX_HTTP_ERROR_BODY_BYTES + 1)[:MAX_HTTP_ERROR_BODY_BYTES]
             content_type = response.headers.get("Content-Type", "")
         finally:
             response.close()
@@ -566,6 +588,7 @@ def open_chat_stream(base_url, request_bytes, timeout=60.0):
 def iter_chat_frames(response, chunk_bytes=65536):
     """Yield ``(flags, payload)`` frames from an open chat response."""
     decoder = ConnectFrameDecoder()
+    total_bytes = 0
     while True:
         capture = current_capture()
         if capture is not None:
@@ -580,6 +603,9 @@ def iter_chat_frames(response, chunk_bytes=65536):
             if decoder.pending_bytes:
                 raise DevinFrameError("Devin stream ended inside a Connect frame")
             break
+        total_bytes += len(chunk)
+        if total_bytes > MAX_CHAT_STREAM_BYTES:
+            raise DevinFrameError("Devin stream exceeded the safety size limit")
         items = decoder.decode(chunk)
         for item in items:
             if capture is not None:

@@ -31,6 +31,10 @@
   -KiroServerDir and -KiroAutostart map to the corresponding --kiro-*
   launcher options. Prefer a private env file for the proxy key.
 
+  -DevinUpstream and -DevinApiKey map to --devin-upstream and
+  --devin-api-key. -Models prints the model catalog (--models) instead of
+  launching; -ModelsProvider (--models-provider) limits it to one provider.
+
 .EXAMPLE
   .\muse-gateway.ps1
   Starts the gateway on :8787 and opens interactive Muse.

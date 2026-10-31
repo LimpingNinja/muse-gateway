@@ -53,7 +53,10 @@ class GatewayContracts(unittest.TestCase):
         mime, wire = post(base, {"model": "devin/swe-1-6", "input": "hello", "stream": True})
         self.assertEqual(mime, "text/event-stream")
         streamed = consume(wire)
-        mime, raw = post(base, {"model": "devin/swe-1-6", "input": "hello", "stream": False})
+        try:
+            mime, raw = post(base, {"model": "devin/swe-1-6", "input": "hello", "stream": False})
+        except urllib.error.HTTPError as error:
+            self.fail(f"TERMINAL: nonstream Devin turn returned HTTP {error.code} instead of a terminal response")
         self.assertEqual(mime, "application/json")
         final = json.loads(raw)
         self.assertEqual(streamed, final)
@@ -255,7 +258,7 @@ class GatewayContracts(unittest.TestCase):
         base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
         history = [{"type": "message", "role": "user", "content": "Remember the sentinel"}]
         _, wire = post(base, {"model": "meta/muse-spark-1.3", "input": history, "stream": True})
-        self.assertEqual(wire, meta)
+        self.assertEqual(consume(wire), consume(meta))
         history += consume(wire)["output"] + [{"role": "user", "content": "Echo OK"}]
         _, wire = post(base, {"model": "devin/swe-1-6", "input": history, "stream": True})
         tool = consume(wire)["output"][0]
@@ -269,7 +272,7 @@ class GatewayContracts(unittest.TestCase):
                     "prompt_cache_key": "cache-sentinel", "max_output_tokens": 1234,
                     "previous_response_id": "resp_foreign"}
         _, wire = post(base, {"model": "codex/gpt-5.4", "input": history, "stream": True, **controls})
-        self.assertEqual(wire, codex)
+        self.assertEqual(consume(wire), consume(codex))
         self.assertEqual(consume(wire)["status"], "completed")
         self.assertEqual(len(peer.requests), 4, "CODEX_RECOVERY: expected exactly one retry")
         first, recovered = peer.requests[-2:]
@@ -413,7 +416,7 @@ class GatewayContracts(unittest.TestCase):
             "filter-11": (chat("partial", stop=11) + TRAILER, "failed"),
             "error-13": (chat("partial", stop=13) + TRAILER, "failed"),
             "noninsertion-12": (chat("partial", stop=12) + TRAILER, "incomplete"),
-            "minlogprob-4": (chat("partial", stop=4) + TRAILER, "incomplete"),
+            "minlogprob-4": (chat("partial", stop=4) + TRAILER, "completed"),
             "unknown-99": (chat("partial", stop=99) + TRAILER, "failed"),
             "bad-trailer-json": (chat("partial", stop=2) + envelope(b"{not-json", 2), "failed"),
             "bad-trailer-shape": (chat("partial", stop=2) + envelope(b'{"error":42}', 2), "failed"),
@@ -434,17 +437,9 @@ class GatewayContracts(unittest.TestCase):
         peer = Peer([truncated])
         base = self.start(peer)
         _, wire = post(base, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": True})
-        self.assertIn(b"response.failed", wire)
-        self.assertIn(b"upstream_truncated", wire)
-        events = []
-        for line in wire.decode().splitlines():
-            if line.startswith("data: "):
-                try:
-                    events.append(json.loads(line[6:]))
-                except ValueError:
-                    pass  # the truncated first frame is intentional
-        self.assertEqual(events[-1]["type"], "response.failed")
-        self.assertIsInstance(events[-1]["sequence_number"], int)
+        terminal = consume(wire)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error"]["code"], "upstream_truncated")
         logs = (Path(self.directory) / "gateway.log").read_text()
         self.assertIn("upstream_stream_truncated", logs)
         self.assertIn('"stream_failed": true', logs)
@@ -527,6 +522,70 @@ class GatewayContracts(unittest.TestCase):
                     drops = log.read_text().count("previous_response_id_dropped") - logged
                     self.assertEqual(drops, 1 if outcome == "drop" else 0)
 
+    def test_route_by_control_matrix(self):
+        import argparse
+        import muse_kiro
+        from muse_devin import DevinModel, build_chat_request, build_tools
+        from muse_gateway import Config, run_claude_cli
+        from muse_providers import ProviderError, responses_to_anthropic
+
+        tool = {"type": "function", "name": "echo", "parameters": {"type": "object", "properties": {}}}
+        controls = {
+            "tool_choice": {"type": "function", "name": "echo"},
+            "parallel_tool_calls": False,
+            "stop": ["END"],
+        }
+        body = {"model": "fixture", "input": "hi", "tools": [tool], **controls}
+
+        # Claude HTTP: Anthropic payload carries all three controls.
+        claude_payload, _ = responses_to_anthropic(body)
+        self.assertEqual(claude_payload["tool_choice"], {
+            "type": "tool", "name": "echo", "disable_parallel_tool_use": True})
+        self.assertEqual(claude_payload["stop_sequences"], ["END"])
+
+        # Claude CLI: choice/parallel use the same Anthropic payload policy;
+        # stop is explicitly unsupported and rejected before spawn.
+        cli_payload, _ = responses_to_anthropic({
+            key: value for key, value in body.items() if key != "stop"})
+        self.assertEqual(cli_payload["tool_choice"], claude_payload["tool_choice"])
+        with patch("muse_gateway.subprocess.Popen", side_effect=AssertionError("child spawned")):
+            with self.assertRaises(ProviderError) as caught:
+                run_claude_cli(body, Config(argparse.Namespace(provider="claude", model_discovery=False)))
+        self.assertEqual(caught.exception.code, "claude_cli_stop_unsupported")
+
+        # Devin: protobuf request carries all three controls.
+        model = DevinModel(
+            uid="fixture", logical_id="fixture", label="Fixture",
+            context_limit=1000, output_limit=1000, supports_parallel=True)
+        devin_request = build_chat_request(
+            "", body, model, model.uid, "k", "jwt", "cascade", [],
+            build_tools([tool], False))
+        self.assertEqual(devin_request.tool_choice.tool_name, "echo")
+        self.assertTrue(devin_request.disable_parallel_tool_calls)
+        self.assertEqual(list(devin_request.configuration.stop_patterns), ["END"])
+
+        # Kiro: each unrepresentable control is rejected by name.
+        for option, code in (
+            ({"tool_choice": controls["tool_choice"]}, "kiro_unsupported_tool_choice"),
+            ({"parallel_tool_calls": False}, "kiro_unsupported_option"),
+            ({"stop": ["END"]}, "kiro_unsupported_option"),
+        ):
+            with self.subTest(route="kiro", option=option):
+                with self.assertRaises(ProviderError) as caught:
+                    muse_kiro.prepare_request({"model": "haiku", "input": "hi", "tools": [tool], **option})
+                self.assertEqual(caught.exception.code, code)
+
+        # Codex passthrough: the upstream request preserves all three.
+        peer = Peer([responses_text("ok")])
+        base = self.start(peer, access_token="fixture-codex-token", allow_oauth_host_override=True)
+        _, wire = post(base, {"model": "codex/gpt-5.4", "input": "hi", "tools": [tool],
+                              "stream": True, **controls})
+        self.assertEqual(consume(wire)["status"], "completed")
+        sent = peer.requests[-1]
+        self.assertEqual(sent["tool_choice"], controls["tool_choice"])
+        self.assertIs(sent["parallel_tool_calls"], False)
+        self.assertEqual(sent["stop"], ["END"])
+
     def test_split_timeouts_idle_connect_and_inbound_body(self):
         # P1-09: idle budget after headers -> numbered response.failed;
         # slow headers -> 502 before any byte; stalled body -> 408.
@@ -564,7 +623,7 @@ class GatewayContracts(unittest.TestCase):
         host, port = slow.rsplit(":", 1)
         client = socket_module.create_connection((host.split("//")[1], int(port)), timeout=10)
         self.addCleanup(client.close)
-        client.sendall(b"POST /responses HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        client.sendall(b"POST /responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                        b"Content-Length: 100\r\n\r\n{\"model\":")
         started = __import__("time").monotonic()
         reply = b""
@@ -614,7 +673,7 @@ class GatewayContracts(unittest.TestCase):
         host, port = base.split("//")[1].split(":")
         body = json.dumps({"model": "meta/muse-spark-1.3", "input": "hi", "stream": True}).encode()
         client = socket_module.create_connection((host, int(port)), timeout=5)
-        client.sendall(b"POST /responses HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        client.sendall(b"POST /responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
         self.assertIn(b"200", client.recv(4096))
         closed_at = time_module.monotonic()
@@ -643,6 +702,130 @@ class GatewayContracts(unittest.TestCase):
             server.server_close()
             worker.join(timeout=5)
             self.assertTrue(resource.closed)
+
+    def test_inference_admission_is_bounded_and_turn_deadline_fails_stream(self):
+        import threading
+        import time as time_module
+
+        held = responses_text("held")
+        peer = Peer([held], hold_after=len(held) // 2)
+        base = self.start(peer, max_concurrent_requests=1, stream_idle_timeout=10, timeout=4)
+        result = {}
+
+        def first_request():
+            try:
+                result["wire"] = post(base, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": True})[1]
+            except Exception as error:  # reported by the assertions below
+                result["error"] = error
+
+        worker = threading.Thread(target=first_request, daemon=True)
+        worker.start()
+        deadline = time_module.monotonic() + 5
+        while not peer.requests and time_module.monotonic() < deadline:
+            time_module.sleep(0.02)
+        self.assertEqual(len(peer.requests), 1)
+        status, headers, payload = self._post_error(
+            base, {"model": "meta/muse-spark-1.3", "input": "second", "stream": True})
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("Retry-After"), "1")
+        self.assertEqual(payload["error"]["type"], "gateway_busy")
+        peer.release.set()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("error", result)
+        self.assertEqual(consume(result["wire"])["status"], "completed")
+
+        held = responses_text("deadline")
+        peer = Peer([held], hold_after=len(held) // 2)
+        base = self.start(peer, stream_idle_timeout=10, timeout=4, turn_timeout=0.5)
+        started = time_module.monotonic()
+        _, wire = post(base, {"model": "meta/muse-spark-1.3", "input": "hi", "stream": True})
+        elapsed = time_module.monotonic() - started
+        peer.release.set()
+        self.assertLess(elapsed, 3)
+        self.assertIn(b"response.failed", wire)
+        self.assertIn(b"turn_timeout", wire)
+
+    def test_inbound_host_origin_and_token_checks_spend_no_turn(self):
+        import socket as socket_module
+
+        body = {"model": "meta/muse-spark-1.3", "input": "hi", "stream": True}
+        peer = Peer([responses_text("allowed")])
+        base = self.start(peer)
+        origin_request = request(base, body)
+        origin_request.add_header("Origin", "https://evil.example")
+        status, _headers, payload = self._post_error(base, body, request_obj=origin_request)
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["type"], "browser_origin_rejected")
+        self.assertEqual(peer.requests, [])
+
+        host, port = base.rsplit(":", 1)
+        raw_body = json.dumps(body).encode()
+        with socket_module.create_connection((host.split("//")[1], int(port)), timeout=5) as client:
+            client.sendall(
+                b"POST /responses HTTP/1.1\r\nHost: evil.example\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(raw_body)}\r\n\r\n".encode() + raw_body
+            )
+            reply = client.recv(4096)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 403"), reply[:64])
+        self.assertEqual(peer.requests, [])
+
+        peer = Peer([responses_text("token-ok")])
+        base = self.start(
+            peer, require_inbound_token=True, inbound_token="fixture-inbound-token")
+        with urllib.request.urlopen(base + "/health", timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        status, _headers, payload = self._post_error(base, body)
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["type"], "inbound_token_required")
+        wrong = request(base, body)
+        wrong.add_header("x-muse-gateway-token", "wrong-token")
+        status, _headers, _payload = self._post_error(base, body, request_obj=wrong)
+        self.assertEqual(status, 401)
+        self.assertEqual(peer.requests, [])
+        allowed = request(base, body)
+        allowed.add_header("x-muse-gateway-token", "fixture-inbound-token")
+        with urllib.request.urlopen(allowed, timeout=5) as response:
+            self.assertEqual(consume(response.read())["status"], "completed")
+        self.assertEqual(len(peer.requests), 1)
+
+    def test_slow_drip_body_uses_absolute_deadline(self):
+        import socket as socket_module
+        import threading
+        import time as time_module
+
+        base = self.start(Peer([]), timeout=1)
+        self.stack.enter_context(patch("muse_gateway.MuseShimHandler.body_timeout_floor", 0.5))
+        host, port = base.rsplit(":", 1)
+        client = socket_module.create_connection((host.split("//")[1], int(port)), timeout=10)
+        self.addCleanup(client.close)
+        client.sendall(b"POST /responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                       b"Content-Length: 100\r\n\r\n{")
+        stop = threading.Event()
+
+        def drip():
+            while not stop.wait(0.15):
+                try:
+                    client.sendall(b"x")
+                except OSError:
+                    return
+
+        worker = threading.Thread(target=drip, daemon=True)
+        worker.start()
+        started = time_module.monotonic()
+        reply = b""
+        try:
+            while b"\r\n\r\n" not in reply:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+        finally:
+            stop.set()
+            worker.join(timeout=2)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 408"), reply[:64])
+        self.assertLess(time_module.monotonic() - started, 2.5)
 
     def test_get_failures_answer_and_failed_nonstream_devin_is_marked(self):
         # P2-13: discovery raising mid-GET is a JSON 500, not a dropped socket;
@@ -730,8 +913,9 @@ class GatewayContracts(unittest.TestCase):
         from muse_gateway import _read_bounded_upstream_body, _write_upstream_body
         from muse_providers import ProviderError
 
-        # (a) A well-formed terminal split at arbitrary chunk boundaries is
-        # observed whole: no synthesized second terminal.
+        # (a) Parsed relay: split frames are buffered, terminals are
+        # de-duplicated, missing sequence numbers are replaced locally, and
+        # a missing lifecycle opening is synthesized.
         wire = responses_text("split-ok")
 
         class Dribble:
@@ -755,11 +939,41 @@ class GatewayContracts(unittest.TestCase):
             def _log_event(self, event, **fields):
                 self.events.append((event, fields))
 
-        handler = FakeHandler()
-        _write_upstream_body(handler, Dribble(wire), stream=True,
-                             content_type="text/event-stream")
-        self.assertEqual(handler.wfile.getvalue(), wire)
+        def relay(data):
+            handler = FakeHandler()
+            _write_upstream_body(handler, Dribble(data), stream=True,
+                                 content_type="text/event-stream")
+            return handler, handler.wfile.getvalue()
+
+        handler, relayed = relay(wire)
+        self.assertEqual(consume(relayed)["status"], "completed")
         self.assertFalse(handler._stream_failed)
+
+        frames = wire.split(b"\n\n")
+        without_opening = b"\n\n".join(frames[2:])
+        handler, relayed = relay(without_opening)
+        self.assertEqual(consume(relayed)["status"], "completed")
+
+        import re as re_module
+        unnumbered = re_module.sub(rb',\s*"sequence_number":\s*\d+', b"", wire)
+        handler, relayed = relay(unnumbered)
+        self.assertEqual(consume(relayed)["status"], "completed")
+        self.assertIn("upstream_missing_sequence_number", [event for event, _ in handler.events])
+
+        duplicated_terminal = wire + wire.split(b"\n\n")[-2] + b"\n\n"
+        handler, relayed = relay(duplicated_terminal)
+        self.assertEqual(consume(relayed)["status"], "completed")
+        self.assertEqual(relayed.count(b"event: response.completed"), 1)
+
+        handler, relayed = relay(responses_text("x" * 70000))
+        self.assertEqual(consume(relayed)["status"], "completed")
+
+        malformed_tail = b"\n\n".join(frames[:3]) + b"\n\nevent: broken\ndata: {not-json\n\n"
+        handler, relayed = relay(malformed_tail)
+        terminal = consume(relayed)
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error"]["code"], "upstream_protocol_error")
+        self.assertNotIn(b"not-json", relayed)
 
         # (b) Distinct bounded-read codes for oversize vs truncation.
         class FakeUpstream:
@@ -777,6 +991,11 @@ class GatewayContracts(unittest.TestCase):
             _read_bounded_upstream_body(FakeUpstream(b"short", length=99), limit=64)
         self.assertEqual(caught.exception.code, "upstream_truncated")
         self.assertEqual(_read_bounded_upstream_body(FakeUpstream(b"fine"), limit=64), b"fine")
+        from muse_gateway import _read_bounded_json
+        with self.assertRaises(ProviderError) as caught:
+            _read_bounded_json(io_module.BytesIO(b"x" * 65), limit=64)
+        self.assertEqual(caught.exception.code, "upstream_response_too_large")
+        self.assertEqual(_read_bounded_json(io_module.BytesIO(b'{"ok": true}'), limit=64), {"ok": True})
 
 
 if __name__ == "__main__":
